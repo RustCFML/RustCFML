@@ -1263,6 +1263,8 @@ include "harness.cfm";
 <!--- Component metadata parameter defaults; a pseudo-constructor include whose
       path varies is resolved per instance (GH #468, #481). --->
 <cf_runtest file="oop/test_gh468_481_component_meta_and_dyn_include.cfm" />
+<cf_runtest file="oop/test_gh481_method_include_mixins.cfm" />
+<cf_runtest file="oop/test_gh481_mixin_collision.cfm" rustcfmlOnly="true" why="Lucee itself StackOverflows on this shape in isolation; our non-shadowing rule is a deliberate Preside-compat divergence" />
 
 <!--- A cookie set in long form reads back as its value in the same request
       (GH #480). Serve-mode only; skips on the CLI. --->

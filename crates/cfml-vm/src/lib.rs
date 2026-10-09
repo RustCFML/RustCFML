@@ -2672,6 +2672,18 @@ pub struct CfmlVirtualMachine {
     /// closure-carrying `CfmlFunction` per instance, and does NOT register it
     /// as a bare page function (GH #463).
     cfc_body_include_depth: u32,
+    /// Depth of `include`s running inside a component METHOD, nested includes
+    /// counted. While non-zero, a named function an included template declares
+    /// is a method OF THE INSTANCE (Lucee 7.1, probed: it lands in `this`, it
+    /// does NOT see the including method's locals at call time, and it is NOT
+    /// callable as a bare page function afterwards). This is ColdBox's
+    /// `includeUDF` helper-mixin pattern — Preside runs it with ~800 helpers on
+    /// every handler/renderer instance, so `DefineFunction` hands out the
+    /// memoised class-invariant `method_arc_cache` value instead of building a
+    /// closure-carrying `CfmlFunction` per declaration per instance, and the
+    /// include merge-back writes it into the instance's `this` and `variables`
+    /// (GH #481 follow-up).
+    method_include_depth: u32,
     /// The calling frame's `__variables` scope, captured at each `CallMethod`
     /// dispatch. Used as a FALLBACK when a `this.method()` receiver carries no
     /// `__variables` of its own — which happens while a component is still
@@ -4816,6 +4828,7 @@ impl CfmlVirtualMachine {
             captured_locals: None,
             include_share_local_keys: None,
             cfc_body_include_depth: 0,
+            method_include_depth: 0,
             dispatch_caller_variables: None,
             dispatch_caller_this: None,
             transaction_conn: None,
@@ -14143,6 +14156,68 @@ impl CfmlVirtualMachine {
                         stack.push(CfmlValue::Function(shared));
                         continue;
                     }
+                    // A named function declared by a template an `include` ran
+                    // from a component METHOD is a method of the INSTANCE (see
+                    // `method_include_depth` — ColdBox `includeUDF` mixins).
+                    // Same treatment: the memoised class-invariant value, no
+                    // closure env (probed on Lucee 7.1: the helper does not see
+                    // the including method's locals at call time), and no
+                    // `user_functions` entry (on Lucee it is not callable as a
+                    // bare page function afterwards). The include merge-back
+                    // stores it into the instance's `this` and `variables`.
+                    // Building the full value here cost ~1.9 KB of allocation
+                    // and ~500 B retained PER HELPER PER INSTANCE on Preside's
+                    // ~800-helper mixin set.
+                    if !bc_func_arc.is_component_method
+                        && self.method_include_depth > 0
+                        && func.is_template_frame
+                        && !bc_func_arc.name.starts_with("__")
+                    {
+                        let shared = self.method_arc_for(&bc_func_arc);
+                        // Public on `this` as well (Lucee 7.1, probed): the
+                        // declaration's own store writes it into the instance's
+                        // `variables` through the shared frame scope; `this` has
+                        // no such write-through, so set it here. The frame's
+                        // `this` is inherited from the including method.
+                        //
+                        // DELIBERATELY NON-SHADOWING: a mixin whose name collides
+                        // with one of the instance's existing methods does NOT
+                        // replace it. An isolated Lucee probe actually lets the
+                        // mixin win — and StackOverflows on the very shape Preside
+                        // ships (presideProxies.cfm declares `renderView`, which
+                        // proxies back to the Renderer, whose CLASS also declares
+                        // `renderView`; ColdBox mixes the proxies into that same
+                        // Renderer). Production Preside on Lucee demonstrably has
+                        // the class method win on that instance, and shadowing it
+                        // here sent admin login into "infinite recursion detected:
+                        // renderView (depth 256)". Class method wins; the mixin
+                        // remains reachable through `variables`.
+                        match locals.get(&*cfml_common::key::well_known::THIS) {
+                            Some(CfmlValue::Struct(ts)) => {
+                                if ts.get(shared.name.as_str()).is_none() {
+                                    ts.insert(
+                                        shared.name.as_str(),
+                                        CfmlValue::Function(Arc::clone(&shared)),
+                                    );
+                                }
+                            }
+                            #[cfg(feature = "component-instance")]
+                            Some(CfmlValue::Instance(inst)) => {
+                                let g = inst.read();
+                                if g.lookup_method(shared.name.as_str()).is_none()
+                                    && g.get_public_member(shared.name.as_str()).is_none()
+                                {
+                                    g.set_public_member(
+                                        shared.name.as_str(),
+                                        CfmlValue::Function(Arc::clone(&shared)),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                        stack.push(CfmlValue::Function(shared));
+                        continue;
+                    }
                     let func_name = bc_func_arc.name.clone();
                     // Lucee parity: a named function declaration that collides
                     // with a built-in function is a compile/parse-time error in
@@ -15895,16 +15970,24 @@ impl CfmlVirtualMachine {
                                 );
                             }
                             // An include from a CFC pseudo-constructor (or from an
-                            // include already running in one) declares methods —
-                            // see `cfc_body_include_depth`. An include from a
-                            // METHOD body is left alone: its functions stay
-                            // ordinary template-defined UDFs.
+                            // include already running in one) declares CLASS
+                            // methods — see `cfc_body_include_depth`. An include
+                            // from a component METHOD declares INSTANCE methods —
+                            // see `method_include_depth` (ColdBox `includeUDF`).
                             let declares_methods = func.name == "__cfc_body__"
                                 || (self.cfc_body_include_depth > 0
                                     && func.is_template_frame
                                     && func.name == "__main__");
+                            let declares_instance_methods = !declares_methods
+                                && (func.is_component_method
+                                    || (self.method_include_depth > 0
+                                        && func.is_template_frame
+                                        && func.name == "__main__"));
                             if declares_methods {
                                 self.cfc_body_include_depth += 1;
+                            }
+                            if declares_instance_methods {
+                                self.method_include_depth += 1;
                             }
                             let result = self.execute_function_with_args(
                                 &inc_func,
@@ -15913,6 +15996,9 @@ impl CfmlVirtualMachine {
                             );
                             if declares_methods {
                                 self.cfc_body_include_depth -= 1;
+                            }
+                            if declares_instance_methods {
+                                self.method_include_depth -= 1;
                             }
                             self.try_stack = saved_try_stack;
                             #[cfg(feature = "observability")]
@@ -15929,6 +16015,7 @@ impl CfmlVirtualMachine {
                             // (they're already in user_functions); merging them would
                             // inject captured_scope that triggers spurious write-backs.
                             if let Some(inc_locals) = self.captured_locals.take() {
+
                                 for (k, v) in inc_locals {
                                     if k == "arguments" || k.starts_with("__") {
                                         continue;
@@ -16080,16 +16167,24 @@ impl CfmlVirtualMachine {
                                 );
                             }
                             // An include from a CFC pseudo-constructor (or from an
-                            // include already running in one) declares methods —
-                            // see `cfc_body_include_depth`. An include from a
-                            // METHOD body is left alone: its functions stay
-                            // ordinary template-defined UDFs.
+                            // include already running in one) declares CLASS
+                            // methods — see `cfc_body_include_depth`. An include
+                            // from a component METHOD declares INSTANCE methods —
+                            // see `method_include_depth` (ColdBox `includeUDF`).
                             let declares_methods = func.name == "__cfc_body__"
                                 || (self.cfc_body_include_depth > 0
                                     && func.is_template_frame
                                     && func.name == "__main__");
+                            let declares_instance_methods = !declares_methods
+                                && (func.is_component_method
+                                    || (self.method_include_depth > 0
+                                        && func.is_template_frame
+                                        && func.name == "__main__"));
                             if declares_methods {
                                 self.cfc_body_include_depth += 1;
+                            }
+                            if declares_instance_methods {
+                                self.method_include_depth += 1;
                             }
                             let result = self.execute_function_with_args(
                                 &inc_func,
@@ -16099,6 +16194,9 @@ impl CfmlVirtualMachine {
                             if declares_methods {
                                 self.cfc_body_include_depth -= 1;
                             }
+                            if declares_instance_methods {
+                                self.method_include_depth -= 1;
+                            }
                             self.try_stack = saved_try_stack;
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
@@ -16107,6 +16205,7 @@ impl CfmlVirtualMachine {
                             }
                             // Merge new non-function variables from the include
                             if let Some(inc_locals) = self.captured_locals.take() {
+
                                 for (k, v) in inc_locals {
                                     if k == "arguments" || k.starts_with("__") {
                                         continue;
