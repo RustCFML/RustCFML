@@ -4506,3 +4506,127 @@ pub fn expand_list_param(value: &CfmlValue, separator: &str) -> Vec<CfmlValue> {
             .collect(),
     }
 }
+
+/// Intern the SHORT string VALUES of a freshly-built metadata graph against a
+/// bounded process-wide pool, so the resident copies share one `Arc<String>`
+/// per spelling. On one real application's 4,286 classes the metadata held
+/// 454,281 string values with only 40,141 distinct — `"any"` alone appeared
+/// 62,802 times — and the class cache keeps every class's metadata for the
+/// life of the process, so the duplicates were pure resident waste.
+///
+/// Safe because CFML strings are immutable values: every string operation
+/// produces a new value, so two metadata graphs sharing one `Arc<String>` can
+/// never observe each other. (Sharing whole SUB-STRUCTS across classes would
+/// NOT be safe — metadata structs are reference-typed and callers mutate them,
+/// Lucee-visibly — so this interns leaves only.)
+///
+/// Only strings <= 48 bytes are pooled (type names, access levels, parameter
+/// names; longer strings are hints/paths and mostly unique), the pool is
+/// capped at 32,768 spellings (first come wins), and the walk is bounded by
+/// a visited set and a depth cap so a cyclic or adversarial graph terminates.
+pub fn intern_metadata_string_values(v: &CfmlValue) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashMap<String, Arc<String>>>> = OnceLock::new();
+    const CAP: usize = 32_768;
+    const MAX_LEN: usize = 48;
+    const MAX_DEPTH: usize = 32;
+
+    fn walk(
+        v: &CfmlValue,
+        pool: &mut HashMap<String, Arc<String>>,
+        seen: &mut rustc_hash::FxHashSet<usize>,
+        depth: usize,
+    ) {
+        if depth >= MAX_DEPTH {
+            return;
+        }
+        match v {
+            CfmlValue::Struct(s) => {
+                if !seen.insert(s.backing_ptr()) {
+                    return;
+                }
+                s.with_write(|m| {
+                    for (_k, val) in m.iter_mut() {
+                        intern_leaf(val, pool);
+                    }
+                });
+                // Recurse outside the write lock: a nested value is its own
+                // Arc, so the parent's lock need not be held while walking it.
+                for (_k, val) in s.snapshot() {
+                    if matches!(val, CfmlValue::Struct(_) | CfmlValue::Array(_)) {
+                        walk(&val, pool, seen, depth + 1);
+                    }
+                }
+            }
+            CfmlValue::Array(a) => {
+                if !seen.insert(a.backing_ptr()) {
+                    return;
+                }
+                a.with_write(|vec| {
+                    for val in vec.iter_mut() {
+                        intern_leaf(val, pool);
+                    }
+                });
+                let items = a.with_read(|vec| vec.clone());
+                for val in items {
+                    if matches!(val, CfmlValue::Struct(_) | CfmlValue::Array(_)) {
+                        walk(&val, pool, seen, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn intern_leaf(val: &mut CfmlValue, pool: &mut HashMap<String, Arc<String>>) {
+        if let CfmlValue::String(a) = val {
+            if a.len() > MAX_LEN {
+                return;
+            }
+            if let Some(shared) = pool.get(a.as_str()) {
+                *a = shared.clone();
+            } else if pool.len() < CAP {
+                pool.insert((**a).clone(), a.clone());
+            }
+        }
+    }
+
+    let Ok(mut pool) = POOL.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+        return;
+    };
+    let mut seen = rustc_hash::FxHashSet::default();
+    walk(v, &mut pool, &mut seen, 0);
+}
+
+#[cfg(test)]
+mod metadata_value_intern {
+    //! Interning metadata string values shares one Arc per spelling without
+    //! changing what any reader sees.
+    use super::*;
+
+    #[test]
+    fn repeated_values_share_and_content_is_unchanged() {
+        let mk = || {
+            let mut p = ValueMap::default();
+            p.insert("type", CfmlValue::string("any"));
+            p.insert("name", CfmlValue::string("event"));
+            CfmlValue::strukt(p)
+        };
+        let mut f = ValueMap::default();
+        f.insert("parameters", CfmlValue::array(vec![mk(), mk()]));
+        let meta = CfmlValue::strukt(f);
+        intern_metadata_string_values(&meta);
+        let CfmlValue::Struct(s) = &meta else { unreachable!() };
+        let Some(CfmlValue::Array(params)) = s.get("parameters") else { unreachable!() };
+        let (a, b) = params.with_read(|v| (v[0].clone(), v[1].clone()));
+        let get = |p: &CfmlValue, k: &str| -> Arc<String> {
+            let CfmlValue::Struct(ps) = p else { unreachable!() };
+            let Some(CfmlValue::String(st)) = ps.get(k) else { unreachable!() };
+            st
+        };
+        assert_eq!(*get(&a, "type"), "any".to_string());
+        assert!(Arc::ptr_eq(&get(&a, "type"), &get(&b, "type")), "values must share one Arc");
+        assert!(Arc::ptr_eq(&get(&a, "name"), &get(&b, "name")));
+    }
+}

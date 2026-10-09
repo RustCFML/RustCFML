@@ -1757,6 +1757,9 @@ impl ActiveRequestGuard {
         state
             .active_requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state
+            .requests_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self(state.active_requests.clone())
     }
 }
@@ -1778,6 +1781,10 @@ pub struct ServerState {
     /// Lucee's `getPageContext().getCFMLFactory().getActiveRequests()` reports.
     /// The serve loop holds an [`ActiveRequestGuard`] for each request.
     pub active_requests: Arc<std::sync::atomic::AtomicUsize>,
+    /// Cumulative requests started, bumped by [`ActiveRequestGuard::new`].
+    /// Housekeeping reads it to run idle work (allocator collect, cache
+    /// trims) only when traffic has actually happened since the last pass.
+    pub requests_started: Arc<std::sync::atomic::AtomicU64>,
     /// Named locks for cflock: name → RwLock (exclusive = write, readonly = read)
     pub named_locks: Arc<Mutex<HashMap<String, Arc<NamedLock>>>>,
     /// Bytecode cache — skips recompilation when file mtime is unchanged
@@ -1968,6 +1975,7 @@ impl ServerState {
             applications: Arc::new(MemoryApplicationStore::new()),
             sessions: Arc::new(MemoryStore::new()),
             active_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            requests_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             named_locks: Arc::new(Mutex::new(HashMap::new())),
             bytecode_cache: BytecodeCache::with_trust(production_mode),
             webroot: None,
@@ -38716,6 +38724,10 @@ impl CfmlVirtualMachine {
     /// Cross-request class cache, write side for metadata (see
     /// `cross_request_metadata`).
     fn publish_metadata(&mut self, src: &str, name: &str, instance_form: bool, meta: &CfmlValue) {
+        // The class cache keeps this struct for the life of the process —
+        // share one Arc per repeated short string value ("any", "string",
+        // "public", parameter names) across all classes' resident metadata.
+        cfml_common::dynamic::intern_metadata_string_values(meta);
         if self.server_state.is_none() {
             self.local_class_metadata.insert((src.to_string(), name.to_string()), meta.clone());
             return;
