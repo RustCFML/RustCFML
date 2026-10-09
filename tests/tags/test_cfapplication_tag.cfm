@@ -8,6 +8,12 @@ suiteBegin("cfapplication tag is implemented (GH 374)");
 // the tag proves it executes without rebinding the application scope out from
 // under the tests that follow.
 before = getApplicationMetadata().name;
+// On Lucee the tag REBUILDS the application from its own attributes, dropping
+// the mappings (and custom tag paths) other tests registered — which silently
+// broke component resolution for every test after this one in the runner.
+// Capture them so the end of this suite can put them back.
+beforeMappings     = getApplicationMetadata().mappings       ?: {};
+beforeCustomTagDirs = getApplicationMetadata().customTagPaths ?: [];
 </cfscript>
 
 <cfapplication name="#before#" sessionmanagement="true" clientmanagement="false">
@@ -30,6 +36,10 @@ assert("applicationName matches the declaration",
 // The script form lowers to the same intercept and must behave identically.
 application name="#before#" sessionmanagement="true";
 assert("the script form also runs", getApplicationMetadata().name, before);
+
+// Restore what the rebind dropped (see the capture at the top): merge, never
+// replace — the project rule for every test that touches application settings.
+application action="update" mappings=beforeMappings customTagPaths=beforeCustomTagDirs;
 
 suiteEnd();
 </cfscript>
