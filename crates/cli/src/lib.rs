@@ -2513,6 +2513,55 @@ async fn async_run_server(
     spawn_session_reaper(server_state.clone(), &cfconfig);
     spawn_upload_reaper(&cfconfig);
 
+    // Drop datasource pools that have sat unused past the idle TTL
+    // (RUSTCFML_DB_POOL_IDLE_TTL, default 600 s, 0 disables), so the driver
+    // connections — and the per-connection I/O buffers that grow to the largest
+    // result they ever carried — go back to the OS instead of being retained
+    // for the life of the process. Its own timer, not the session reaper's:
+    // that one can be disabled (reapIntervalSecs = 0) or sleep adaptively.
+    let housekeeping_state = server_state.clone();
+    tokio::spawn(async move {
+        // Idle allocator collect: request threads that have exited leave their
+        // mimalloc heaps abandoned, and freed pages sit in the allocator's
+        // reserve — on a warm Preside server that is a large share of the
+        // footprint OUTSIDE the live heap. Collecting on every request cost
+        // 31% throughput (GH #354), so instead collect when the server is
+        // QUIET: no request in flight, traffic has happened since the last
+        // collect, and at least five minutes have passed. An idle server
+        // settles back toward its live heap; a busy one never pays.
+        let mut last_collect_marker: u64 = 0;
+        let mut last_collect = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            cfml_stdlib::builtins::sweep_idle_datasource_pools();
+            #[cfg(all(
+                feature = "mimalloc",
+                not(feature = "dhat-heap"),
+                not(all(feature = "memprofile", unix))
+            ))]
+            {
+                use std::sync::atomic::Ordering;
+                let started = housekeeping_state.requests_started.load(Ordering::Relaxed);
+                let active = housekeeping_state.active_requests.load(Ordering::Relaxed);
+                if active == 0
+                    && started != last_collect_marker
+                    && last_collect.elapsed() >= std::time::Duration::from_secs(300)
+                {
+                    unsafe { libmimalloc_sys::mi_collect(true) };
+                    last_collect_marker = started;
+                    last_collect = std::time::Instant::now();
+                    log::debug!("[memory] idle allocator collect");
+                }
+            }
+            #[cfg(not(all(
+                feature = "mimalloc",
+                not(feature = "dhat-heap"),
+                not(all(feature = "memprofile", unix))
+            )))]
+            let _ = (&housekeeping_state, &mut last_collect_marker, &mut last_collect);
+        }
+    });
+
     // Spawn the deferred cycle-GC sweep (serve mode only, when the collector is
     // armed). Request boundaries already drain deferred logs under load; this
     // timer guarantees a request that spawned a background thread is still

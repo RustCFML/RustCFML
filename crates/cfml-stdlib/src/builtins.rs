@@ -10886,7 +10886,19 @@ pub fn global_default_datasource() -> Option<String> {
 
 /// Global pool manager — maps datasource URL → pool instance (type-erased)
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-static POOL_MANAGER: OnceLock<Mutex<HashMap<String, Box<dyn std::any::Any + Send>>>> = OnceLock::new();
+struct PoolEntry {
+    pool: Box<dyn std::any::Any + Send>,
+    /// Stamped on every checkout of this pool (each request's first query per
+    /// datasource at least). `sweep_idle_datasource_pools` drops entries whose
+    /// stamp is older than the TTL, closing the driver's connections and with
+    /// them the per-connection read/write buffers that grow to the largest
+    /// result they ever carried and are otherwise retained for the life of the
+    /// process (~57 MB measured on a warm Preside server's two MySQL pools).
+    last_used: std::time::Instant,
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+static POOL_MANAGER: OnceLock<Mutex<HashMap<String, PoolEntry>>> = OnceLock::new();
 
 /// How many database connection pools are open. The driver crates' own
 /// per-connection read/write buffers are NOT reachable from here — they grow
@@ -10909,8 +10921,54 @@ pub fn db_pool_count() -> usize {
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn get_pool_manager() -> &'static Mutex<HashMap<String, Box<dyn std::any::Any + Send>>> {
+fn get_pool_manager() -> &'static Mutex<HashMap<String, PoolEntry>> {
     POOL_MANAGER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The sweep itself, with the TTL explicit (`0` = disabled). Split from the
+/// env-reading wrapper so tests can exercise it without racing the process-wide
+/// `RUSTCFML_DB_POOL_IDLE_TTL` cache.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn sweep_idle_datasource_pools_with(ttl_secs: u64) -> usize {
+    if ttl_secs == 0 {
+        return 0;
+    }
+    let Ok(mut manager) = get_pool_manager().lock() else { return 0 };
+    let before = manager.len();
+    let ttl = std::time::Duration::from_secs(ttl_secs);
+    manager.retain(|_, e| e.last_used.elapsed() < ttl);
+    let dropped = before - manager.len();
+    if dropped > 0 {
+        log::debug!("[datasource] dropped {dropped} idle connection pool(s)");
+    }
+    dropped
+}
+
+/// Drop datasource pools no request has used for the idle TTL
+/// (`RUSTCFML_DB_POOL_IDLE_TTL` seconds, default 600; `0` disables the sweep).
+/// Dropping the registry's handle closes the pool's idle connections — a
+/// checked-out connection keeps the inner pool alive until it is returned, so
+/// an in-flight request is never cut off; the NEXT use of the datasource
+/// simply reconnects. Returns how many pools were dropped. Always present so
+/// the server's housekeeping needs no feature gate; a build without database
+/// drivers answers 0.
+pub fn sweep_idle_datasource_pools() -> usize {
+    #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+    {
+        use std::sync::OnceLock as TtlOnce;
+        static TTL_SECS: TtlOnce<u64> = TtlOnce::new();
+        let ttl = *TTL_SECS.get_or_init(|| {
+            std::env::var("RUSTCFML_DB_POOL_IDLE_TTL")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(600)
+        });
+        return sweep_idle_datasource_pools_with(ttl);
+    }
+    #[cfg(not(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+    {
+        0
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -10940,8 +10998,9 @@ impl r2d2::ManageConnection for SqliteConnectionManager {
 fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
     let key = format!("sqlite:{}", path);
-    if let Some(pool_any) = manager.get(&key) {
-        if let Some(pool) = pool_any.downcast_ref::<r2d2::Pool<SqliteConnectionManager>>() {
+    if let Some(entry) = manager.get_mut(&key) {
+        if let Some(pool) = entry.pool.downcast_ref::<r2d2::Pool<SqliteConnectionManager>>() {
+            entry.last_used = std::time::Instant::now();
             return Ok(pool.clone());
         }
     }
@@ -10971,7 +11030,10 @@ fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, Cf
         .connection_timeout(std::time::Duration::from_secs(30))
         .build(mgr)
         .map_err(|e| CfmlError::database(format!("queryExecute: failed to create SQLite pool: {}", e)))?;
-    manager.insert(key, Box::new(pool.clone()));
+    manager.insert(
+        key,
+        PoolEntry { pool: Box::new(pool.clone()), last_used: std::time::Instant::now() },
+    );
     Ok(pool)
 }
 
@@ -11096,8 +11158,9 @@ fn mysql_extract_ssl(url: &str) -> (String, Option<mysql::SslOpts>) {
 fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
     let key = format!("mysql:{}", url);
-    if let Some(pool_any) = manager.get(&key) {
-        if let Some(pool) = pool_any.downcast_ref::<mysql::Pool>() {
+    if let Some(entry) = manager.get_mut(&key) {
+        if let Some(pool) = entry.pool.downcast_ref::<mysql::Pool>() {
+            entry.last_used = std::time::Instant::now();
             return Ok(pool.clone());
         }
     }
@@ -11171,7 +11234,10 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         .additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_FOUND_ROWS);
     let pool = mysql::Pool::new(builder)
         .map_err(|e| CfmlError::database(format!("queryExecute: MySQL pool creation error: {}", e)))?;
-    manager.insert(key, Box::new(pool.clone()));
+    manager.insert(
+        key,
+        PoolEntry { pool: Box::new(pool.clone()), last_used: std::time::Instant::now() },
+    );
     Ok(pool)
 }
 
@@ -11739,8 +11805,9 @@ const PG_POOL_MAX_SIZE: u32 = 10;
 fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
     let key = format!("postgres:{}", url);
-    if let Some(pool_any) = manager.get(&key) {
-        if let Some(pool) = pool_any.downcast_ref::<r2d2::Pool<PostgresConnectionManager>>() {
+    if let Some(entry) = manager.get_mut(&key) {
+        if let Some(pool) = entry.pool.downcast_ref::<r2d2::Pool<PostgresConnectionManager>>() {
+            entry.last_used = std::time::Instant::now();
             return Ok(pool.clone());
         }
     }
@@ -11756,7 +11823,10 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
         .test_on_check_out(false)
         .build(mgr)
         .map_err(|e| CfmlError::database(format!("queryExecute: failed to create PostgreSQL pool: {}", e)))?;
-    manager.insert(key, Box::new(pool.clone()));
+    manager.insert(
+        key,
+        PoolEntry { pool: Box::new(pool.clone()), last_used: std::time::Instant::now() },
+    );
     Ok(pool)
 }
 
@@ -11931,8 +12001,9 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
 fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
     let key = format!("mssql:{}", url);
-    if let Some(pool_any) = manager.get(&key) {
-        if let Some(pool) = pool_any.downcast_ref::<r2d2::Pool<MssqlConnectionManager>>() {
+    if let Some(entry) = manager.get_mut(&key) {
+        if let Some(pool) = entry.pool.downcast_ref::<r2d2::Pool<MssqlConnectionManager>>() {
+            entry.last_used = std::time::Instant::now();
             return Ok(pool.clone());
         }
     }
@@ -11947,7 +12018,10 @@ fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlE
         .test_on_check_out(false)
         .build(mgr)
         .map_err(|e| CfmlError::database(format!("queryExecute: failed to create MSSQL pool: {}", e)))?;
-    manager.insert(key, Box::new(pool.clone()));
+    manager.insert(
+        key,
+        PoolEntry { pool: Box::new(pool.clone()), last_used: std::time::Instant::now() },
+    );
     Ok(pool)
 }
 
@@ -21797,5 +21871,42 @@ mod builtins_meta_guard {
                 "{name} is declared VM-intercepted but is_pure_builtin() accepted it"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod pool_idle_sweep {
+    //! The datasource-pool idle sweep: a pool unused past the TTL is dropped
+    //! (its connections close and their grown I/O buffers return to the OS);
+    //! a recently-used pool stays; TTL 0 means the sweep never drops anything.
+    use super::*;
+
+    fn seed(key: &str, age_secs: u64) {
+        let mut m = get_pool_manager().lock().unwrap();
+        m.insert(
+            key.to_string(),
+            PoolEntry {
+                pool: Box::new(()),
+                last_used: std::time::Instant::now()
+                    - std::time::Duration::from_secs(age_secs),
+            },
+        );
+    }
+
+    fn has(key: &str) -> bool {
+        get_pool_manager().lock().unwrap().contains_key(key)
+    }
+
+    #[test]
+    fn idle_pools_drop_fresh_pools_stay_and_ttl_zero_disables() {
+        seed("test:stale", 700);
+        seed("test:fresh", 10);
+        assert_eq!(sweep_idle_datasource_pools_with(0), 0, "TTL 0 must be a no-op");
+        assert!(has("test:stale") && has("test:fresh"));
+        let dropped = sweep_idle_datasource_pools_with(600);
+        assert!(dropped >= 1, "the stale pool must be dropped");
+        assert!(!has("test:stale"), "stale pool still registered");
+        assert!(has("test:fresh"), "fresh pool must survive the sweep");
+        get_pool_manager().lock().unwrap().remove("test:fresh");
     }
 }

@@ -203,6 +203,9 @@ keeps rising, reload after reload, with no plateau.
 | Glob patterns (`directoryList` filters) and URL-rewrite rules | 1,024 patterns each, cleared when full |
 | `evaluate()` expressions | 2,048 expressions, cleared when full |
 | Interned identifier names | grows with the distinct names the application uses, never pruned |
+| Interned struct-key spellings | 131,072 spellings (`RUSTCFML_KEY_INTERN_CAP`, `0` disables); when full, later keys allocate privately as before |
+| Pooled bytecode string operands | 65,536 spellings (`RUSTCFML_OPERAND_POOL_CAP`, `0` disables); compiled files share one allocation per literal |
+| Interned metadata string values | 32,768 spellings, values ≤ 48 bytes; resident `getComponentMetaData` structs share one allocation per repeated value |
 | MySQL prepared statements | 256 per connection, least recently used evicted |
 
 All of these are sized by the application's code, not its traffic, except the
@@ -222,6 +225,13 @@ All of these are sized by the application's code, not its traffic, except the
   [Sessions](sessions.md).
 - **Ehcache-backed caches** (through the Java shim) honour their
   `maxObjects` / `maxSizeInMb` settings.
+- **Datasource connection pools** are dropped after sitting unused for
+  `RUSTCFML_DB_POOL_IDLE_TTL` seconds (default 600; `0` keeps them forever).
+  A driver connection's read/write buffers grow to the largest result it has
+  carried and are retained while the connection lives — ~57 MB across two
+  MySQL pools on a warm Preside server — so an idle datasource's next use
+  pays one reconnect instead of the process holding those buffers overnight.
+  An in-flight request keeps its connections; only the idle pool is dropped.
 
 ### Threads and scheduled tasks
 
@@ -443,7 +453,10 @@ The release binary uses **mimalloc** as its allocator, which is worth roughly
 returning it to the OS promptly, so a server's footprint settles at a plateau
 above its live data: a rounding error on a large application, but on a small
 one it can roughly double the idle footprint. The engine asks mimalloc to
-return retained memory only when shedding under `--max-memory`; doing it on
+return retained memory when shedding under `--max-memory`, and — in serve
+mode — once the server has been QUIET for a housekeeping tick (no request in
+flight, at least five minutes since the last collect, traffic since then), so
+an idle server settles back toward its live heap. Doing it on
 every request cost 31% throughput ([#354](https://github.com/RustCFML/RustCFML/issues/354)).
 
 Two of mimalloc's own options recover most of the plateau. mimalloc reads them
