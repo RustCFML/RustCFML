@@ -29206,7 +29206,18 @@ impl CfmlVirtualMachine {
             );
         }
 
-        let method_lower = method.to_lowercase();
+        // Lowercased on the STACK. This runs on every member-function call
+        // (`w.findNoCase(x)`, `s.len()`, …), and `to_lowercase()` allocated a
+        // `String` for a name that is almost always a short ASCII literal.
+        let mut method_lower_buf = [0u8; MEMBER_BIF_NAME_BUF];
+        let method_lower_owned;
+        let method_lower: &str = match ascii_lower_in(method, &mut method_lower_buf) {
+            Some(s) => s,
+            None => {
+                method_lower_owned = method.to_lowercase();
+                &method_lower_owned
+            }
+        };
         // Caller's `__variables` (set by the CallMethod op). Used as a fallback
         // for a receiver that has no `__variables` of its own yet — the
         // in-construction `this` during a pseudo-constructor. Taken up-front so
@@ -29431,9 +29442,9 @@ impl CfmlVirtualMachine {
                 // matcher must be written back so a following group(n) reads
                 // this step's match — same pattern as Queue.poll / Map.remove.
                 if java_class == "java.util.regex.matcher"
-                    && matches!(method_lower.as_str(), "find" | "matches" | "lookingat")
+                    && matches!(method_lower, "find" | "matches" | "lookingat")
                 {
-                    let mode = match method_lower.as_str() {
+                    let mode = match method_lower {
                         "matches" => java_shims::MatchMode::Matches,
                         "lookingat" => java_shims::MatchMode::LookingAt,
                         _ => java_shims::MatchMode::Find,
@@ -29446,7 +29457,7 @@ impl CfmlVirtualMachine {
                 // Matcher.region()/reset() rewind the matcher and return it
                 // (Java returns `this`, so `p.matcher(s).region(a, b)` chains).
                 if java_class == "java.util.regex.matcher"
-                    && matches!(method_lower.as_str(), "region" | "reset")
+                    && matches!(method_lower, "region" | "reset")
                 {
                     let new_matcher = java_shims::java_matcher_reset(s, &method_lower, extra_args)
                         .map_err(|e| self.wrap_error(e))?;
@@ -29482,7 +29493,7 @@ impl CfmlVirtualMachine {
                 }
 
                 let all_args: Vec<CfmlValue> = std::mem::take(extra_args);
-                let m = method_lower.clone();
+                let m = method_lower.to_string();
                 // Keep a copy so a fall-through (the shim handler returns Null =
                 // "method not mine") can hand the args back to the generic
                 // struct/property dispatch below. The handlers consume all_args
@@ -29958,7 +29969,7 @@ impl CfmlVirtualMachine {
             None
         } else {
             match object {
-            CfmlValue::String(_) => match method_lower.as_str() {
+            CfmlValue::String(_) => match method_lower {
                 "tostring" => {
                     // java.lang.String.toString() / Lucee string member: returns
                     // the receiver text unchanged. (Was falling through to None →
@@ -30387,7 +30398,7 @@ impl CfmlVirtualMachine {
                 "dayofyear" => Some("dayOfYear"),
                 _ => None,
             },
-            CfmlValue::Array(arr) => match method_lower.as_str() {
+            CfmlValue::Array(arr) => match method_lower {
                 "len" | "length" | "size" => Some("arrayLen"),
                 "toarray" => {
                     // .toArray() on a CFML array is a no-op; this matches
@@ -30908,7 +30919,7 @@ impl CfmlVirtualMachine {
                 "tojson" | "serializejson" => Some("serializeJSON"),
                 _ => None,
             },
-            CfmlValue::Struct(s) => match method_lower.as_str() {
+            CfmlValue::Struct(s) => match method_lower {
                 // Struct member-function helpers must NEVER fire on a component.
                 // A CFC is represented internally as a struct, but it is not a
                 // struct to user code: a method named like a struct helper
@@ -31209,7 +31220,7 @@ impl CfmlVirtualMachine {
                 "tojson" | "serializejson" => Some("serializeJSON"),
                 _ => None,
             },
-            CfmlValue::Query(q) => match method_lower.as_str() {
+            CfmlValue::Query(q) => match method_lower {
                 "recordcount" | "len" | "size" => {
                     return Ok(CfmlValue::Int(q.row_count() as i64));
                 }
@@ -31530,7 +31541,7 @@ impl CfmlVirtualMachine {
                 }
                 _ => None,
             },
-            CfmlValue::Int(_) | CfmlValue::Double(_) => match method_lower.as_str() {
+            CfmlValue::Int(_) | CfmlValue::Double(_) => match method_lower {
                 "tostring" => {
                     return Ok(CfmlValue::string(object.as_string()));
                 }
@@ -31550,7 +31561,7 @@ impl CfmlVirtualMachine {
             // Taffy BaseSerializerSpec/ResponseHandlingSpec), and only diverges for
             // the separate-but-equal case, where value equality is the intuitive
             // answer. Documented in docs/known-issues.md.
-            CfmlValue::Binary(bytes) => match method_lower.as_str() {
+            CfmlValue::Binary(bytes) => match method_lower {
                 "equals" => {
                     let eq = matches!(
                         extra_args.first(),
@@ -31566,7 +31577,7 @@ impl CfmlVirtualMachine {
             // getMinutes do NOT exist on Lucee's TimeSpan — they throw — so we
             // don't add them.) Unknown methods fall through to the shared
             // getClass()/toString() handling below. Verified vs Lucee 7.0.4.
-            CfmlValue::TimeSpan(d) => match method_lower.as_str() {
+            CfmlValue::TimeSpan(d) => match method_lower {
                 "getseconds" => {
                     return Ok(CfmlValue::Int((*d * 86_400.0).round() as i64));
                 }
@@ -31587,8 +31598,13 @@ impl CfmlVirtualMachine {
         };
 
         if let Some(name) = builtin_name {
-            // Build args list: object as first arg, then extra args
-            let mut args = vec![object.clone()];
+            // Build args list: object as first arg, then extra args.
+            // Sized up front — `vec![x]` then `append` allocates once for the
+            // receiver and reallocates on the first extra argument, so a
+            // one-argument member call such as `widgets.findNoCase( name )`
+            // paid two allocations before the BIF was even reached.
+            let mut args = Vec::with_capacity(1 + extra_args.len());
+            args.push(object.clone());
             args.append(extra_args);
 
             // For string member functions where the standalone signature has the
@@ -31607,9 +31623,21 @@ impl CfmlVirtualMachine {
                 }
             }
 
-            // Look up the builtin (exact spelling first, then case-insensitive)
-            let name_lower = name.to_lowercase();
-            if let Some((_, builtin)) = self.builtin_lookup_ci(name, &name_lower) {
+            // Look up the builtin (exact spelling first, then case-insensitive).
+            // The lowercase form goes on the STACK: `name` is a short static
+            // literal from the mapping table above (`"arrayFindNoCase"`), and
+            // `to_lowercase()` heap-allocated a `String` for it on every single
+            // member-function call.
+            let mut lower_buf = [0u8; MEMBER_BIF_NAME_BUF];
+            let name_lower_owned;
+            let name_lower: &str = match ascii_lower_in(name, &mut lower_buf) {
+                Some(s) => s,
+                None => {
+                    name_lower_owned = name.to_lowercase();
+                    &name_lower_owned
+                }
+            };
+            if let Some((_, builtin)) = self.builtin_lookup_ci(name, name_lower) {
                 #[cfg(feature = "bif-census")]
                 cfml_common::perf_counters::bif_census::record(&name_lower, &args);
                 let result = builtin(args)?;
@@ -32185,7 +32213,7 @@ impl CfmlVirtualMachine {
                 // aborted executor scheduling. Identity hash = the shared struct
                 // backing pointer (same instance -> same value), matching
                 // System.identityHashCode.
-                match method_lower.as_str() {
+                match method_lower {
                     "hashcode" => {
                         let raw = s.backing_ptr() as u64;
                         let folded = (raw ^ (raw >> 32)) & 0x7fff_ffff;
@@ -32328,7 +32356,7 @@ impl CfmlVirtualMachine {
                     && !s.contains_key("__is_super")
                     && s.method_table().is_none())
         {
-            match method_lower.as_str() {
+            match method_lower {
                 "equals" => {
                     let other = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
                     return Ok(CfmlValue::Bool(java_shims::java_equals(&object, &other)));
@@ -46237,3 +46265,22 @@ mod debug_footer_gate_tests {
         assert!(vm.output_buffer.is_empty());
     }
 }
+
+/// Buffer size for `ascii_lower_in`. Every builtin name is far shorter.
+const MEMBER_BIF_NAME_BUF: usize = 64;
+
+/// ASCII-lowercase `name` into `buf` and borrow it back, or `None` when it does
+/// not fit or is not ASCII (then the caller allocates). Lets a hot lookup that
+/// needs a lowercase spelling avoid a `String` per call.
+#[inline]
+fn ascii_lower_in<'a>(name: &str, buf: &'a mut [u8; MEMBER_BIF_NAME_BUF]) -> Option<&'a str> {
+    let bytes = name.as_bytes();
+    if bytes.len() > MEMBER_BIF_NAME_BUF || !name.is_ascii() {
+        return None;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    std::str::from_utf8(&buf[..bytes.len()]).ok()
+}
+

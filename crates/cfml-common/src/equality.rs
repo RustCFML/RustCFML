@@ -11,6 +11,19 @@ use crate::dynamic::CfmlValue;
 /// everything else by string form.
 pub fn deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
     match (a, b) {
+        // Two strings compare BORROWED. They would otherwise fall to the
+        // `as_string()` arm at the bottom, which allocates a fresh `String` for
+        // each side on every comparison — so a scan like
+        // `arrayFindNoCase( widgets, name )` over N strings allocated 2N of
+        // them before it could answer. Same semantics as that arm, which also
+        // uses `eq_ignore_ascii_case` for the nocase form.
+        (CfmlValue::String(x), CfmlValue::String(y)) => {
+            if nocase {
+                x.as_str().eq_ignore_ascii_case(y.as_str())
+            } else {
+                x.as_str() == y.as_str()
+            }
+        }
         (CfmlValue::Struct(sa), CfmlValue::Struct(sb)) => {
             // Identity short-circuit: two references to the SAME backing handle
             // are equal without walking their contents. This is both correct (a

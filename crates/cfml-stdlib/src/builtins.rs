@@ -1322,11 +1322,18 @@ fn get_int(args: &[CfmlValue], idx: usize) -> i64 {
 }
 
 fn get_float(args: &[CfmlValue], idx: usize) -> f64 {
+    args.get(idx).map_or(0.0, float_of)
+}
+
+/// `get_float` for a value already in hand. The reducers below used to build a
+/// one-element `Vec` per element just to call `get_float` through it — a heap
+/// allocation per element of every `arrayMin`/`arrayMax`/`arrayAvg`/`arraySum`.
+fn float_of(v: &CfmlValue) -> f64 {
     // A QueryColumn proxy coerces to its first-row value in scalar contexts.
-    match args.get(idx).map(|v| v.query_column_scalar()) {
-        Some(CfmlValue::Int(i)) => *i as f64,
-        Some(CfmlValue::Double(d)) => *d,
-        Some(CfmlValue::String(s)) => s.parse().unwrap_or(0.0),
+    match v.query_column_scalar() {
+        CfmlValue::Int(i) => *i as f64,
+        CfmlValue::Double(d) => *d,
+        CfmlValue::String(s) => s.parse().unwrap_or(0.0),
         _ => 0.0,
     }
 }
@@ -3239,16 +3246,83 @@ fn array_contains_substring(
     }
     let needle = args[1].as_string();
     let needle = if ignore_case { needle.to_lowercase() } else { needle.to_string() };
-    if let Some(arr) = args[0].as_array() {
-        for (i, v) in arr.iter().enumerate() {
-            let item = v.as_string();
-            let item = if ignore_case { item.to_lowercase() } else { item.to_string() };
-            if item.contains(&needle) {
-                return Ok(CfmlValue::Int((i + 1) as i64));
+    // Match the handle rather than `as_array()`, which snapshots the whole
+    // backing Vec. The body only reads each element as a string and never
+    // re-enters the array, so a borrowed walk under the read guard is safe.
+    if let CfmlValue::Array(arr) = &args[0] {
+        let hit: Option<usize> = arr.with_read(|items| {
+            for (i, v) in items.iter().enumerate() {
+                let item = v.as_string();
+                let item = if ignore_case { item.to_lowercase() } else { item };
+                if item.contains(&needle) {
+                    return Some(i + 1);
+                }
             }
+            None
+        });
+        if let Some(i) = hit {
+            return Ok(CfmlValue::Int(i as i64));
         }
     }
     Ok(CfmlValue::Int(0))
+}
+
+/// Can `deep_equal` compare this NEEDLE against any element without taking a
+/// lock? Struct/Array/Query needles recurse into the other side's backing store
+/// when the element is the same kind, so a guarded scan could re-enter the very
+/// array it is walking. Every other needle is answered by an arm that either
+/// compares scalars or returns `false` outright ("a complex value never equals
+/// a scalar"), and component instances compare by `Arc::ptr_eq` — none of which
+/// lock. See `cfml_common::equality::deep_equal`.
+fn needle_compares_lock_free(needle: &CfmlValue) -> bool {
+    !matches!(
+        needle,
+        CfmlValue::Struct(_) | CfmlValue::Array(_) | CfmlValue::Query(_)
+    )
+}
+
+/// Scan an array for elements equal to `needle`, WITHOUT snapshotting it.
+///
+/// `CfmlArray::iter()` is `snapshot()` — it clones the whole backing `Vec`
+/// before the first element is even looked at, so a find that matches at index
+/// 1 still paid for all N, and a find over an EMPTY array still paid for the
+/// call. Measured on a Preside admin render, `arrayFindNoCase` allocated ~3 KB
+/// per call over a 100-element array and 63 bytes over an empty one; Preside's
+/// `FeatureService.getFeatureForWidget` runs one such find per configured
+/// feature per call, which made it the single largest allocator on the page.
+///
+/// `first_only` stops at the first hit (`arrayFind`); otherwise every match is
+/// collected (`arrayFindAll`). Falls back to the snapshot walk for a needle
+/// that cannot be compared under the read guard — see `needle_compares_lock_free`.
+fn array_find_positions(
+    arr: &cfml_common::dynamic::CfmlArray,
+    needle: &CfmlValue,
+    nocase: bool,
+    first_only: bool,
+) -> Vec<usize> {
+    let mut hits: Vec<usize> = Vec::new();
+    if needle_compares_lock_free(needle) {
+        arr.with_read(|items| {
+            for (i, v) in items.iter().enumerate() {
+                if cfml_deep_equal(v, needle, nocase) {
+                    hits.push(i + 1);
+                    if first_only {
+                        return;
+                    }
+                }
+            }
+        });
+        return hits;
+    }
+    for (i, v) in arr.iter().enumerate() {
+        if cfml_deep_equal(&v, needle, nocase) {
+            hits.push(i + 1);
+            if first_only {
+                break;
+            }
+        }
+    }
+    hits
 }
 
 fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
@@ -3258,10 +3332,8 @@ fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            for (i, v) in arr.iter().enumerate() {
-                if cfml_deep_equal(&v, &args[1], false) {
-                    return Ok(CfmlValue::Int((i + 1) as i64));
-                }
+            if let Some(pos) = array_find_positions(arr, &args[1], false, true).first() {
+                return Ok(CfmlValue::Int(*pos as i64));
             }
         }
     }
@@ -3273,10 +3345,8 @@ fn fn_array_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            for (i, v) in arr.iter().enumerate() {
-                if cfml_deep_equal(&v, &args[1], true) {
-                    return Ok(CfmlValue::Int((i + 1) as i64));
-                }
+            if let Some(pos) = array_find_positions(arr, &args[1], true, true).first() {
+                return Ok(CfmlValue::Int(*pos as i64));
             }
         }
     }
@@ -3562,11 +3632,14 @@ fn fn_array_min(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let mut min = f64::INFINITY;
-        for v in arr.iter() {
-            let n = get_float(&[v.clone()], 0);
-            if n < min { min = n; }
-        }
+        let min = arr.with_read(|items| {
+            let mut acc = f64::INFINITY;
+            for v in items {
+                let n = float_of(v);
+                if n < acc { acc = n; }
+            }
+            acc
+        });
         Ok(CfmlValue::Double(if min.is_infinite() { 0.0 } else { min }))
     } else {
         Ok(CfmlValue::Int(0))
@@ -3579,11 +3652,14 @@ fn fn_array_max(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let mut max = f64::NEG_INFINITY;
-        for v in arr.iter() {
-            let n = get_float(&[v.clone()], 0);
-            if n > max { max = n; }
-        }
+        let max = arr.with_read(|items| {
+            let mut acc = f64::NEG_INFINITY;
+            for v in items {
+                let n = float_of(v);
+                if n > acc { acc = n; }
+            }
+            acc
+        });
         Ok(CfmlValue::Double(if max.is_infinite() { 0.0 } else { max }))
     } else {
         Ok(CfmlValue::Int(0))
@@ -3597,7 +3673,7 @@ fn fn_array_avg(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
         if arr.is_empty() { return Ok(CfmlValue::Int(0)); }
-        let sum: f64 = arr.iter().map(|v| get_float(&[v.clone()], 0)).sum();
+        let sum: f64 = arr.with_read(|items| items.iter().map(float_of).sum());
         Ok(CfmlValue::Double(sum / arr.len() as f64))
     } else {
         Ok(CfmlValue::Int(0))
@@ -3610,7 +3686,7 @@ fn fn_array_sum(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let sum: f64 = arr.iter().map(|v| get_float(&[v.clone()], 0)).sum();
+        let sum: f64 = arr.with_read(|items| items.iter().map(float_of).sum());
         Ok(CfmlValue::Double(sum))
     } else {
         Ok(CfmlValue::Int(0))
@@ -3685,9 +3761,9 @@ fn fn_array_find_all(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let indices: Vec<CfmlValue> = arr.iter().enumerate()
-                .filter(|(_, v)| cfml_deep_equal(v, &args[1], false))
-                .map(|(i, _)| CfmlValue::Int((i + 1) as i64))
+            let indices: Vec<CfmlValue> = array_find_positions(arr, &args[1], false, false)
+                .into_iter()
+                .map(|i| CfmlValue::Int(i as i64))
                 .collect();
             return Ok(CfmlValue::array(indices));
         }
@@ -3700,9 +3776,9 @@ fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let indices: Vec<CfmlValue> = arr.iter().enumerate()
-                .filter(|(_, v)| cfml_deep_equal(v, &args[1], true))
-                .map(|(i, _)| CfmlValue::Int((i + 1) as i64))
+            let indices: Vec<CfmlValue> = array_find_positions(arr, &args[1], true, false)
+                .into_iter()
+                .map(|i| CfmlValue::Int(i as i64))
                 .collect();
             return Ok(CfmlValue::array(indices));
         }

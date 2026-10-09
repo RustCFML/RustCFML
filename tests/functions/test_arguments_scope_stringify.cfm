@@ -26,15 +26,20 @@ assert( "structKeyList unchanged", structKeyList( d ), "name,dsl,required" );
 assert( "structCount unchanged"  , structCount( d )  , 3 );
 assertFalse( "serializeJson hides the markers", serializeJson( d ) contains "__arguments_" );
 
-// An arguments scope and a plain struct with the same content must stringify
-// identically — TestBox/MockBox hashes this string to match `$args( {...} )`
-// against the struct the subject under test builds.
+// On RustCFML an arguments scope and a plain struct with the same content
+// stringify identically — TestBox/MockBox hashes this string to match
+// `$args( {...} )` against the struct the subject under test builds. This is a
+// SUPERSET: Lucee's arguments scope is array-backed and stringifies as
+// `[1, 2]`, deliberately unlike `{A={1}, B={2}}` for the struct, so the
+// assertion is ours alone.
 function echoArgs( a, b ) { return arguments; }
-assert(
-	  "an arguments scope stringifies like the equivalent struct"
-	, echoArgs( a=1, b=2 ).toString()
-	, { a=1, b=2 }.toString()
-);
+if ( isRustCFML() ) {
+	assert(
+		  "an arguments scope stringifies like the equivalent struct"
+		, echoArgs( a=1, b=2 ).toString()
+		, { a=1, b=2 }.toString()
+	);
+}
 
 suiteEnd();
 </cfscript>
