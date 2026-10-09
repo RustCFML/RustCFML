@@ -69,3 +69,45 @@ pub fn array_bytes(len: usize) -> u64 {
     };
     (ARRAY_BASE + slots * ARRAY_SLOT) as u64
 }
+
+// ---------------------------------------------------------------------------
+// Reporting hooks
+// ---------------------------------------------------------------------------
+//
+// A couple of the debug footer's pots describe state that lives in
+// `cfml-stdlib` (the compiled-regex cache, the database pool manager), but
+// `cfml-vm` — which builds the panel — depends on `cfml-stdlib` only
+// OPTIONALLY, under the `s3` and `mcp-client` features. Calling into it
+// directly compiles in a workspace build, where something else has already
+// linked the crate, and FAILS in `cargo test -p cfml-vm`, which is what CI
+// runs. (It did: v0.724.0's Tests workflow, while a local
+// `cargo test --workspace` stayed green.)
+//
+// So the owning crate installs a function pointer here at startup and the
+// panel reads it, with a sensible answer when nothing has registered.
+
+use std::sync::OnceLock;
+
+static REGEX_CACHE_CENSUS: OnceLock<fn() -> (usize, u64)> = OnceLock::new();
+static DB_POOL_COUNT: OnceLock<fn() -> usize> = OnceLock::new();
+
+/// Install the compiled-regex cache's census. Called by `cfml-stdlib`.
+pub fn set_regex_cache_census(f: fn() -> (usize, u64)) {
+    let _ = REGEX_CACHE_CENSUS.set(f);
+}
+
+/// `(patterns, bytes)` in the compiled-regex cache, or `(0, 0)` in a build
+/// that has no regex cache registered.
+pub fn regex_cache_census() -> (usize, u64) {
+    REGEX_CACHE_CENSUS.get().map_or((0, 0), |f| f())
+}
+
+/// Install the database pool count. Called by `cfml-stdlib`.
+pub fn set_db_pool_count(f: fn() -> usize) {
+    let _ = DB_POOL_COUNT.set(f);
+}
+
+/// Open database connection pools, or `0` in a build with no database drivers.
+pub fn db_pool_count() -> usize {
+    DB_POOL_COUNT.get().map_or(0, |f| f())
+}

@@ -70,7 +70,7 @@ impl CfmlVirtualMachine {
         }
         let snap = guard.as_ref().expect("just filled");
         let mut pots = snap.pots.clone();
-        let pools = cfml_stdlib::builtins::db_pool_count();
+        let pools = cfml_common::container_size::db_pool_count();
         // "Other" is the rest of the live heap, recomputed against the current
         // total rather than the cached one.
         if let Some(live) = live_heap {
@@ -292,8 +292,9 @@ fn estimate_pots(ss: &ServerState) -> Vec<MemoryPot> {
 
     // Compiled regular expressions. The pattern strings are exact; the
     // compiled automaton behind each entry is not sizeable, so this is a
-    // floor — see `cfml_stdlib::builtins::regex_cache_census`.
-    let (re_n, re_bytes) = cfml_stdlib::builtins::regex_cache_census();
+    // floor — see `cfml_stdlib::builtins` for the cache itself, which
+    // registers its census through `container_size`.
+    let (re_n, re_bytes) = cfml_common::container_size::regex_cache_census();
     out.push(MemoryPot {
         name: "Regex cache".to_string(),
         bytes: re_bytes,

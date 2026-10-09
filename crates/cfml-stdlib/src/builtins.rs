@@ -425,6 +425,12 @@ pub fn get_builtins() -> ValueMap {
 
 /// Returns all builtin function implementations
 pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
+    // Install the debug footer's reporting hooks. `cfml-vm` builds the memory
+    // panel but depends on this crate only optionally, so it reads these
+    // through `cfml-common` rather than calling in directly — see
+    // `container_size`'s reporting-hooks section.
+    cfml_common::container_size::set_regex_cache_census(regex_cache_census);
+    cfml_common::container_size::set_db_pool_count(db_pool_count);
     let mut f: HashMap<String, BuiltinFunction> = HashMap::new();
 
     // ---- Output functions ----
