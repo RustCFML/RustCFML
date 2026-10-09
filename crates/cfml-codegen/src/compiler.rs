@@ -2187,6 +2187,7 @@ impl CfmlCompiler {
         }
         main.finalize();
         self.program.functions.shrink_to_fit();
+        pool_operand_strings(&mut self.program);
 
         self.program
     }
@@ -7046,6 +7047,60 @@ fn plain_variable_path_expr(text: &str, location: &cfml_common::position::Source
         }));
     }
     Some(expr)
+}
+
+/// Dedupe the string operands of a finished program against a process-wide,
+/// bounded pool, so every compiled file shares ONE `Arc<String>` per spelling
+/// instead of allocating its own. Scope keys, member names and small literals
+/// repeat across a real application's thousands of templates ("variables",
+/// "__name", column names, CSS class strings); before this pass each file's
+/// compile re-allocated all of them, and on a warm Preside server the compiled
+/// bytecode held ~97 MB with string operands a sizeable share.
+///
+/// Runs at the end of `compile()`, while the program still uniquely owns its
+/// functions (`Arc::get_mut`); a function something else already shares is
+/// left alone — sharing is an optimisation, never a requirement. The pool is
+/// capped (`RUSTCFML_OPERAND_POOL_CAP`, default 65,536 spellings; `0`
+/// disables) and only strings <= 96 bytes are pooled: long literals are
+/// one-off template text, and the cap bounds the table on pathological
+/// codebases. First-come wins, like the key interner.
+fn pool_operand_strings(program: &mut BytecodeProgram) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Option<Mutex<HashMap<String, std::sync::Arc<String>>>>> =
+        OnceLock::new();
+    static CAP: OnceLock<usize> = OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        std::env::var("RUSTCFML_OPERAND_POOL_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(65_536)
+    });
+    let Some(pool) = POOL.get_or_init(|| (cap > 0).then(|| Mutex::new(HashMap::new()))) else {
+        return;
+    };
+    let Ok(mut pool) = pool.lock() else { return };
+    let mut dedupe = |a: &mut std::sync::Arc<String>| {
+        if a.len() > 96 {
+            return;
+        }
+        if let Some(shared) = pool.get(a.as_str()) {
+            *a = shared.clone();
+        } else if pool.len() < cap {
+            pool.insert((**a).clone(), a.clone());
+        }
+    };
+    for func in &mut program.functions {
+        let Some(f) = std::sync::Arc::get_mut(func) else { continue };
+        for op in &mut f.instructions {
+            match op {
+                BytecodeOp::String(a) | BytecodeOp::UnsetPath(a) | BytecodeOp::Include(a) => {
+                    dedupe(a)
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
