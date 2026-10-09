@@ -107,19 +107,118 @@ pub struct Key {
     name: Arc<str>,
 }
 
+/// The bounded key interner behind [`Key::new`] / [`Key::from_string`].
+///
+/// Every map that stores a given name used to hold its own `Arc<str>` of it:
+/// 644,325 key insertions across one application's component metadata carried
+/// only 800 distinct names, and the per-copy `Arc` allocations showed up as
+/// tens of MB of a live Preside heap. Interning hands every constructor of the
+/// same spelling the SAME `Arc<str>`, which also lets `Key::eq`'s pointer test
+/// answer most comparisons.
+///
+/// Two properties the module doc's old "no global interner" stance demanded,
+/// now provided instead of avoided:
+///
+/// * **Bounded.** CFML builds keys from user data (query columns, form fields,
+///   session ids), so the name set is unbounded. The table stops interning at
+///   a cap (`RUSTCFML_KEY_INTERN_CAP`, default 131072 names; `0` disables) and
+///   later constructions simply allocate privately, exactly as before — the
+///   cap bounds the table, never correctness. First-come wins: an application's
+///   code-driven names are constructed early and stay shared.
+/// * **Case-exact.** Keys are case-preserving per first write of each MAP, so
+///   the interner must never substitute another casing: entries are matched by
+///   EXACT bytes. Two casings of one name are two entries (both under the same
+///   folded hash bucket).
+///
+/// 16 shards picked by the folded hash keep the lock uncontended; construction
+/// is off the per-op hot path (lookups go through [`KeyRef`] / cloned keys).
+mod intern {
+    use super::fold_hash;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    const SHARDS: usize = 16;
+    type Shard = parking_lot::Mutex<std::collections::HashMap<u64, Vec<Arc<str>>>>;
+
+    static TABLE: OnceLock<Vec<Shard>> = OnceLock::new();
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn cap() -> usize {
+        static CAP: OnceLock<usize> = OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("RUSTCFML_KEY_INTERN_CAP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(131_072)
+        })
+    }
+
+    /// (names interned, approximate bytes they hold) — for the memory panel.
+    pub fn stats() -> (usize, usize) {
+        let n = COUNT.load(Ordering::Relaxed);
+        let Some(table) = TABLE.get() else { return (0, 0) };
+        let mut bytes = 0usize;
+        for shard in table {
+            let g = shard.lock();
+            // Arc<str> header (2 counters) + text, plus the bucket slot.
+            bytes += g
+                .values()
+                .map(|b| b.iter().map(|a| 16 + a.len() + 8).sum::<usize>() + 24)
+                .sum::<usize>();
+        }
+        (n, bytes)
+    }
+
+    #[inline]
+    pub fn intern(name: &str, hash: u64) -> Arc<str> {
+        debug_assert_eq!(hash, fold_hash(name));
+        let cap = cap();
+        if cap == 0 || name.len() > 128 {
+            return Arc::from(name);
+        }
+        let table = TABLE.get_or_init(|| (0..SHARDS).map(|_| Shard::default()).collect());
+        let mut shard = table[(hash as usize) & (SHARDS - 1)].lock();
+        let bucket = shard.entry(hash).or_default();
+        // EXACT match only — see the module doc. Buckets are almost always one
+        // entry (the fold hash already separates names), so this scan is short.
+        for a in bucket.iter() {
+            if **a == *name {
+                return a.clone();
+            }
+        }
+        if COUNT.load(Ordering::Relaxed) >= cap {
+            return Arc::from(name);
+        }
+        let a: Arc<str> = Arc::from(name);
+        bucket.push(a.clone());
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        a
+    }
+}
+
+/// How many distinct key names the interner holds, and roughly what they cost.
+pub fn key_intern_stats() -> (usize, usize) {
+    intern::stats()
+}
+
 impl Key {
-    /// Fold, hash, and take ownership of `name`. The one allocating entry
-    /// point; prefer cloning an existing `Key` on hot paths.
+    /// Fold, hash, and intern `name`. The one allocating entry point; prefer
+    /// cloning an existing `Key` on hot paths. Every constructor of the same
+    /// spelling (case-exact) shares one `Arc<str>` — see [`intern`].
     #[inline]
     pub fn new(name: impl AsRef<str>) -> Self {
         let name = name.as_ref();
-        Key { hash: fold_hash(name), name: Arc::from(name) }
+        let hash = fold_hash(name);
+        Key { hash, name: intern::intern(name, hash) }
     }
 
-    /// Build from an already-owned `String` without a second copy of the text.
+    /// Build from an already-owned `String`. The text is interned like
+    /// [`Key::new`]'s, so the owned buffer is only kept when it is the first
+    /// sighting of this spelling.
     #[inline]
     pub fn from_string(name: String) -> Self {
-        Key { hash: fold_hash(&name), name: Arc::from(name) }
+        let hash = fold_hash(&name);
+        Key { hash, name: intern::intern(&name, hash) }
     }
 
     /// The key in its original casing.
@@ -579,4 +678,36 @@ pub mod well_known {
     /// Declared parameter names carried on the `arguments` scope, so
     /// `arguments[N]` can fall through to the positional param.
     pub static ARGUMENTS_PARAMS: LazyLock<Key> = LazyLock::new(|| Key::new("__arguments_params"));
+}
+
+#[cfg(test)]
+mod intern_tests {
+    //! The interner must share one Arc per exact spelling, keep distinct
+    //! casings distinct (per-map case preservation), and never affect
+    //! equality semantics.
+    use super::*;
+
+    #[test]
+    fn same_spelling_shares_one_allocation() {
+        let a = Key::new("internProbeAlpha");
+        let b = Key::from_string("internProbeAlpha".to_string());
+        assert!(Arc::ptr_eq(&a.as_arc(), &b.as_arc()), "same spelling must share the Arc");
+    }
+
+    #[test]
+    fn different_casings_keep_their_own_text_but_compare_equal() {
+        let a = Key::new("internProbeBeta");
+        let b = Key::new("INTERNPROBEBETA");
+        assert_eq!(a, b, "case-insensitive equality unchanged");
+        assert_eq!(a.as_str(), "internProbeBeta");
+        assert_eq!(b.as_str(), "INTERNPROBEBETA");
+        assert!(!Arc::ptr_eq(&a.as_arc(), &b.as_arc()), "casings must not be merged");
+    }
+
+    #[test]
+    fn stats_reports_interned_names() {
+        let _ = Key::new("internProbeGamma");
+        let (n, bytes) = key_intern_stats();
+        assert!(n >= 1 && bytes > 0);
+    }
 }
