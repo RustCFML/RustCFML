@@ -3137,7 +3137,9 @@ impl CfmlValue {
     /// `RUSTCFML_CACHE_CENSUS` report to answer "which scope / cache holds the
     /// heap" — a question a sampling heap profiler (allocation sites) cannot.
     pub fn approx_heap_bytes(&self, seen: &mut HashSet<usize>) -> usize {
-        const HANDLE: usize = 32; // Arc header + lock + Vec/IndexMap headers, roughly
+        use crate::container_size::{ARRAY_BASE, STRUCT_BASE, STRUCT_ENTRY};
+        // Query and component-instance handles are sized as a bare container.
+        const HANDLE: usize = ARRAY_BASE;
         match self {
             CfmlValue::String(s) => {
                 let p = Arc::as_ptr(s) as *const () as usize;
@@ -3145,7 +3147,10 @@ impl CfmlValue {
             }
             CfmlValue::Array(a) => {
                 if !seen.insert(a.backing_ptr()) { return 0; }
-                a.with_read(|v| HANDLE + v.len() * 24 + v.iter().map(|x| x.approx_heap_bytes(seen)).sum::<usize>())
+                a.with_read(|v| {
+                    crate::container_size::array_bytes(v.len()) as usize
+                        + v.iter().map(|x| x.approx_heap_bytes(seen)).sum::<usize>()
+                })
             }
             CfmlValue::QueryColumn(col, _) => {
                 let p = Arc::as_ptr(col) as *const () as usize;
@@ -3155,7 +3160,7 @@ impl CfmlValue {
             CfmlValue::Struct(st) => {
                 if !seen.insert(st.backing_ptr()) { return 0; }
                 st.with_read(|m| {
-                    HANDLE + m.len() * 40
+                    STRUCT_BASE + m.len() * STRUCT_ENTRY
                         + m.iter().map(|(k, v)| k.as_str().len() + v.approx_heap_bytes(seen)).sum::<usize>()
                 })
             }

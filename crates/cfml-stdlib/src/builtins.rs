@@ -10882,6 +10882,26 @@ pub fn global_default_datasource() -> Option<String> {
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 static POOL_MANAGER: OnceLock<Mutex<HashMap<String, Box<dyn std::any::Any + Send>>>> = OnceLock::new();
 
+/// How many database connection pools are open. The driver crates' own
+/// per-connection read/write buffers are NOT reachable from here — they grow
+/// to the largest result set a connection has carried and neither `mysql` nor
+/// `r2d2` exposes their size — so the debug footer reports this COUNT beside
+/// its unattributed remainder rather than inventing a byte figure. On a warm
+/// Preside server the heap profiler put those buffers at ~57 MB.
+///
+/// Always present, so callers (the debug footer) need no cfg of their own;
+/// a build without a database driver has no pools and answers 0.
+pub fn db_pool_count() -> usize {
+    #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+    {
+        return get_pool_manager().lock().map(|m| m.len()).unwrap_or(0);
+    }
+    #[cfg(not(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+    {
+        0
+    }
+}
+
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn get_pool_manager() -> &'static Mutex<HashMap<String, Box<dyn std::any::Any + Send>>> {
     POOL_MANAGER.get_or_init(|| Mutex::new(HashMap::new()))

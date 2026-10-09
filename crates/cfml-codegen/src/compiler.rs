@@ -1557,6 +1557,55 @@ pub enum BytecodeOp {
 }
 
 impl BytecodeOp {
+    /// Heap carried by this op's OPERANDS, for memory reporting only.
+    ///
+    /// `size_of::<BytecodeOp>() * capacity` counts the instruction vector but
+    /// not what the operands point at, so a template full of string literals
+    /// and named-argument lists reported a fraction of its real size — the
+    /// debug footer's "Compiled code" pot read ~76 MB on a Preside server the
+    /// heap profiler put nearer 121 MB.
+    ///
+    /// Shared operands are counted ONCE per distinct backing store: the
+    /// compiler interns literals heavily, so charging every referencing site
+    /// would multiply one string by the number of places it is used. Variants
+    /// not listed carry no heap of their own.
+    pub fn operand_heap_bytes(&self, seen: &mut std::collections::HashSet<usize>) -> u64 {
+        #[inline]
+        fn once(seen: &mut std::collections::HashSet<usize>, ptr: usize, bytes: u64) -> u64 {
+            if seen.insert(ptr) { bytes } else { 0 }
+        }
+        fn names(v: &[String]) -> u64 {
+            24 + v.iter().map(|x| 24 + x.len() as u64).sum::<u64>()
+        }
+        match self {
+            BytecodeOp::String(a) | BytecodeOp::UnsetPath(a) | BytecodeOp::Include(a) => once(
+                seen,
+                std::sync::Arc::as_ptr(a) as *const () as usize,
+                32 + a.len() as u64,
+            ),
+            BytecodeOp::WriteText(a) => once(
+                seen,
+                a.as_ptr() as *const () as usize,
+                16 + a.len() as u64,
+            ),
+            BytecodeOp::BuildStructStatic(a) => once(
+                seen,
+                a.as_ptr() as *const () as usize,
+                16 + (a.len() * std::mem::size_of::<Name>()) as u64,
+            ),
+            BytecodeOp::SetScopePath(a) => once(
+                seen,
+                std::sync::Arc::as_ptr(a) as *const () as usize,
+                16 + std::mem::size_of::<ScopePath>() as u64,
+            ),
+            BytecodeOp::NewObjectNamed(v, _)
+            | BytecodeOp::CallComputedMethodNamed(v, _)
+            | BytecodeOp::CallNamed(v, _) => names(v),
+            BytecodeOp::CallMethod(_, _, Some(v)) => names(v),
+            _ => 0,
+        }
+    }
+
     /// Dense opcode index for the dynamic op census (`op-census` builds).
     /// Generated from the variant order of this enum; kept in lockstep with
     /// [`Self::CENSUS_NAMES`].

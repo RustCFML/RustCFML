@@ -70,6 +70,7 @@ impl CfmlVirtualMachine {
         }
         let snap = guard.as_ref().expect("just filled");
         let mut pots = snap.pots.clone();
+        let pools = cfml_stdlib::builtins::db_pool_count();
         // "Other" is the rest of the live heap, recomputed against the current
         // total rather than the cached one.
         if let Some(live) = live_heap {
@@ -77,9 +78,15 @@ impl CfmlVirtualMachine {
             pots.push(MemoryPot {
                 name: "Other".to_string(),
                 bytes: live.saturating_sub(attributed),
-                detail: "the REMAINDER, not a measurement: in-flight requests, database \
-                 driver buffers, the collector's own logs, and whatever the pots above \
-                 under-count".to_string(),
+                detail: format!(
+                    "the REMAINDER, not a measurement: in-flight requests, the \
+                     per-request allocation logs (thread-local, not summable here), \
+                     the driver buffers behind {} database connection pool{} (not \
+                     sizeable through the driver crates), and whatever the pots above \
+                     under-count",
+                    pools,
+                    if pools == 1 { "" } else { "s" }
+                ),
             });
         }
         (pots, snap.at.elapsed().as_secs())
@@ -270,6 +277,17 @@ fn estimate_pots(ss: &ServerState) -> Vec<MemoryPot> {
         name: "Interned names".to_string(),
         bytes: cfml_common::name::Name::interned_bytes(),
         detail: format!("{} names", cfml_common::name::Name::interned_count()),
+    });
+
+    // The collector's CROSS-REQUEST survivor table: weak handles to every
+    // container that outlived the request that created it. Its own memory, not
+    // the containers'. Per-request logs are thread-local and cannot be summed
+    // from here, so they stay in the remainder below.
+    let (gc_n, gc_bytes) = cfml_common::cycle_gc::persistent_set_bytes();
+    out.push(MemoryPot {
+        name: "Collector survivor table".to_string(),
+        bytes: gc_bytes,
+        detail: format!("{} tracked containers", gc_n),
     });
 
     // Compiled regular expressions. The pattern strings are exact; the

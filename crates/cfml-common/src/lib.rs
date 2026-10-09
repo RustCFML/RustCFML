@@ -12,6 +12,7 @@ pub mod component;
 pub mod cycle_gc;
 pub mod datetime;
 pub mod dirlist;
+pub mod container_size;
 pub mod dynamic;
 pub mod encodings;
 pub mod equality;

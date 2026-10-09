@@ -879,11 +879,16 @@ fn scalar_bytes(v: &CfmlValue, strings: &mut PtrSet) -> u64 {
 }
 
 fn map_bytes<'a>(entries: impl Iterator<Item = (&'a str, &'a CfmlValue)>, strings: &mut PtrSet) -> u64 {
-    let mut n = 32;
+    // Sizes come from `container_size` so this estimator and the memory
+    // panel's cannot drift apart; they each used to carry the same sketch,
+    // which under-counted a container by 2-4x.
+    let mut n = 0u64;
+    let mut len = 0usize;
     for (k, v) in entries {
-        n += 40 + k.len() as u64 + scalar_bytes(v, strings);
+        len += 1;
+        n += k.len() as u64 + scalar_bytes(v, strings);
     }
-    n
+    n + crate::container_size::struct_bytes(len)
 }
 
 /// This thread's census: what the running request created, and what of it is
@@ -946,7 +951,8 @@ pub fn request_census() -> RequestCensus {
                 }
                 let b = a
                     .try_read()
-                    .map(|v| 32 + v.len() as u64 * 24 + v.iter().map(|x| scalar_bytes(x, &mut strings)).sum::<u64>())
+                    .map(|v| crate::container_size::array_bytes(v.len())
+                        + v.iter().map(|x| scalar_bytes(x, &mut strings)).sum::<u64>())
                     .unwrap_or(32);
                 out.arrays.alive += 1;
                 out.arrays.alive_bytes += b;
@@ -1685,6 +1691,27 @@ struct PersistentSet {
 }
 
 static PERSISTENT: parking_lot::Mutex<Option<PersistentSet>> = parking_lot::Mutex::new(None);
+
+/// `(entries, bytes)` held by the CROSS-REQUEST survivor set, for the debug
+/// footer's memory panel. This is the collector's own table — weak handles to
+/// every container that outlived the request that made it — not the containers
+/// themselves. It is real memory and had no pot, so it landed in the panel's
+/// unattributed remainder; on a warm server it is tens of megabytes.
+///
+/// Per-request allocation logs are thread-local and are NOT included: they
+/// belong to whichever request thread is running and cannot be summed from
+/// here.
+pub fn persistent_set_bytes() -> (usize, u64) {
+    let g = PERSISTENT.lock();
+    match g.as_ref() {
+        Some(p) => (
+            p.entries.len(),
+            (p.entries.capacity() * std::mem::size_of::<TrackedAlloc>()) as u64
+                + (p.seen.len() * std::mem::size_of::<usize>() * 2) as u64,
+        ),
+        None => (0, 0),
+    }
+}
 
 /// Floor for the cross-request sweep budget, so a small application does not
 /// sweep on every request just because its live set is tiny. Overridable with

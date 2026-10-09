@@ -796,7 +796,15 @@ impl BytecodeCache {
                     + (f.instructions.capacity() * std::mem::size_of::<BytecodeOp>()) as u64
                     + f.name.len() as u64
                     + f.params.iter().map(|p| 24 + p.len() as u64).sum::<u64>()
-                    + f.source_file.as_ref().map(|p| p.len() as u64).unwrap_or(0);
+                    + f.source_file.as_ref().map(|p| p.len() as u64).unwrap_or(0)
+                    // ...and what the operands POINT AT. The line above counts
+                    // the instruction vector; a template full of string
+                    // literals and named-argument lists keeps far more behind
+                    // it. Shared literals are counted once (same `seen`).
+                    + f.instructions
+                        .iter()
+                        .map(|op| op.operand_heap_bytes(&mut seen))
+                        .sum::<u64>();
             }
         }
         (entries.len(), bytes)
