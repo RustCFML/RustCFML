@@ -33,5 +33,20 @@ assert("the second instance does not keep the first's",
 	structKeyExists( second, "gh481HelperA" ), false);
 assert("and the function is callable", second.gh481HelperB(), "B");
 
+// GH 481 (second report) — the include's path is a LITERAL, but it sits under a
+// condition the first instance fails. The include runs per instance, so the
+// second instance (condition now true) must get the template's functions even
+// though the first construction built the class without them.
+structDelete( request, "gh481Ready" );
+condFirst = new oop.fixtures.gh481.CondSub();
+request.gh481Ready = true;
+condSecond = new oop.fixtures.gh481.CondSub();
+assert("the skipping instance does not have the helper",
+	structKeyExists( condFirst, "gh481HelperG" ), false);
+assert("the including instance has the helper",
+	structKeyExists( condSecond, "gh481HelperG" ), true);
+assert("and an unscoped call from a method finds it", condSecond.gh481CallHelper(), "g");
+structDelete( request, "gh481Ready" );
+
 suiteEnd();
 </cfscript>

@@ -5316,15 +5316,13 @@ impl CfmlCompiler {
         }
 
         // A pseudo-constructor `include` whose path is not a literal can resolve
-        // to a DIFFERENT template per instance, so the methods it declares are
-        // not class-invariant. Mark the class: the VM then keeps each instance's
-        // methods inline instead of sharing one per-class method table built by
-        // the first construction, which gave every later instance the first
-        // template's functions (GH #481).
-        if body.iter().any(|st| match st {
-            Statement::Include(i) => !matches!(i.path, Expression::Literal(_)),
-            _ => false,
-        }) {
+        // to a DIFFERENT template per instance, and one under control flow can
+        // run for one instance and not another — either way the methods it
+        // declares are not class-invariant. Mark the class: the VM then keeps
+        // each instance's methods inline instead of sharing one per-class
+        // method table built by the first construction, which gave every later
+        // instance the first construction's functions (GH #481).
+        if include_set_varies(body.iter().copied()) {
             instructions.push(BytecodeOp::String(std::sync::Arc::new(
                 "__dyn_include".to_string(),
             )));
@@ -7240,6 +7238,55 @@ fn is_literal_text_output(st: &Statement) -> bool {
     matches!(fc.name.as_ref(), Expression::Identifier(id) if id.name.eq_ignore_ascii_case("__writeText"))
         && fc.arguments.len() == 1
         && matches!(&fc.arguments[0], Expression::Literal(Literal { value: LiteralValue::String(_), .. }))
+}
+
+/// Does this statement contain a `Statement::Include` anywhere below it?
+/// Function/component declarations are skipped: an include inside a method body
+/// runs at call time, not in the pseudo-constructor, so it never declares class
+/// methods. Expressions are not descended into (a closure body's include is
+/// likewise not a pseudo-constructor include when it runs).
+fn stmt_contains_include(st: &Statement) -> bool {
+    let any = |b: &[Statement]| b.iter().any(stmt_contains_include);
+    match st {
+        Statement::Include(_) => true,
+        Statement::If(i) => {
+            any(&i.then_branch)
+                || i.else_if.iter().any(|e| any(&e.body))
+                || i.else_branch.as_deref().is_some_and(any)
+        }
+        Statement::Switch(s) => {
+            s.cases.iter().any(|c| any(&c.body)) || s.default_case.as_deref().is_some_and(any)
+        }
+        Statement::For(f) => {
+            f.init.as_deref().is_some_and(stmt_contains_include) || any(&f.body)
+        }
+        Statement::ForIn(f) => any(&f.body),
+        Statement::While(w) => any(&w.body),
+        Statement::Do(d) => any(&d.body),
+        Statement::Try(t) => {
+            any(&t.body)
+                || t.catches.iter().any(|c| any(&c.body))
+                || t.finally_body.as_deref().is_some_and(any)
+        }
+        Statement::Output(o) => any(&o.body),
+        _ => false,
+    }
+}
+
+/// Can the set of methods a pseudo-constructor's `include`s declare differ
+/// between instances of the class? True when any include's path is not a
+/// literal (it can resolve to a different template per instance), or when any
+/// include sits under control flow (`if`/loop/`switch`/`try` — it may run for
+/// one instance and not another, GH #481). A literal include at the top level
+/// of the body always runs and always pulls the same template, so it keeps the
+/// shared per-class method table. `<cfoutput>` blocks are transparent: their
+/// statements run unconditionally.
+fn include_set_varies<'a>(body: impl Iterator<Item = &'a Statement>) -> bool {
+    body.into_iter().any(|st| match st {
+        Statement::Include(i) => !matches!(i.path, Expression::Literal(_)),
+        Statement::Output(o) => include_set_varies(o.body.iter()),
+        _ => stmt_contains_include(st),
+    })
 }
 
 fn is_literal_scope_assignment(st: &Statement) -> bool {
