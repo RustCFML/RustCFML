@@ -30,6 +30,11 @@ pub struct Parser {
 /// nesting level walks the full precedence chain (~10 frames), so this stays
 /// well below what a thread stack can hold while remaining far above any
 /// hand-written CFML expression.
+/// Variable a script-form `procresult name="x"` parks its name in, for the
+/// enclosing `storedproc { }` lowering to lift out and delete (GH #485). Never
+/// reaches generated code: the parent removes the marker statement.
+const PROC_RESULT_MARKER: &str = "__cfproc_result_name";
+
 const MAX_EXPR_DEPTH: usize = 64;
 
 /// Maximum statement nesting depth (nested blocks / function declarations).
@@ -1486,6 +1491,10 @@ impl Parser {
                 // `cfzip(…)` / `invoke(obj,"m",args)` call forms are untouched.
                 "zip" => Some("cfzip"),
                 "invoke" => Some("cfinvoke"),
+                //   storedproc procedure=… datasource=… { procparam cfsqltype=… value=…; }
+                // Same child-tag shape; `procparam`/`procresult` below append to
+                // the array this seeds (GH #485).
+                "storedproc" => Some("cfstoredproc"),
                 _ => None,
             };
             if let Some(canonical) = body_tag {
@@ -1510,8 +1519,8 @@ impl Parser {
                             && !self.check(&Token::Semicolon)
                             && !self.is_at_end()
                         {
-                            if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
-                                let key = self.extract_identifier()?;
+                            if self.is_tag_attr_key_at(0) && matches!(self.peek(1), Token::Equal) {
+                                let key = self.extract_tag_attr_key()?;
                                 self.advance(); // consume '='
                                 match self.parse_expression() {
                                     Ok(v) => attrs.push((key, v)),
@@ -1718,6 +1727,114 @@ impl Parser {
                     })),
                     location: stmt_loc,
                 })));
+            }
+            // `procparam cfsqltype="char" value=x null=false;` (or the
+            // parenthesised / cf-prefixed spellings) inside a script
+            // `storedproc … { }` body: appends to the array the parent seeds, at
+            // RUNTIME, so a param inside `if`/`for` is seen (GH #485). Mirrors
+            // `httpparam` above; `null` is a legal attribute name here, hence
+            // `extract_tag_attr_key`.
+            if (nlow == "procparam" || nlow == "cfprocparam")
+                && ((self.is_tag_attr_key_at(1) && matches!(self.peek(2), Token::Equal))
+                    || matches!(self.peek(1), Token::LParen))
+            {
+                let paren = matches!(self.peek(1), Token::LParen);
+                self.advance(); // procparam
+                if paren {
+                    self.advance(); // (
+                }
+                let mut pairs: Vec<(Expression, Expression)> = Vec::new();
+                while !self.check(&Token::Semicolon)
+                    && !self.check(&Token::RBrace)
+                    && !self.check(&Token::RParen)
+                    && !self.is_at_end()
+                {
+                    if self.is_tag_attr_key_at(0) && matches!(self.peek(1), Token::Equal) {
+                        let pname = self.extract_tag_attr_key()?;
+                        self.advance(); // =
+                        let pvalue = self.parse_expression()?;
+                        pairs.push((
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(pname.to_lowercase()),
+                                location: stmt_loc,
+                            }),
+                            pvalue,
+                        ));
+                        if paren {
+                            self.match_token(&Token::Comma);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if paren {
+                    self.match_token(&Token::RParen);
+                }
+                self.match_token(&Token::Semicolon);
+                return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "arrayAppend".to_string(),
+                            location: stmt_loc,
+                        })),
+                        arguments: vec![
+                            Expression::Identifier(Identifier {
+                                name: "__cfproc_params".to_string(),
+                                location: stmt_loc,
+                            }),
+                            Expression::Struct(Struct { pairs, ordered: false, location: stmt_loc }),
+                        ],
+                        location: stmt_loc,
+                    })),
+                    location: stmt_loc,
+                })));
+            }
+            // `procresult name="rs";` names the variable the result lands in. It
+            // carries that name to the enclosing `storedproc` lowering as a
+            // marker assignment, which the parent lifts out and removes — the
+            // name has to be known at COMPILE time to be an assignment target.
+            if (nlow == "procresult" || nlow == "cfprocresult")
+                && ((self.is_tag_attr_key_at(1) && matches!(self.peek(2), Token::Equal))
+                    || matches!(self.peek(1), Token::LParen))
+            {
+                let paren = matches!(self.peek(1), Token::LParen);
+                self.advance(); // procresult
+                if paren {
+                    self.advance(); // (
+                }
+                let mut name_expr: Option<Expression> = None;
+                while !self.check(&Token::Semicolon)
+                    && !self.check(&Token::RBrace)
+                    && !self.check(&Token::RParen)
+                    && !self.is_at_end()
+                {
+                    if self.is_tag_attr_key_at(0) && matches!(self.peek(1), Token::Equal) {
+                        let pname = self.extract_tag_attr_key()?;
+                        self.advance(); // =
+                        let pvalue = self.parse_expression()?;
+                        if pname.eq_ignore_ascii_case("name") {
+                            name_expr = Some(pvalue);
+                        }
+                        if paren {
+                            self.match_token(&Token::Comma);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if paren {
+                    self.match_token(&Token::RParen);
+                }
+                self.match_token(&Token::Semicolon);
+                return Ok(CfmlNode::Statement(Statement::Assignment(Box::new(Assignment {
+                    target: AssignTarget::Variable(PROC_RESULT_MARKER.to_string()),
+                    value: name_expr.unwrap_or(Expression::Literal(Literal {
+                        value: LiteralValue::String(String::new()),
+                        location: stmt_loc,
+                    })),
+                    operator: AssignOp::Equal,
+                    location: stmt_loc,
+                }))));
             }
             // cfzipparam(source=…, prefix=…, …) → appends to the runtime array
             // that the surrounding script `cfzip(){ }` (or the <cfzip> tag body)
@@ -3906,6 +4023,105 @@ impl Parser {
                 });
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }
+            // Script `storedproc procedure=… datasource=… { procparam …; procresult …; }`
+            // (GH #485). Lowers to the same `CALL proc(?,?)` queryExecute the
+            // `<cfstoredproc>` tag builds, with the params collected at RUNTIME
+            // so a `procparam` inside `if`/`for` is seen. `procresult name="x"`
+            // names the result variable; without one it is `cfresult`, as in tag
+            // form.
+            "cfstoredproc" => {
+                let call = |name: &str, arguments: Vec<Expression>| Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier { name: name.to_string(), location: loc })),
+                    arguments,
+                    location: loc,
+                }));
+                let str_lit = |t: &str| Expression::Literal(Literal {
+                    value: LiteralValue::String(t.to_string()),
+                    location: loc,
+                });
+                let ident = |n: &str| Expression::Identifier(Identifier { name: n.to_string(), location: loc });
+                let concat = |l: Expression, r: Expression| Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(l),
+                    operator: BinaryOpType::Concat,
+                    right: Box::new(r),
+                    location: loc,
+                }));
+                let pick = |want: &str| attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(want))
+                    .map(|(_, v)| v.clone());
+
+                // `procresult name="x"` lowers to a marker assignment the body
+                // carries; lift the name out of it and drop the marker, so the
+                // result lands in the variable the author named.
+                let mut result_var: Option<String> = None;
+                let body: Vec<Statement> = body
+                    .into_iter()
+                    .filter(|st| {
+                        if let Statement::Assignment(a) = st {
+                            if matches!(&a.target, AssignTarget::Variable(n) if n == PROC_RESULT_MARKER) {
+                                if let Expression::Literal(Literal { value: LiteralValue::String(nm), .. }) = &a.value {
+                                    result_var = Some(nm.clone());
+                                }
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+
+                let procedure = pick("procedure").unwrap_or_else(|| str_lit(""));
+                let mut stmts = vec![Statement::Assignment(Box::new(Assignment {
+                    target: AssignTarget::Variable("__cfproc_params".to_string()),
+                    value: Expression::Array(Array { elements: vec![], location: loc }),
+                    operator: AssignOp::Equal,
+                    location: loc,
+                }))];
+                stmts.extend(body);
+
+                // "?,?," trimmed of its trailing comma — empty when no params.
+                let n_params = call("arrayLen", vec![ident("__cfproc_params")]);
+                let placeholders = Expression::Ternary(Box::new(Ternary {
+                    condition: Box::new(Expression::BinaryOp(Box::new(BinaryOp {
+                        left: Box::new(n_params.clone()),
+                        operator: BinaryOpType::Equal,
+                        right: Box::new(Expression::Literal(Literal {
+                            value: LiteralValue::Int(0),
+                            location: loc,
+                        })),
+                        location: loc,
+                    }))),
+                    then_expr: Box::new(str_lit("")),
+                    else_expr: Box::new(call("reReplace", vec![
+                        call("repeatString", vec![str_lit("?,"), n_params]),
+                        str_lit(",$"),
+                        str_lit(""),
+                        str_lit("one"),
+                    ])),
+                    location: loc,
+                }));
+                let sql = concat(
+                    concat(concat(str_lit("CALL "), procedure), str_lit("(")),
+                    concat(placeholders, str_lit(")")),
+                );
+
+                let mut qe_args = vec![sql, ident("__cfproc_params")];
+                if let Some(ds) = pick("datasource") {
+                    qe_args.push(Expression::Struct(Struct {
+                        pairs: vec![(str_lit("datasource"), ds)],
+                        ordered: false,
+                        location: loc,
+                    }));
+                }
+                stmts.push(Statement::Assignment(Box::new(Assignment {
+                    target: AssignTarget::Variable(
+                        result_var.filter(|n| !n.is_empty()).unwrap_or_else(|| "cfresult".to_string()),
+                    ),
+                    value: call("queryExecute", qe_args),
+                    operator: AssignOp::Equal,
+                    location: loc,
+                })));
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
             // Script `cfinvoke( component=…, method=… ) { cfinvokeArgument(…); }`.
             // The child arguments accumulate into __cfinvoke_args at runtime, so
             // an argument added inside `if`/`for` is seen — then the same
@@ -5673,6 +5889,29 @@ impl Parser {
     /// Check if the next token can be used as an identifier (true Identifier or soft keyword).
     fn is_identifier_like(&self) -> bool {
         self.is_identifier_like_at(0)
+    }
+
+    /// Whether the token at `offset` can be a TAG ATTRIBUTE name.
+    ///
+    /// Identical to [`Self::is_identifier_like_at`] plus the `null` keyword:
+    /// `null` is an ordinary attribute of `cfprocparam`/`cfqueryparam`/`cfcookie`,
+    /// but it lexes as [`Token::Null`], so every attribute loop stopped dead at
+    /// `null=false` (GH #485). `parse_struct_literal` already softens it the same
+    /// way for the `{value:…, cfsqltype:…, null:true}` shape the cfqueryparam
+    /// compiler emits. Deliberately NOT folded into `is_identifier_like_at`,
+    /// which also governs expression and declaration contexts where `null` must
+    /// keep its literal meaning.
+    fn is_tag_attr_key_at(&self, offset: usize) -> bool {
+        self.is_identifier_like_at(offset) || matches!(self.peek(offset), Token::Null)
+    }
+
+    /// Consume a tag attribute name — see [`Self::is_tag_attr_key_at`].
+    fn extract_tag_attr_key(&mut self) -> Result<String, ParseError> {
+        if matches!(self.peek(0), Token::Null) {
+            self.advance();
+            return Ok("null".to_string());
+        }
+        self.extract_identifier()
     }
 
     /// Decide whether a `component` token at the current position begins a CFC

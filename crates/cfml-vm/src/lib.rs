@@ -4745,7 +4745,15 @@ fn is_reference_value(v: &CfmlValue) -> bool {
 }
 
 fn is_engine_frame_local(name: &str) -> bool {
-    name.eq_ignore_ascii_case("__cfquery_params") || name.eq_ignore_ascii_case("__cfhttp_params")
+    name.eq_ignore_ascii_case("__cfquery_params")
+        || name.eq_ignore_ascii_case("__cfhttp_params")
+        // Same accumulator shape, same hazard: `<cfstoredproc>`/`storedproc{}`
+        // and `<cfzip>`/`cfzip(){}` seed an array their child tags append to.
+        // Left in the component `variables` scope they were both shared by every
+        // thread holding the instance (GH #362) and visible to user code after
+        // the call.
+        || name.eq_ignore_ascii_case("__cfproc_params")
+        || name.eq_ignore_ascii_case("__cfzip_params")
 }
 
 impl CfmlVirtualMachine {
@@ -39851,7 +39859,25 @@ impl CfmlVirtualMachine {
             // A cookie written in attribute form is always emitted: its value
             // may equal the incoming one while the attributes (httpOnly, path,
             // expires) are the point of the write.
-            let attrs = attrs.get(&key.to_lowercase()).cloned();
+            //
+            // The parked attributes are only this cookie's as long as the live
+            // value is still the one they were parked with. A later PLAIN write
+            // (`cookie.x = "second"`) replaces the value without going near the
+            // attribute store, so rendering from a stale struct sent the FIRST
+            // value and silently dropped the second (GH #486). Comparing the
+            // collapsed `value` is what makes the plain write win, and it also
+            // covers delete-then-reset. Lucee emits BOTH headers in order; one
+            // header carrying the final value leaves the client in the same
+            // state, which is what this store (one entry per name) can express.
+            let attrs = attrs
+                .get(&key.to_lowercase())
+                .filter(|a| match a {
+                    CfmlValue::Struct(s) => s
+                        .get_ci("value")
+                        .is_some_and(|v| v.as_string() == value.as_string()),
+                    _ => false,
+                })
+                .cloned();
             let unchanged = attrs.is_none()
                 && self
                     .initial_cookies

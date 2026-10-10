@@ -686,6 +686,9 @@ include "harness.cfm";
 <!--- cfhtmlhead exists as a tag (v0.186) but must ALSO be script-callable (cfhtmlhead(text=)); RustCFML threw "undefined". --->
 <cf_runtest file="tags/test_cfhtmlhead_script_callable.cfm" />
 <cf_runtest file="tags/test_cfstoredproc_runtime_body.cfm" />
+<!--- storedproc in cfscript was a parse error: the name was not a recognised
+      script tag, so its body block was read as a struct literal (GH #485). --->
+<cf_runtest file="tags/test_gh485_storedproc_script_form.cfm" />
 <cf_runtest file="tags/test_tags_cfimport.cfm" />
 <cf_runtest file="tags/test_tags_cfthread.cfm" />
 <cf_runtest file="tags/test_cfthread_metadata.cfm" />
@@ -1269,5 +1272,8 @@ include "harness.cfm";
 <!--- A cookie set in long form reads back as its value in the same request
       (GH #480). Serve-mode only; skips on the CLI. --->
 <cf_runtest file="server/test_cookie_struct_form_readback.cfm" />
+<!--- A long-form cookie overwritten with a plain value sent the FIRST value:
+      the parked attributes outlived the write that replaced them (GH #486). --->
+<cf_runtest file="server/test_cookie_overwrite_after_struct_form.cfm" />
 
 <cfscript> printSummary(); </cfscript>

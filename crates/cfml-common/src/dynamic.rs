@@ -1705,6 +1705,14 @@ impl CfmlStruct {
         let prev = g.map.shift_remove(key);
         if prev.is_some() {
             g.shape_id = next_shape_id();
+            // A deleted cookie takes its parked long-form attributes with it,
+            // or a later plain write under the same name would be rendered
+            // from the dead struct (GH #486). Free inside the write lock we
+            // already hold, and the map is empty for every non-cookie scope.
+            if g.cookie_scope {
+                let lower = key.to_ascii_lowercase();
+                g.cookie_attrs.remove(&lower);
+            }
         }
         let persistent = g.persistent_scope;
         drop(g);

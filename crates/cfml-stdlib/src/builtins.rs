@@ -15077,12 +15077,28 @@ fn run_mssql_statement(
             bound.iter().map(|p| p as &dyn tiberius::ToSql).collect();
 
         if is_select {
-            let stream = client.query(rewritten.as_str(), &param_refs).await
+            let mut stream = client.query(rewritten.as_str(), &param_refs).await
                 .map_err(|e| MssqlRunError::from_tiberius("query error", e, true))?;
+            // Column names come from the result-set METADATA, which tiberius
+            // exposes by peeking the stream ahead of the first row. Deriving
+            // them from `result.first()` gave a zero-row SELECT no columns at
+            // all, so `query.columnList` was empty and reading any column of an
+            // empty result threw — the same defect GH #474 fixed on the MySQL
+            // transaction path, which this driver still had on BOTH paths.
+            let meta_columns: Vec<String> = stream
+                .columns()
+                .await
+                .map_err(|e| MssqlRunError::from_tiberius("result error", e, true))?
+                .map(|cols| cols.iter().map(|c| c.name().to_string()).collect())
+                .unwrap_or_default();
             let result = stream.into_first_result().await
                 .map_err(|e| MssqlRunError::from_tiberius("result error", e, true))?;
 
-            let raw_columns: Vec<String> = if let Some(first_row) = result.first() {
+            // The first row stays the fallback for the case where the server
+            // sent rows but no usable metadata; it cannot help when empty.
+            let raw_columns: Vec<String> = if !meta_columns.is_empty() {
+                meta_columns
+            } else if let Some(first_row) = result.first() {
                 first_row.columns().iter()
                     .map(|c| c.name().to_string())
                     .collect()
