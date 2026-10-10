@@ -48,5 +48,22 @@ assert("the including instance has the helper",
 assert("and an unscoped call from a method finds it", condSecond.gh481CallHelper(), "g");
 structDelete( request, "gh481Ready" );
 
+// GH 487 — the `__dyn_include` class marker that drives the per-instance
+// include handling is engine bookkeeping and must NOT be visible to user code:
+// not in for-in, not in structKeyList, not readable. v0.726.0 leaked it on any
+// class whose pseudo-constructor has an include under control flow.
+request.gh481Ready = true;
+leakProbe = new oop.fixtures.gh481.CondSub();
+leaked = [];
+for ( k in leakProbe ) {
+	if ( left( k, 2 ) == "__" ) { arrayAppend( leaked, k ); }
+}
+assert("for-in over the instance shows no __ bookkeeping keys", arrayToList( leaked ), "");
+assert("structKeyList does not show __dyn_include",
+	findNoCase( "__dyn_include", structKeyList( leakProbe ) ), 0);
+assert("structKeyExists does not see __dyn_include",
+	structKeyExists( leakProbe, "__dyn_include" ), false);
+structDelete( request, "gh481Ready" );
+
 suiteEnd();
 </cfscript>
