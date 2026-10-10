@@ -34,5 +34,31 @@ assert("numberFormat out of order", numberFormat( mask = "0.00", number = 1.5 ),
 assert("positional listAppend", listAppend( "a", "x" ), "a,x");
 assert("positional left", left( "abcdef", 2 ), "ab");
 
+// ── Lucee's OWN argument names, which the first pass of this table missed ──
+// The table was written from the canonical cfdocs name per parameter, so 138
+// spellings Lucee accepts — its documented aliases, and in a few cases the name
+// Lucee actually declares (`haystack`/`needle` for arrayContains) — matched
+// nothing and fell back to binding in CALL ORDER. Reversed, they silently
+// misbound. Every case below was measured on Lucee 7.1.0.204 and agrees.
+arrGh482 = [ "a", "b", "c" ];
+assert("arrayContains by Lucee's own names, reversed",
+	arrayContains( needle = "b", haystack = arrGh482 ), 2);
+assert("arrayFind by Lucee's own names, reversed",
+	arrayFind( value_or_closure = "c", array = arrGh482 ), 3);
+assert("replace( substring= ) — Lucee's name for substring1",
+	replace( substring2 = "Y", string = "aXb", substring = "X" ), "aYb");
+assert("expandPath( relative_path= )", len( expandPath( relative_path = "/x" ) ) GT 0, true);
+assert("duplicate( deepcopy=, object= ) reversed",
+	isArray( duplicate( deepcopy = true, object = [ 1, 2 ] ) ), true);
+assert("arrayReduce by Lucee's alias set, fully reversed",
+	arrayReduce( initalvalue = 10, object = [ 1, 2 ], callback = function( a, b ) { return a + b; } ), 13);
+// serializeJSON's second parameter is `queryFormat` on Lucee, not the
+// `serializeQueryByColumns` the table had; naming it used to be ignored, so a
+// query came back in column format whatever was asked for.
+gh482q = queryNew( "id,name", "integer,varchar", [ [ 1, "a" ] ] );
+gh482rows = deserializeJSON( serializeJSON( queryFormat = "struct", var = gh482q ) );
+assert("serializeJSON( queryFormat= ) is honoured when named", isArray( gh482rows ), true);
+assert("and it produced a row struct", gh482rows[ 1 ].id, 1);
+
 suiteEnd();
 </cfscript>
