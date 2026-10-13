@@ -573,6 +573,8 @@ include "harness.cfm";
 <cf_runtest file="tags/test_zip_tag_params.cfm" />
 <cf_runtest file="tags/test_tag_preprocessor_masa_fixes.cfm" />
 <cf_runtest file="tags/test_cfmodule_script_form.cfm" />
+<!--- A custom tag reads its calling function's arguments only by explicit arguments.x. --->
+<cf_runtest file="tags/test_custom_tag_caller_arguments.cfm" />
 <cf_runtest file="tags/test_seethrough_udf_variables.cfm" />
 <cf_runtest file="tags/test_include_udf_no_caller_locals.cfm" />
 <cf_runtest file="tags/test_tags_basic.cfm" />

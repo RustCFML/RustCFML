@@ -2369,6 +2369,21 @@ pub struct CfmlVirtualMachine {
     /// `frame_ctx.last()` is not guaranteed to describe the frame that is actually
     /// running — and a wrong answer here silently changes what `local` means.
     frame_has_local_scope: bool,
+    /// Is the frame currently executing a custom-tag / `cfmodule` template (or
+    /// a template included from one)? Its `arguments` scope is the CALLING
+    /// function's, bridged in by [`Self::custom_tag_frame`] so an explicit
+    /// `arguments.x` reads it, as on Lucee. Lucee does not put that scope in a
+    /// tag's bare-name chain, though: an unscoped read does not find
+    /// `arguments` keys, and an unscoped write lands in the tag's `variables`
+    /// even when an argument has the same name. The undeclared-argument cascade
+    /// steps are skipped while this is set.
+    ///
+    /// Saved and restored by `execute_function_with_args` exactly like
+    /// `frame_has_local_scope`.
+    frame_args_explicit_only: bool,
+    /// Set by `execute_custom_tag_template_impl` for the one template frame it
+    /// is about to run; taken by `execute_function_with_args`.
+    pending_custom_tag_frame: bool,
     /// The live `local` scope handle of the CURRENT frame, once `local` has
     /// been read as a value in it (`var s = local`, `getVariable("local")`,
     /// `evaluate("local")`, passing `local` to a helper). `None` in every
@@ -4672,6 +4687,10 @@ struct FrameScopeCache {
     args_len: usize,
     /// A closure-env carrier or an arguments extra is present: generic path.
     blocked: bool,
+    /// The frame's `arguments` is a calling function's, seen from a custom
+    /// tag (see `frame_args_explicit_only`): not part of bare-name resolution,
+    /// so its keys neither block the direct path nor invalidate it.
+    args_explicit_only: bool,
 }
 
 impl FrameScopeCache {
@@ -4682,10 +4701,14 @@ impl FrameScopeCache {
             .get(&*cfml_common::key::well_known::VARIABLES)
             .and_then(|x| x.as_cfml_struct())
             .cloned();
-        self.args = locals
-            .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
-            .and_then(|x| x.as_cfml_struct())
-            .cloned();
+        self.args = if self.args_explicit_only {
+            None
+        } else {
+            locals
+                .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                .and_then(|x| x.as_cfml_struct())
+                .cloned()
+        };
         let has_marker = locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV);
         let (args_len, extras) = match &self.args {
             Some(a) => a.with_map(|m| {
@@ -4791,6 +4814,8 @@ impl CfmlVirtualMachine {
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
             frame_has_local_scope: false,
+            frame_args_explicit_only: false,
+            pending_custom_tag_frame: false,
             escaped_local: None,
             local_watch: false,
             #[cfg(feature = "scope-pool")]
@@ -8508,6 +8533,9 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         #[cfg(feature = "call-phases")]
         let _cp_wrap = std::time::Instant::now();
+        // Taken before anything can return early, so the hand-off from
+        // `execute_custom_tag_template_impl` can never outlive this one frame.
+        let custom_tag_frame = std::mem::take(&mut self.pending_custom_tag_frame);
         // `--max-memory` hard tier. Frame entry is the poll point a runaway
         // allocator cannot avoid for long, and it costs one relaxed atomic load
         // against a ~1.3us frame when no limit is configured. See §85.
@@ -8533,6 +8561,14 @@ impl CfmlVirtualMachine {
         let local_watch_before = self.local_watch;
         self.frame_has_local_scope =
             !func.is_template_frame || self.include_share_local_keys.is_some();
+        // A custom-tag template, or a template included from one, sees the
+        // calling function's `arguments` only by explicit qualification. A
+        // function or method frame always has its own, and a component body
+        // has none to inherit.
+        let frame_args_explicit_only_before = self.frame_args_explicit_only;
+        self.frame_args_explicit_only = func.is_template_frame
+            && func.name == "__main__"
+            && (custom_tag_frame || frame_args_explicit_only_before);
         let try_depth_before = self.try_stack.len();
         let saved_buffers_before = self.saved_output_buffers.len();
 
@@ -8592,6 +8628,7 @@ impl CfmlVirtualMachine {
         self.call_stack.truncate(call_depth_before);
         self.frame_ctx.truncate(frame_ctx_before);
         self.frame_has_local_scope = frame_has_local_scope_before;
+        self.frame_args_explicit_only = frame_args_explicit_only_before;
         self.escaped_local = escaped_local_before;
         self.local_watch = local_watch_before;
         self.try_stack.truncate(try_depth_before);
@@ -9430,7 +9467,10 @@ impl CfmlVirtualMachine {
         // validated by `locals.version()`: any insert into (or removal from)
         // `locals` — including a replacement of `__variables` — bumps the
         // version, so a stale handle can never be used. See FrameScopeCache.
-        let mut scope_cache = FrameScopeCache::default();
+        let mut scope_cache = FrameScopeCache {
+            args_explicit_only: self.frame_args_explicit_only,
+            ..FrameScopeCache::default()
+        };
         // Direct-resolution fast paths apply to a page frame and to any frame
         // with a `variables` handle (CFC methods, UDFs called from a page) —
         // see FrameScopeCache. Writes additionally need classic localmode.
@@ -11092,6 +11132,7 @@ impl CfmlVirtualMachine {
                         } else if !declared_locals.contains_key(name.key())
                             && !locals.contains_key(name)
                             && name_lower != "arguments"
+                            && !self.frame_args_explicit_only
                             && !Self::is_live_param(func, &inherited_or_param_keys, &locals, name)
                             && locals
                                 .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
@@ -13543,7 +13584,11 @@ impl CfmlVirtualMachine {
                                     // (GH #478).
                                     || matches!(v, CfmlValue::Query(_))
                             };
-                            let existing_arg = if let Some(CfmlValue::Struct(args_scope)) =
+                            // Not from a custom tag: the calling function's
+                            // arguments are outside the tag's bare-name chain.
+                            let existing_arg = if self.frame_args_explicit_only {
+                                None
+                            } else if let Some(CfmlValue::Struct(args_scope)) =
                                 locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
                             {
                                 args_scope
@@ -24481,9 +24526,13 @@ impl CfmlVirtualMachine {
         // caller's argument — the ColdBox `preHandler( event, action )` idiom where
         // `rc`/`prc` are passed but not declared, so they live only in the arguments
         // scope. Comes BEFORE `__variables`/web scopes, per the CFML cascade.
-        if let Some(CfmlValue::Struct(args_scope)) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
-            if let Some(v) = args_scope.get_ci(name) {
-                return Some(v);
+        // Not in a custom tag, whose `arguments` is the caller's and outside the
+        // bare-name chain (see `frame_args_explicit_only`).
+        if !self.frame_args_explicit_only {
+            if let Some(CfmlValue::Struct(args_scope)) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+                if let Some(v) = args_scope.get_ci(name) {
+                    return Some(v);
+                }
             }
         }
         // Web request scopes (url/form/cgi/cookie) are always request-global:
@@ -24928,8 +24977,10 @@ impl CfmlVirtualMachine {
         // lookup that bare `prc` resolves to nothing and `prc.x ?: ""` silently
         // yields "" (Preside DataManager topRightButtons -> hasWorkflow("")
         // -> "Object [] does not exist"). Placed before `__variables` so the
-        // arguments scope correctly outranks the variables scope.
-        if name_lower != "arguments" {
+        // arguments scope correctly outranks the variables scope. A custom tag's
+        // `arguments` (the calling function's) is not in this chain on Lucee:
+        // see `frame_args_explicit_only`.
+        if name_lower != "arguments" && !self.frame_args_explicit_only {
             if let Some(CfmlValue::Struct(args)) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
                 // A NULL entry is a declared-but-omitted parameter (§105: the
                 // scope holds one per declared param, Lucee shape). It must not
@@ -25717,6 +25768,7 @@ impl CfmlVirtualMachine {
             // names already present in arguments and not a frame local.
             let is_undeclared_arg = !is_reserved_store_scope
                 && !locals.contains_key(scope)
+                && !self.frame_args_explicit_only
                 && locals
                     .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
                     .and_then(|v| v.as_cfml_struct())
@@ -34299,6 +34351,8 @@ impl CfmlVirtualMachine {
         let tag_func = self.program.functions[main_idx].clone();
 
         let saved_try_stack = std::mem::take(&mut self.try_stack);
+        // The template's `arguments` is the caller's, explicit access only.
+        self.pending_custom_tag_frame = true;
         let result = self.execute_function_with_args(&tag_func, Vec::new(), Some(tag_locals));
         self.try_stack = saved_try_stack;
         self.pop_program_swap(old_program);
