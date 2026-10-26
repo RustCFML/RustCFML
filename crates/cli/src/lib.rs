@@ -1245,7 +1245,7 @@ fn real_main() {
         memprofile::arm("rustcfml-memprofile");
     }
 
-    execute_file(&path, args.debug);
+    execute_file(&path, args.debug, args.bytecode_cache.as_ref().map(PathBuf::from));
 
     #[cfg(all(feature = "memprofile", unix))]
     if args.memprofile {
@@ -1258,13 +1258,13 @@ fn real_main() {
     }
 }
 
-fn execute_file(path: &PathBuf, debug: bool) {
+fn execute_file(path: &PathBuf, debug: bool, bytecode_cache_dir: Option<PathBuf>) {
     let source = fs::read_to_string(path).expect("Failed to read file");
-    execute_code_with_file(&source, debug, Some(path.to_string_lossy().to_string()));
+    execute_code_with_file(&source, debug, Some(path.to_string_lossy().to_string()), bytecode_cache_dir);
 }
 
 fn execute_code(source: &str, debug: bool) {
-    execute_code_with_file(source, debug, None);
+    execute_code_with_file(source, debug, None, None);
 }
 
 /// Resolve cfconfig in CLI (non-serve) mode. Searches the entry file's
@@ -1351,7 +1351,7 @@ fn configure_cfml_logging(cfconfig: &mut RustCfmlConfig, webroot: Option<&std::p
     cfconfig.logging.logs_directory = resolved.to_string_lossy().to_string();
 }
 
-fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>) {
+fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>, bytecode_cache_dir: Option<PathBuf>) {
     // CLI mode: load .cfconfig.json once, attach via a minimal ServerState so
     // the VM picks up runtime knobs, datasource registry, and security flags.
     // Without this, CFML tests can't observe cfconfig effects.
@@ -1368,6 +1368,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
     let mut server_state = ServerState::with_config(false, cfconfig.clone());
+    server_state.disk_cache_dir = bytecode_cache_dir;
     // Sampling profiler in CLI runs: no watchdog thread, so threshold-based
     // auto-sampling never fires, but `profileNow()` still captures synchronously
     // and `getRequestProfile()` reports it. Armed only when config enables it.

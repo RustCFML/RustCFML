@@ -43,10 +43,15 @@ use std::sync::Arc;
 /// - 1: Initial disk cache implementation (v0.654.0)
 pub const BYTECODE_FORMAT_VERSION: u32 = 1;
 
-/// Compute cache key for a source file
-fn compute_cache_key(source_bytes: &[u8]) -> [u8; 32] {
+/// Compute cache key for a source file, optionally including the source path.
+/// The path component ensures that the same file compiled via different paths
+/// (e.g., physical path vs mapping-qualified path) produces distinct cache entries.
+fn compute_cache_key(source_bytes: &[u8], source_file: Option<&str>) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(source_bytes);
+    if let Some(path) = source_file {
+        hasher.update(path.as_bytes());
+    }
     hasher.finalize().into()
 }
 
@@ -253,12 +258,13 @@ struct SerializedProgram {
 pub fn write_to_disk_cache(
     cache_dir: &Path,
     source_bytes: &[u8],
+    source_file: Option<&str>,
     program: &BytecodeProgram,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create cache directory if it doesn't exist
     std::fs::create_dir_all(cache_dir)?;
 
-    let source_hash = compute_cache_key(source_bytes);
+    let source_hash = compute_cache_key(source_bytes, source_file);
     let cache_file = cache_file_path(cache_dir, &source_hash);
 
     // Serialize all functions
@@ -306,8 +312,9 @@ pub fn write_to_disk_cache(
 pub fn read_from_disk_cache(
     cache_dir: &Path,
     source_bytes: &[u8],
+    source_file: Option<&str>,
 ) -> Result<Option<BytecodeProgram>, Box<dyn std::error::Error>> {
-    let source_hash = compute_cache_key(source_bytes);
+    let source_hash = compute_cache_key(source_bytes, source_file);
     let cache_file = cache_file_path(cache_dir, &source_hash);
 
     // File doesn't exist → cache miss
@@ -387,9 +394,9 @@ mod tests {
         let source2 = b"function test() { return 42; }";
         let source3 = b"function test() { return 43; }";
 
-        let hash1 = compute_cache_key(source1);
-        let hash2 = compute_cache_key(source2);
-        let hash3 = compute_cache_key(source3);
+        let hash1 = compute_cache_key(source1, None);
+        let hash2 = compute_cache_key(source2, None);
+        let hash3 = compute_cache_key(source3, None);
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
@@ -439,9 +446,9 @@ mod tests {
             })],
         };
 
-        write_to_disk_cache(cache_dir, source, &program).unwrap();
+        write_to_disk_cache(cache_dir, source, None, &program).unwrap();
 
-        let loaded = read_from_disk_cache(cache_dir, source).unwrap();
+        let loaded = read_from_disk_cache(cache_dir, source, None).unwrap();
         assert!(loaded.is_some());
 
         let loaded_program = loaded.unwrap();
@@ -456,7 +463,7 @@ mod tests {
         let cache_dir = temp_dir.path();
         let source = b"function test() { return 42; }";
 
-        let source_hash = compute_cache_key(source);
+        let source_hash = compute_cache_key(source, None);
         let cache_file = cache_file_path(cache_dir, &source_hash);
         std::fs::create_dir_all(cache_dir).unwrap();
 
@@ -475,7 +482,7 @@ mod tests {
         std::fs::write(&cache_file, &data).unwrap();
 
         // Should be a cache miss
-        let loaded = read_from_disk_cache(cache_dir, source).unwrap();
+        let loaded = read_from_disk_cache(cache_dir, source, None).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -485,7 +492,7 @@ mod tests {
         let cache_dir = temp_dir.path();
         let source = b"function test() { return 42; }";
 
-        let source_hash = compute_cache_key(source);
+        let source_hash = compute_cache_key(source, None);
         let cache_file = cache_file_path(cache_dir, &source_hash);
         std::fs::create_dir_all(cache_dir).unwrap();
 
@@ -504,7 +511,7 @@ mod tests {
         std::fs::write(&cache_file, &data).unwrap();
 
         // Should be a cache miss
-        let loaded = read_from_disk_cache(cache_dir, source).unwrap();
+        let loaded = read_from_disk_cache(cache_dir, source, None).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -645,14 +652,14 @@ mod tests {
         };
 
         // Write to cache
-        write_to_disk_cache(cache_dir, source, &program).unwrap();
+        write_to_disk_cache(cache_dir, source, None, &program).unwrap();
 
         // Allocate more dummy IDs to ensure remapped IDs are fresh
         let _dummy3 = cfml_codegen::compiler::next_global_fn_id();
         let _dummy4 = cfml_codegen::compiler::next_global_fn_id();
 
         // Load from cache
-        let loaded = read_from_disk_cache(cache_dir, source).unwrap();
+        let loaded = read_from_disk_cache(cache_dir, source, None).unwrap();
         assert!(loaded.is_some());
 
         let loaded_program = loaded.unwrap();
@@ -683,5 +690,20 @@ mod tests {
         } else {
             panic!("Expected DefineComponentMethods op");
         }
+    }
+
+    #[test]
+    fn test_cache_key_includes_source_path() {
+        let source = b"component { function test() { return 42; } }";
+        
+        let hash_no_path = compute_cache_key(source, None);
+        let hash_path1 = compute_cache_key(source, Some("tests/oop/Component.cfc"));
+        let hash_path2 = compute_cache_key(source, Some("/dotdotprobe/Component.cfc"));
+        
+        assert_ne!(hash_no_path, hash_path1, "Cache key should differ when path is included");
+        assert_ne!(hash_path1, hash_path2, "Cache keys should differ for different paths");
+        
+        let hash_path1_again = compute_cache_key(source, Some("tests/oop/Component.cfc"));
+        assert_eq!(hash_path1, hash_path1_again, "Cache key should be stable for same path");
     }
 }

@@ -1358,7 +1358,7 @@ pub fn compile_file_cached_flagged(
     
     // Check disk cache before compiling (if enabled)
     if let Some(disk_dir) = disk_cache_dir {
-        if let Ok(Some(program)) = disk_cache::read_from_disk_cache(disk_dir, source_code.as_bytes()) {
+        if let Ok(Some(program)) = disk_cache::read_from_disk_cache(disk_dir, source_code.as_bytes(), Some(path)) {
             // Found in disk cache - insert into memory cache for fast re-access
             if let Some(c) = cache {
                 if let Ok(mtime) = vfs.modified(path) {
@@ -1426,7 +1426,7 @@ pub fn compile_file_cached_flagged(
 
     // Write to disk cache (best effort - failures are silent)
     if let Some(disk_dir) = disk_cache_dir {
-        let _ = disk_cache::write_to_disk_cache(disk_dir, &source_bytes, &program);
+        let _ = disk_cache::write_to_disk_cache(disk_dir, &source_bytes, Some(path), &program);
     }
 
     // Cache the result in memory
