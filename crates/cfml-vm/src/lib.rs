@@ -4849,10 +4849,22 @@ impl FrameScopeCache {
                 .cloned()
         };
         let has_marker = locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV);
+        // Optimize the extras check: build a small hashset of param keys upfront
+        // to avoid O(args × params) case-insensitive scans on every refresh.
+        // The old code did params.iter().any(case_insensitive_eq) per arg key.
         let (args_len, extras) = match &self.args {
             Some(a) => a.with_map(|m| {
+                if params.is_empty() {
+                    // Fast path: no params means every non-__ key is an extra
+                    let extras = m.keys().any(|k| !k.starts_with("__"));
+                    return (m.len(), extras);
+                }
+                // Build param lookup: hash once per param instead of per arg × param
+                use cfml_common::key::fold_hash;
+                let param_set: std::collections::HashSet<u64> = 
+                    params.iter().map(|p| fold_hash(p)).collect();
                 let extras = m.keys().any(|k| {
-                    !k.starts_with("__") && !params.iter().any(|p| p.eq_ignore_ascii_case(k.as_str()))
+                    !k.starts_with("__") && !param_set.contains(&fold_hash(k.as_str()))
                 });
                 (m.len(), extras)
             }),
