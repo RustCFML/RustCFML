@@ -4579,9 +4579,12 @@ impl InheritedKeys {
     fn into_shared(self) -> Arc<InheritedKeys> {
         use std::sync::OnceLock;
         static SHARED: OnceLock<[Arc<InheritedKeys>; 32]> = OnceLock::new();
-        if self.has_data_keys() {
+        // Fast path: check for empty/structural-only case first to avoid the function call
+        let has_data = self.param_bits != 0 || self.inline_len != 0 || !self.other.is_empty();
+        if has_data {
             return Arc::new(self);
         }
+        // Common case: structural-only, use the static pool
         let shared = SHARED.get_or_init(|| {
             std::array::from_fn(|i| {
                 Arc::new(InheritedKeys {
@@ -4594,7 +4597,8 @@ impl InheritedKeys {
                 })
             })
         });
-        shared[(self.structural & 31) as usize].clone()
+        // Safe: structural & 31 is always in range [0, 31]
+        unsafe { shared.get_unchecked((self.structural & 31) as usize).clone() }
     }
 }
 
@@ -8791,13 +8795,21 @@ impl CfmlVirtualMachine {
         // call/try stacks exactly as it found them. truncate() only shrinks, so a
         // balanced clean exit (len == before) and __main__'s unconditional pop
         // (len < before) are both untouched; only a leaked frame is reclaimed.
-        self.call_stack.truncate(call_depth_before);
-        self.frame_ctx.truncate(frame_ctx_before);
+        // Micro-optimization: check before truncating to avoid the call overhead
+        // for the common case where no frames were leaked.
+        if self.call_stack.len() > call_depth_before {
+            self.call_stack.truncate(call_depth_before);
+        }
+        if self.frame_ctx.len() > frame_ctx_before {
+            self.frame_ctx.truncate(frame_ctx_before);
+        }
         self.frame_has_local_scope = frame_has_local_scope_before;
         self.frame_args_explicit_only = frame_args_explicit_only_before;
         self.escaped_local = escaped_local_before;
         self.local_watch = local_watch_before;
-        self.try_stack.truncate(try_depth_before);
+        if self.try_stack.len() > try_depth_before {
+            self.try_stack.truncate(try_depth_before);
+        }
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
         // `<cfsilent><cfreturn …></cfsilent>` helpers — booleanUtils `isTrue`,
@@ -9222,7 +9234,8 @@ impl CfmlVirtualMachine {
     #[cfg(feature = "scope-pool")]
     #[inline]
     fn recycle_locals_map(&mut self, mut m: ValueMap) {
-        if self.locals_pool.len() < 128 {
+        // Only recycle if the pool has room and the map has some capacity worth reusing
+        if m.capacity() > 0 && self.locals_pool.len() < 128 {
             m.clear();
             self.locals_pool.push(m);
         }
