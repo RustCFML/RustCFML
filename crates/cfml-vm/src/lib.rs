@@ -4765,6 +4765,49 @@ struct CustomTagState {
     base_tag_depth: usize,
 }
 
+/// Batched frame state for save/restore in `execute_function_with_args`.
+/// Grouping these together improves cache locality and enables better
+/// compiler optimization of the save/restore operations.
+struct FrameState {
+    call_depth: usize,
+    frame_ctx_depth: usize,
+    frame_has_local_scope: bool,
+    frame_args_explicit_only: bool,
+    escaped_local: Option<EscapedLocal>,
+    local_watch: bool,
+    try_depth: usize,
+    saved_buffers_depth: usize,
+}
+
+impl FrameState {
+    /// Capture current frame state from the VM.
+    #[inline]
+    fn capture(vm: &mut CfmlVirtualMachine) -> Self {
+        Self {
+            call_depth: vm.call_stack.len(),
+            frame_ctx_depth: vm.frame_ctx.len(),
+            frame_has_local_scope: vm.frame_has_local_scope,
+            frame_args_explicit_only: vm.frame_args_explicit_only,
+            escaped_local: vm.escaped_local.take(),
+            local_watch: vm.local_watch,
+            try_depth: vm.try_stack.len(),
+            saved_buffers_depth: vm.saved_output_buffers.len(),
+        }
+    }
+
+    /// Restore frame state to the VM.
+    #[inline]
+    fn restore(self, vm: &mut CfmlVirtualMachine) {
+        vm.call_stack.truncate(self.call_depth);
+        vm.frame_ctx.truncate(self.frame_ctx_depth);
+        vm.frame_has_local_scope = self.frame_has_local_scope;
+        vm.frame_args_explicit_only = self.frame_args_explicit_only;
+        vm.escaped_local = self.escaped_local;
+        vm.local_watch = self.local_watch;
+        vm.try_stack.truncate(self.try_depth);
+    }
+}
+
 /// Engine-generated bind-param accumulators that must never escape the frame
 /// assembling the statement. Emitted by the runtime-body lowering of `<cfquery>`
 /// and `<cfhttp>` (the forms whose body contains control flow, so the SQL and the
@@ -8706,8 +8749,11 @@ impl CfmlVirtualMachine {
         // allocator cannot avoid for long, and it costs one relaxed atomic load
         // against a ~1.3us frame when no limit is configured. See §85.
         self.check_memory_abort()?;
-        let call_depth_before = self.call_stack.len();
-        let frame_ctx_before = self.frame_ctx.len();
+        
+        // Batch all frame state saves into a single structure for better cache
+        // locality and compiler optimization opportunities.
+        let saved_state = FrameState::capture(self);
+        
         // GH #351 — restored unconditionally in the epilogue below, so the flag
         // describes the CALLER again the instant this call returns, on the error
         // path as well as the normal one.
@@ -8720,23 +8766,15 @@ impl CfmlVirtualMachine {
         // wrapper always runs. The inputs are exactly the body's: the function's
         // own template-ness, plus a pending shared-`local` hand-off from an
         // enclosing `<cfinclude>` (which the body `take()`s after this).
-        let frame_has_local_scope_before = self.frame_has_local_scope;
-        // The callee starts with no escaped `local`; the caller's handle (if
-        // any) is restored with its frame below.
-        let escaped_local_before = self.escaped_local.take();
-        let local_watch_before = self.local_watch;
         self.frame_has_local_scope =
             !func.is_template_frame || self.include_share_local_keys.is_some();
         // A custom-tag template, or a template included from one, sees the
         // calling function's `arguments` only by explicit qualification. A
         // function or method frame always has its own, and a component body
         // has none to inherit.
-        let frame_args_explicit_only_before = self.frame_args_explicit_only;
         self.frame_args_explicit_only = func.is_template_frame
             && func.name == "__main__"
-            && (custom_tag_frame || frame_args_explicit_only_before);
-        let try_depth_before = self.try_stack.len();
-        let saved_buffers_before = self.saved_output_buffers.len();
+            && (custom_tag_frame || saved_state.frame_args_explicit_only);
 
         // `output="false"` on a cffunction/component method suppresses ALL output
         // the body produces — inter-tag whitespace, plain text, AND cfoutput/
@@ -8773,7 +8811,7 @@ impl CfmlVirtualMachine {
                 o.on_fn_enter(&observe::FnEnter {
                     name: &func.name,
                     called_name: &func.name,
-                    depth: call_depth_before,
+                    depth: saved_state.call_depth,
                 });
             }
         }
@@ -8787,17 +8825,10 @@ impl CfmlVirtualMachine {
         let result = self.execute_function_body(func, args, parent_scope);
         #[cfg(feature = "call-phases")]
         let _cp_wrap = std::time::Instant::now();
-        // Never grow past where we started: a complete call must leave the
-        // call/try stacks exactly as it found them. truncate() only shrinks, so a
-        // balanced clean exit (len == before) and __main__'s unconditional pop
-        // (len < before) are both untouched; only a leaked frame is reclaimed.
-        self.call_stack.truncate(call_depth_before);
-        self.frame_ctx.truncate(frame_ctx_before);
-        self.frame_has_local_scope = frame_has_local_scope_before;
-        self.frame_args_explicit_only = frame_args_explicit_only_before;
-        self.escaped_local = escaped_local_before;
-        self.local_watch = local_watch_before;
-        self.try_stack.truncate(try_depth_before);
+        
+        // Restore all frame state in a single batched operation.
+        saved_state.restore(self);
+        
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
         // `<cfsilent><cfreturn …></cfsilent>` helpers — booleanUtils `isTrue`,
@@ -8817,7 +8848,7 @@ impl CfmlVirtualMachine {
         // cache hits and `/preside/system/assets/*`. Restricting to `is_ok` closes
         // the `silent{return}` orphans without touching exception-managed captures.
         if result.is_ok() {
-            while self.saved_output_buffers.len() > saved_buffers_before {
+            while self.saved_output_buffers.len() > saved_state.saved_buffers_depth {
                 self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
             }
         }
@@ -8836,7 +8867,7 @@ impl CfmlVirtualMachine {
             if let Some(o) = &self.observer {
                 o.on_fn_exit(&observe::FnExit {
                     name: &func.name,
-                    depth: call_depth_before,
+                    depth: saved_state.call_depth,
                     is_error: result.is_err(),
                 });
             }
