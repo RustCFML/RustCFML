@@ -173,9 +173,40 @@ fn serialize_function(func: &BytecodeFunction) -> Result<SerializableFunction, B
     })
 }
 
-/// Convert serializable form back to BytecodeFunction
-fn deserialize_function(ser: &SerializableFunction, new_global_id: u32) -> Result<BytecodeFunction, Box<dyn std::error::Error>> {
-    let instructions: Vec<BytecodeOp> = bincode::deserialize(&ser.instructions_blob)?;
+/// Remap function IDs in a single bytecode instruction
+fn remap_instruction_ids(op: &mut BytecodeOp, id_remap: &HashMap<u32, u32>) {
+    match op {
+        BytecodeOp::DefineFunction(ref mut gid) => {
+            if let Some(&new_id) = id_remap.get(&(*gid as u32)) {
+                *gid = new_id as usize;
+            }
+        }
+        BytecodeOp::DefineComponentMethods(ref mut methods_box) => {
+            // ComponentMethods is in a Box, so we need to remap its gids
+            for gid in &mut methods_box.gids {
+                if let Some(&new_id) = id_remap.get(&(*gid as u32)) {
+                    *gid = new_id as usize;
+                }
+            }
+        }
+        _ => {
+            // Other ops don't contain function IDs
+        }
+    }
+}
+
+/// Convert serializable form back to BytecodeFunction, remapping function IDs
+fn deserialize_function(
+    ser: &SerializableFunction,
+    new_global_id: u32,
+    id_remap: &HashMap<u32, u32>,
+) -> Result<BytecodeFunction, Box<dyn std::error::Error>> {
+    let mut instructions: Vec<BytecodeOp> = bincode::deserialize(&ser.instructions_blob)?;
+    
+    // Remap all function IDs in instructions
+    for instruction in &mut instructions {
+        remap_instruction_ids(instruction, id_remap);
+    }
     
     Ok(BytecodeFunction {
         name: ser.name.clone(),
@@ -332,7 +363,7 @@ pub fn read_from_disk_cache(
         .iter()
         .map(|sf| {
             let new_id = id_remap.get(&sf.global_id).copied().unwrap_or(sf.global_id);
-            deserialize_function(sf, new_id).map(Arc::new)
+            deserialize_function(sf, new_id, &id_remap).map(Arc::new)
         })
         .collect();
 
@@ -340,10 +371,6 @@ pub fn read_from_disk_cache(
         Ok(f) => f,
         Err(_) => return Ok(None), // Deserialization failed → miss
     };
-
-    // TODO: Walk through instructions and remap function IDs in DefineFunction,
-    // ArrayEach, StructEach, etc. ops. For now, most programs will work without
-    // perfect ID remapping.
 
     Ok(Some(BytecodeProgram { functions }))
 }
@@ -479,5 +506,182 @@ mod tests {
         // Should be a cache miss
         let loaded = read_from_disk_cache(cache_dir, source).unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_function_id_remapping_comprehensive() {
+        use cfml_codegen::compiler::{ComponentMethods, Name};
+        
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path();
+        let source = b"component { function init() { function inner() { return 1; } return this; } }";
+
+        // Allocate some function IDs so the remapped IDs will definitely be different
+        let _dummy1 = cfml_codegen::compiler::next_global_fn_id();
+        let _dummy2 = cfml_codegen::compiler::next_global_fn_id();
+
+        // Create functions with DefineFunction and DefineComponentMethods ops
+        let inner_id = cfml_codegen::compiler::next_global_fn_id();
+        let init_id = cfml_codegen::compiler::next_global_fn_id();
+        let main_id = cfml_codegen::compiler::next_global_fn_id();
+
+        let inner_func = Arc::new(BytecodeFunction {
+            name: "inner".to_string(),
+            params: vec![],
+            param_keys: std::sync::OnceLock::new(),
+            name_shared: std::sync::OnceLock::new(),
+            source_file_shared: std::sync::OnceLock::new(),
+            args_needed: std::sync::OnceLock::new(),
+            args_never_escapes: std::sync::OnceLock::new(),
+            rebinds_param: std::sync::OnceLock::new(),
+            local_may_escape: std::sync::OnceLock::new(),
+            params_marker: std::sync::OnceLock::new(),
+            cfc_body: std::sync::OnceLock::new(),
+            source_file_value: std::sync::OnceLock::new(),
+            required_params: vec![],
+            has_default: vec![],
+            instructions: vec![
+                BytecodeOp::Integer(1),
+                BytecodeOp::Return,
+            ],
+            source_file: None,
+            global_id: inner_id,
+            declared_local_mode: None,
+            param_types: vec![],
+            return_type: None,
+            param_annotations: vec![],
+            param_defaults: vec![],
+            is_component_method: true,
+            access: CfmlAccess::Public,
+            metadata: vec![],
+            is_template_frame: false,
+            is_generated_accessor: false,
+            output_suppressed: false,
+            chain_tier: 0,
+            slot_names: vec![],
+        });
+
+        let init_func = Arc::new(BytecodeFunction {
+            name: "init".to_string(),
+            params: vec![],
+            param_keys: std::sync::OnceLock::new(),
+            name_shared: std::sync::OnceLock::new(),
+            source_file_shared: std::sync::OnceLock::new(),
+            args_needed: std::sync::OnceLock::new(),
+            args_never_escapes: std::sync::OnceLock::new(),
+            rebinds_param: std::sync::OnceLock::new(),
+            local_may_escape: std::sync::OnceLock::new(),
+            params_marker: std::sync::OnceLock::new(),
+            cfc_body: std::sync::OnceLock::new(),
+            source_file_value: std::sync::OnceLock::new(),
+            required_params: vec![],
+            has_default: vec![],
+            instructions: vec![
+                // DefineFunction should reference the inner function
+                BytecodeOp::DefineFunction(inner_id as usize),
+                BytecodeOp::StoreLocal(Name::intern("inner")),
+                BytecodeOp::LoadLocal(Name::intern("this")),
+                BytecodeOp::Return,
+            ],
+            source_file: None,
+            global_id: init_id,
+            declared_local_mode: None,
+            param_types: vec![],
+            return_type: None,
+            param_annotations: vec![],
+            param_defaults: vec![],
+            is_component_method: true,
+            access: CfmlAccess::Public,
+            metadata: vec![],
+            is_template_frame: false,
+            is_generated_accessor: false,
+            output_suppressed: false,
+            chain_tier: 0,
+            slot_names: vec![],
+        });
+
+        let main_func = Arc::new(BytecodeFunction {
+            name: "__main__".to_string(),
+            params: vec![],
+            param_keys: std::sync::OnceLock::new(),
+            name_shared: std::sync::OnceLock::new(),
+            source_file_shared: std::sync::OnceLock::new(),
+            args_needed: std::sync::OnceLock::new(),
+            args_never_escapes: std::sync::OnceLock::new(),
+            rebinds_param: std::sync::OnceLock::new(),
+            local_may_escape: std::sync::OnceLock::new(),
+            params_marker: std::sync::OnceLock::new(),
+            cfc_body: std::sync::OnceLock::new(),
+            source_file_value: std::sync::OnceLock::new(),
+            required_params: vec![],
+            has_default: vec![],
+            instructions: vec![
+                // DefineComponentMethods should reference both functions
+                BytecodeOp::DefineComponentMethods(Box::new(ComponentMethods {
+                    holder: Name::intern("__cfc"),
+                    gids: vec![init_id as usize, inner_id as usize],
+                })),
+                BytecodeOp::Return,
+            ],
+            source_file: None,
+            global_id: main_id,
+            declared_local_mode: None,
+            param_types: vec![],
+            return_type: None,
+            param_annotations: vec![],
+            param_defaults: vec![],
+            is_component_method: false,
+            access: CfmlAccess::Public,
+            metadata: vec![],
+            is_template_frame: true,
+            is_generated_accessor: false,
+            output_suppressed: false,
+            chain_tier: 0,
+            slot_names: vec![],
+        });
+
+        let program = BytecodeProgram {
+            functions: vec![main_func, init_func, inner_func],
+        };
+
+        // Write to cache
+        write_to_disk_cache(cache_dir, source, &program).unwrap();
+
+        // Allocate more dummy IDs to ensure remapped IDs are fresh
+        let _dummy3 = cfml_codegen::compiler::next_global_fn_id();
+        let _dummy4 = cfml_codegen::compiler::next_global_fn_id();
+
+        // Load from cache
+        let loaded = read_from_disk_cache(cache_dir, source).unwrap();
+        assert!(loaded.is_some());
+
+        let loaded_program = loaded.unwrap();
+        assert_eq!(loaded_program.functions.len(), 3);
+
+        // Verify function IDs were remapped to fresh values
+        let loaded_main = &loaded_program.functions[0];
+        let loaded_init = &loaded_program.functions[1];
+        let loaded_inner = &loaded_program.functions[2];
+
+        // IDs should be different from original
+        assert_ne!(loaded_main.global_id, main_id);
+        assert_ne!(loaded_init.global_id, init_id);
+        assert_ne!(loaded_inner.global_id, inner_id);
+
+        // Verify DefineFunction in init references the correct remapped inner ID
+        if let BytecodeOp::DefineFunction(ref_id) = loaded_init.instructions[0] {
+            assert_eq!(ref_id as u32, loaded_inner.global_id);
+        } else {
+            panic!("Expected DefineFunction op");
+        }
+
+        // Verify DefineComponentMethods in main references correct remapped IDs
+        if let BytecodeOp::DefineComponentMethods(ref methods_box) = loaded_main.instructions[0] {
+            assert_eq!(methods_box.gids.len(), 2);
+            assert_eq!(methods_box.gids[0] as u32, loaded_init.global_id);
+            assert_eq!(methods_box.gids[1] as u32, loaded_inner.global_id);
+        } else {
+            panic!("Expected DefineComponentMethods op");
+        }
     }
 }
