@@ -1638,8 +1638,10 @@ fn compile_and_run(
     // In serve mode with a source file, use the bytecode cache to skip recompilation
     else if !debug && source_file.is_some() && server_state.is_some() {
         let path = source_file.as_ref().unwrap();
-        let cache = &server_state.unwrap().bytecode_cache;
-        compile_file_cached(path, Some(cache), vfs.as_ref()).map_err(|e| CfmlRunError { output: String::new(), message: format!("{}", e) })?
+        let state = server_state.unwrap();
+        let cache = &state.bytecode_cache;
+        let disk_cache_dir = state.disk_cache_dir.as_ref().map(|p| p.as_path());
+        cfml_vm::compile_file_cached_with_disk_cache(path, Some(cache), vfs.as_ref(), disk_cache_dir).map_err(|e| CfmlRunError { output: String::new(), message: format!("{}", e) })?
     } else {
         // CLI mode / inline code / debug: full pipeline
         // Strip shebang line if present (e.g. #!/usr/bin/env rustcfml)
