@@ -966,6 +966,7 @@ enum DisqReason {
 
 /// Comparison operator tag for fused-compare super-instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CmpOp {
     Lt,
     Lte,
@@ -980,6 +981,7 @@ pub enum CmpOp {
 /// the op stays within the 32-byte / 24-byte size budget (see the size probe);
 /// both fields are read only on a named-argument method call.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NamedMethodCall {
     pub names: Vec<String>,
     pub write_back: Option<Vec<String>>,
@@ -990,6 +992,7 @@ pub struct NamedMethodCall {
 /// every method declared in the class body, in declaration order. Boxed so the
 /// op stays inside the 24-byte budget.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ComponentMethods {
     pub holder: Name,
     pub gids: Vec<usize>,
@@ -1005,6 +1008,7 @@ pub struct ComponentMethods {
 /// null-assignment branch still routes through the string-based
 /// `check_scope_path_writable` / `delete_scope_path`.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScopePath {
     /// The full dotted path, exactly as the old `String` operand spelled it.
     pub path: String,
@@ -1022,6 +1026,7 @@ impl ScopePath {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BytecodeOp {
     // Literals
     Null,

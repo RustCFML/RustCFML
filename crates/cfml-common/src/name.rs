@@ -65,6 +65,25 @@ pub type BuiltinFnPtr = fn(Vec<crate::dynamic::CfmlValue>) -> crate::vm::CfmlRes
 #[derive(Clone)]
 pub struct Name(Arc<NameInner>);
 
+impl serde::Serialize for Name {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_str().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Name {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Name::intern(&s))
+    }
+}
+
 static INTERNER: RwLock<Option<HashMap<Box<str>, Name>>> = RwLock::new(None);
 
 /// Identifiers a frame's load/store ops give special routing (scope names,

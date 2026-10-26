@@ -29,7 +29,7 @@ cfml-stdlib = { workspace = true, default-features = false, optional = true }
 indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 hashbrown = { workspace = true }
-cfml-codegen = { workspace = true }
+cfml-codegen = { workspace = true, features = ["serde"] }
 log = { workspace = true }
 parking_lot = { workspace = true }
 rust_decimal = { version = "1", features = ["maths"] }
@@ -38,6 +38,7 @@ chrono-tz = { workspace = true }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = "1"
 uuid = { version = "1", features = ["v4"] }
 # MCP client transport (feature `mcp-client`). Same version as cfml-stdlib's,
 # so the two share one build of it.
@@ -84,6 +85,7 @@ cfml-stdlib = { workspace = true, default-features = false }
 # Exercises the extension ABI from the module side, in-process: everything a
 # real `.rcx` does except the dlopen itself.
 rustcfml-module = { path = "../rustcfml-module" }
+tempfile = "3"
 
 [features]
 default = ["real-threads", "observability", "scope-pool", "component-instance"]

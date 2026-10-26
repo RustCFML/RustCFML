@@ -41,6 +41,7 @@ mod intercepts_output;
 mod intercepts_realtime;
 mod intercepts_mcp;
 pub mod application_store;
+pub mod disk_cache;
 /// Host side of the dynamic native-extension ABI (`.rcx`).
 pub mod foreign;
 pub mod async_kernel;
@@ -1321,7 +1322,17 @@ pub fn compile_file_cached(
     cache: Option<&BytecodeCache>,
     vfs: &dyn Vfs,
 ) -> Result<BytecodeProgram, CfmlError> {
-    compile_file_cached_flagged(path, cache, vfs).map(|(p, _)| p)
+    compile_file_cached_flagged(path, cache, vfs, None).map(|(p, _)| p)
+}
+
+/// Compile with optional disk cache support.
+pub fn compile_file_cached_with_disk_cache(
+    path: &str,
+    cache: Option<&BytecodeCache>,
+    vfs: &dyn Vfs,
+    disk_cache_dir: Option<&std::path::Path>,
+) -> Result<BytecodeProgram, CfmlError> {
+    compile_file_cached_flagged(path, cache, vfs, disk_cache_dir).map(|(p, _)| p)
 }
 
 /// [`compile_file_cached`] that also says whether it COMPILED (`true`) or served
@@ -1331,8 +1342,9 @@ pub fn compile_file_cached_flagged(
     path: &str,
     cache: Option<&BytecodeCache>,
     vfs: &dyn Vfs,
+    disk_cache_dir: Option<&std::path::Path>,
 ) -> Result<(BytecodeProgram, bool), CfmlError> {
-    // Check cache first
+    // Check in-memory cache first
     if let Some(c) = cache {
         if let Some(program) = c.get(path, vfs) {
             return Ok((program, false));
@@ -1343,6 +1355,21 @@ pub fn compile_file_cached_flagged(
     let source_code = vfs
         .read_to_string(path)
         .map_err(|e| CfmlError::runtime(format!("Cannot read '{}': {}", path, e)))?;
+    
+    // Check disk cache before compiling (if enabled)
+    if let Some(disk_dir) = disk_cache_dir {
+        if let Ok(Some(program)) = disk_cache::read_from_disk_cache(disk_dir, source_code.as_bytes()) {
+            // Found in disk cache - insert into memory cache for fast re-access
+            if let Some(c) = cache {
+                if let Ok(mtime) = vfs.modified(path) {
+                    c.insert(path.to_string(), program.clone(), mtime);
+                }
+            }
+            return Ok((program, false));
+        }
+    }
+    
+    let source_bytes = source_code.as_bytes().to_vec();
 
     // Tag preprocessing. Run when the file looks like a template — either it
     // contains CFML tags, or its extension marks it as static markup that
@@ -1397,8 +1424,12 @@ pub fn compile_file_cached_flagged(
         cfml_codegen::compiler::CfmlCompiler::new().with_source_file(Some(path.to_string()));
     let program = compiler.compile(ast);
 
+    // Write to disk cache (best effort - failures are silent)
+    if let Some(disk_dir) = disk_cache_dir {
+        let _ = disk_cache::write_to_disk_cache(disk_dir, &source_bytes, &program);
+    }
 
-    // Cache the result
+    // Cache the result in memory
     if let Some(c) = cache {
         if let Ok(mtime) = vfs.modified(path) {
             c.insert(path.to_string(), program.clone(), mtime);
@@ -1904,6 +1935,9 @@ pub struct ServerState {
     pub named_locks: Arc<Mutex<HashMap<String, Arc<NamedLock>>>>,
     /// Bytecode cache — skips recompilation when file mtime is unchanged
     pub bytecode_cache: BytecodeCache,
+    /// Optional disk-based bytecode cache directory. When set, compiled bytecode
+    /// is persisted to disk and loaded from disk before recompilation.
+    pub disk_cache_dir: Option<std::path::PathBuf>,
     /// Document root for `--serve` mode. Used as a fallback search path
     /// when resolving dotted CFC paths (e.g. `taffy.core.api`) for files
     /// that live outside the Application.cfc directory.
@@ -2102,6 +2136,7 @@ impl ServerState {
             requests_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             named_locks: Arc::new(Mutex::new(HashMap::new())),
             bytecode_cache: BytecodeCache::with_trust(production_mode),
+            disk_cache_dir: None,
             webroot: None,
             production_mode,
             app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -36747,7 +36782,8 @@ impl CfmlVirtualMachine {
         let metering = false;
         if !metering {
             let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-            return compile_file_cached(path, cache, self.vfs.as_ref());
+            let disk_cache = self.server_state.as_ref().and_then(|s| s.disk_cache_dir.as_deref());
+            return compile_file_cached_with_disk_cache(path, cache, self.vfs.as_ref(), disk_cache);
         }
         let t0 = std::time::Instant::now();
         let a0 = if self.mem_meter.is_some() {
@@ -36757,7 +36793,8 @@ impl CfmlVirtualMachine {
         };
         let result = {
             let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-            compile_file_cached_flagged(path, cache, self.vfs.as_ref())
+            let disk_cache = self.server_state.as_ref().and_then(|s| s.disk_cache_dir.as_deref());
+            compile_file_cached_flagged(path, cache, self.vfs.as_ref(), disk_cache)
         };
         let (program, compiled) = result?;
         #[cfg(feature = "observability")]
