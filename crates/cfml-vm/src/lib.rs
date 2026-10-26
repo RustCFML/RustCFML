@@ -8753,6 +8753,7 @@ impl CfmlVirtualMachine {
         // Batch all frame state saves into a single structure for better cache
         // locality and compiler optimization opportunities.
         let saved_state = FrameState::capture(self);
+        let call_depth = saved_state.call_depth;  // Save for observability hooks
         
         // GH #351 — restored unconditionally in the epilogue below, so the flag
         // describes the CALLER again the instant this call returns, on the error
@@ -8811,7 +8812,7 @@ impl CfmlVirtualMachine {
                 o.on_fn_enter(&observe::FnEnter {
                     name: &func.name,
                     called_name: &func.name,
-                    depth: saved_state.call_depth,
+                    depth: call_depth,
                 });
             }
         }
@@ -8825,6 +8826,9 @@ impl CfmlVirtualMachine {
         let result = self.execute_function_body(func, args, parent_scope);
         #[cfg(feature = "call-phases")]
         let _cp_wrap = std::time::Instant::now();
+        
+        // Save saved_buffers_depth before restoring state.
+        let saved_buffers_depth = saved_state.saved_buffers_depth;
         
         // Restore all frame state in a single batched operation.
         saved_state.restore(self);
@@ -8848,7 +8852,7 @@ impl CfmlVirtualMachine {
         // cache hits and `/preside/system/assets/*`. Restricting to `is_ok` closes
         // the `silent{return}` orphans without touching exception-managed captures.
         if result.is_ok() {
-            while self.saved_output_buffers.len() > saved_state.saved_buffers_depth {
+            while self.saved_output_buffers.len() > saved_buffers_depth {
                 self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
             }
         }
@@ -8867,7 +8871,7 @@ impl CfmlVirtualMachine {
             if let Some(o) = &self.observer {
                 o.on_fn_exit(&observe::FnExit {
                     name: &func.name,
-                    depth: saved_state.call_depth,
+                    depth: call_depth,
                     is_error: result.is_err(),
                 });
             }
