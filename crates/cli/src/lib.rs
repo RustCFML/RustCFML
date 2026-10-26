@@ -668,6 +668,78 @@ where
     run();
 }
 
+/// Pre-compile all CFML files under docroot into the bytecode cache
+fn warm_bytecode_cache(docroot: &str, cache_dir: &str) {
+    use cfml_common::vfs::RealFs;
+    use std::path::Path;
+    
+    let docroot_path = Path::new(docroot);
+    if !docroot_path.exists() {
+        eprintln!("Error: docroot '{}' does not exist", docroot);
+        exit(1);
+    }
+    
+    let cache_path = Path::new(cache_dir);
+    let vfs = RealFs;
+    
+    println!("Warming bytecode cache: {} -> {}", docroot, cache_dir);
+    
+    let mut compiled = 0;
+    let mut failed = 0;
+    
+    // Walk the directory tree
+    fn visit_dir(
+        dir: &Path,
+        vfs: &RealFs,
+        cache_dir: &Path,
+        compiled: &mut usize,
+        failed: &mut usize,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        
+        for entry in entries.flatten() {
+            let path = entry.path();
+            
+            if path.is_dir() {
+                visit_dir(&path, vfs, cache_dir, compiled, failed);
+                continue;
+            }
+            
+            let path_str = path.to_string_lossy();
+            if !path_str.ends_with(".cfm") && !path_str.ends_with(".cfc") {
+                continue;
+            }
+            
+            // Compile the file
+            match cfml_vm::compile_file_cached_with_disk_cache(&path_str, None, vfs, Some(cache_dir)) {
+                Ok(_) => {
+                    *compiled += 1;
+                    if *compiled % 100 == 0 {
+                        println!("  Compiled {} files...", compiled);
+                    }
+                }
+                Err(e) => {
+                    *failed += 1;
+                    eprintln!("  Failed to compile {}: {}", path_str, e.message);
+                }
+            }
+        }
+    }
+    
+    visit_dir(docroot_path, &vfs, cache_path, &mut compiled, &mut failed);
+    
+    println!("\nBytecode cache warming complete:");
+    println!("  Compiled: {}", compiled);
+    println!("  Failed: {}", failed);
+    
+    if failed > 0 {
+        exit(1);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rustcfml")]
 #[command(about = "A CFML interpreter written in Rust", long_about = None)]
@@ -738,6 +810,19 @@ struct Args {
     /// Also honored via `RUSTCFML_PRODUCTION=1`.
     #[arg(long)]
     production: bool,
+
+    /// Directory for persistent bytecode cache. Compiled bytecode is written
+    /// to disk and reloaded across restarts, keyed by source content hash.
+    /// Removes compilation from boot and first-page-hit latency. Use with
+    /// --warm to pre-compile at Docker build time.
+    #[arg(long, value_name = "DIR")]
+    bytecode_cache: Option<String>,
+
+    /// Pre-compile all .cfm/.cfc files under the given docroot and mappings
+    /// into the bytecode cache without executing them. Requires --bytecode-cache.
+    /// For Docker: RUN rustcfml --warm /app --bytecode-cache /app/.rustcfml-bc
+    #[arg(long, value_name = "DOCROOT")]
+    warm: Option<String>,
 
     /// Process-wide memory limit for --serve: a size (1.5G, 1536M) or `auto`
     /// (75% of the cgroup limit). Above 85% of it new requests get 503 +
@@ -918,6 +1003,16 @@ fn real_main() {
 
     if args.verbose {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    }
+
+    // Handle --warm <docroot>
+    if let Some(ref docroot) = args.warm {
+        if args.bytecode_cache.is_none() {
+            eprintln!("Error: --warm requires --bytecode-cache");
+            exit(1);
+        }
+        warm_bytecode_cache(docroot, args.bytecode_cache.as_deref().unwrap());
+        return;
     }
 
     // Handle --build <app-dir>
@@ -1103,6 +1198,7 @@ fn real_main() {
             Arc::new(cfconfig),
             profile,
             memprofile,
+            args.bytecode_cache.as_ref().map(PathBuf::from),
         );
         return;
     }
@@ -2058,6 +2154,7 @@ fn run_server(
     cfconfig: Arc<RustCfmlConfig>,
     profile: bool,
     memprofile_on: bool,
+    bytecode_cache_dir: Option<PathBuf>,
 ) {
     // Sampling heap profiler. Armed for the life of the server; dumps on
     // SIGUSR2 (no restart needed) and once more on graceful shutdown.
@@ -2122,7 +2219,7 @@ fn run_server(
             .build()
             .unwrap()
     };
-    rt.block_on(async_run_server(doc_root, port, socket, debug, single_threaded, vfs, sandbox, production, cfconfig));
+    rt.block_on(async_run_server(doc_root, port, socket, debug, single_threaded, vfs, sandbox, production, cfconfig, bytecode_cache_dir));
 
     // Server has shut down gracefully (Ctrl+C) — write the flamegraph + pprof.
     #[cfg(all(feature = "obs-pprof", unix))]
@@ -2685,8 +2782,10 @@ async fn async_run_server(
     sandbox: bool,
     production: bool,
     cfconfig: Arc<RustCfmlConfig>,
+    bytecode_cache_dir: Option<PathBuf>,
 ) {
     let mut server_state = ServerState::with_config(production, cfconfig.clone());
+    server_state.disk_cache_dir = bytecode_cache_dir;
     // The standalone cluster (`cluster` block) comes up first, so a cluster
     // session store configured alongside it shares the same node.
     #[cfg(feature = "cluster")]
@@ -6004,7 +6103,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false, false);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false, false, None);
         }
         _ => {
             // Foreground mode (default: just run)
@@ -6031,7 +6130,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false, false);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig, false, false, None);
         }
     }
 }
