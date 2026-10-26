@@ -1255,7 +1255,9 @@ impl CfmlStruct {
         CfmlStruct(arc)
     }
 
-    /// Like [`CfmlStruct::new`] but SKIPS the cycle-GC allocation log
+    /// Check if two CfmlStruct instances point to the same underlying data.
+    /// Used by FrameScopeCache to avoid redundant work when the handle hasn't changed.
+    #[inline]
     /// ([`cycle_gc::log_struct`]) — the per-allocation `LocalKey::with` /
     /// `Weak::downgrade` that dominates serve-mode call dispatch (~25% in the
     /// profile; call-dispatch Lever C).

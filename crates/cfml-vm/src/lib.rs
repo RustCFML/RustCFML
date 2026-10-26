@@ -4836,18 +4836,43 @@ impl FrameScopeCache {
     fn refresh(&mut self, locals: &ValueMap, params: &[String]) {
         self.valid = true;
         self.version = locals.version();
-        self.vars = locals
+        
+        // Fetch the current handles from locals
+        let current_vars = locals
             .get(&*cfml_common::key::well_known::VARIABLES)
-            .and_then(|x| x.as_cfml_struct())
-            .cloned();
-        self.args = if self.args_explicit_only {
+            .and_then(|x| x.as_cfml_struct());
+        let current_args = if self.args_explicit_only {
             None
         } else {
             locals
                 .get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
                 .and_then(|x| x.as_cfml_struct())
-                .cloned()
         };
+        
+        // Fast path: if the Arc pointers haven't changed, we can skip cloning
+        // and re-checking extras. CfmlStruct is Arc<...>, so pointer equality
+        // means the same underlying data.
+        let vars_unchanged = match (&self.vars, current_vars) {
+            (Some(cached), Some(current)) => cached.ptr_eq(current),
+            (None, None) => true,
+            _ => false,
+        };
+        let args_unchanged = match (&self.args, current_args) {
+            (Some(cached), Some(current)) => cached.ptr_eq(current),
+            (None, None) => true,
+            _ => false,
+        };
+        
+        if vars_unchanged && args_unchanged {
+            // The handles are the same - just update version and return.
+            // No need to re-clone or re-check extras.
+            return;
+        }
+        
+        // Handles changed - do the full update
+        self.vars = current_vars.cloned();
+        self.args = current_args.cloned();
+        
         let has_marker = locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV);
         let (args_len, extras) = match &self.args {
             Some(a) => a.with_map(|m| {
