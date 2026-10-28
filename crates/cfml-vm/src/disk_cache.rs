@@ -301,10 +301,19 @@ pub fn write_to_disk_cache(
     serialized.header.checksum = compute_checksum(&data);
     data = bincode::serde::encode_to_vec(&serialized, bincode::config::standard())?;
 
-    // Atomic write: temp file then rename
-    let temp_file = cache_file.with_extension("bc.tmp");
-    std::fs::write(&temp_file, &data)?;
-    std::fs::rename(&temp_file, &cache_file)?;
+    // Atomic write: a temp file unique to THIS writer, then rename. A cold
+    // server compiles the same template on several request threads at once
+    // (and a `--warm` can overlap a running server); a temp name shared by
+    // all of them lets one writer truncate another's half-written file and
+    // rename a torn entry into place. The checksum would catch it on read,
+    // but at the price of a miss and a recompile every time.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_file = cache_file.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+    if let Err(e) = std::fs::write(&temp_file, &data).and_then(|_| std::fs::rename(&temp_file, &cache_file)) {
+        let _ = std::fs::remove_file(&temp_file);
+        return Err(e.into());
+    }
 
     Ok(())
 }
