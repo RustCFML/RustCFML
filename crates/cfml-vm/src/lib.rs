@@ -19769,27 +19769,11 @@ impl CfmlVirtualMachine {
                     if !self.timezone.is_empty() {
                         return Ok(CfmlValue::string(self.timezone.clone()));
                     }
-                    // Return the system timezone name
-                    // Try to get IANA timezone from environment variable first
-                    if let Ok(tz) = std::env::var("TZ") {
-                        if !tz.is_empty() {
-                            return Ok(CfmlValue::string(tz));
-                        }
-                    }
-                    // macOS/Linux: read /etc/localtime symlink target
-                    #[cfg(unix)]
-                    {
-                        if let Ok(link) = std::fs::read_link("/etc/localtime") {
-                            let link_str = link.to_string_lossy().to_string();
-                            // Extract timezone from path like /usr/share/zoneinfo/America/New_York
-                            if let Some(pos) = link_str.find("zoneinfo/") {
-                                let tz = &link_str[pos + 9..];
-                                return Ok(CfmlValue::string(tz.to_string()));
-                            }
-                        }
-                    }
-                    // Fallback: return UTC
-                    return Ok(CfmlValue::string("UTC".to_string()));
+                    // Otherwise the host zone — the SAME lookup `now()` and
+                    // every date BIF use, so the name reported is the zone
+                    // dates are actually read in (a private copy here once
+                    // drifted from it).
+                    return Ok(CfmlValue::string(tz::system_tz_id()));
                 }
                 // GH #304: locale is REQUEST STATE, exactly like the timezone above.
                 // `getLocale()` used to return a hardcoded "english (us)" and

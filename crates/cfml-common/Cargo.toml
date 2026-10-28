@@ -68,6 +68,12 @@ chrono = "0.4"
 chrono-tz = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
+# The host zone's IANA id, read the way the operating system itself reads it
+# (registry on Windows, CoreFoundation on macOS, /etc/localtime then
+# /etc/timezone on Linux). chrono already pulls it in on Unix for `Local`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iana-time-zone = "0.1"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
 wasm-bindgen = "0.2"
