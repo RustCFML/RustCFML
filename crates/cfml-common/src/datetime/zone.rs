@@ -126,11 +126,16 @@ pub fn offset_info_for_local(tz: &Tz, local: NaiveDateTime) -> OffsetInfo {
     }
 }
 
-/// The host system timezone id (`TZ` env var, then `/etc/localtime`, else UTC).
-/// Mirrors the JVM's `TimeZone.getDefault()` for the no-`setTimeZone` case.
-/// Resolved once per process (the JVM likewise caches its default): this is
-/// consulted per tz-BIF call when no timezone is configured, and the fallback
-/// path is an env read plus a `readlink` syscall.
+/// The host system timezone id: `TZ` env var, then the zone the operating
+/// system reports (the Windows registry, macOS CoreFoundation, Linux
+/// `/etc/localtime` / `/etc/timezone`), then the `/etc/localtime` symlink,
+/// else UTC. Mirrors the JVM's `TimeZone.getDefault()` for the
+/// no-`setTimeZone` case. Resolved once per process (the JVM likewise caches
+/// its default).
+///
+/// Before the OS lookup was added, Windows had no source at all and every
+/// Windows host outside UTC read `now()` in UTC — a desktop app in Brisbane
+/// stamped records 10 hours out (PR #497 is the regression test).
 pub fn system_tz_id() -> String {
     static SYSTEM_TZ: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SYSTEM_TZ
@@ -138,6 +143,14 @@ pub fn system_tz_id() -> String {
             if let Ok(tz) = std::env::var("TZ") {
                 if !tz.is_empty() {
                     return tz;
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Ok(tz) = iana_time_zone::get_timezone() {
+                    if !tz.is_empty() {
+                        return tz;
+                    }
                 }
             }
             #[cfg(unix)]

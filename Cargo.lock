@@ -1533,6 +1533,7 @@ version = "0.742.2"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "iana-time-zone",
  "indexmap",
  "js-sys",
  "log",
