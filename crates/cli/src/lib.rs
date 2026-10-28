@@ -199,7 +199,7 @@ use cfml_compiler::lexer;
 use cfml_compiler::parser::Parser as CfmlParser;
 use cfml_compiler::tag_parser;
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
-use cfml_vm::{CfmlVirtualMachine, ServerState, ThreadHandle, ThreadSeed, compile_file_cached};
+use cfml_vm::{CfmlVirtualMachine, ServerState, ThreadHandle, ThreadSeed};
 
 // Public re-exports for `--build`-produced native-module crates. A module's
 // `register(vm)` function only needs to depend on `rustcfml-cli` to reach
@@ -734,8 +734,19 @@ fn warm_bytecode_cache(docroot: &str, cache_dir: &str) {
     println!("\nBytecode cache warming complete:");
     println!("  Compiled: {}", compiled);
     println!("  Failed: {}", failed);
-    
-    if failed > 0 {
+    println!(
+        "  Entries are keyed by the path as spelled here; serve with the same docroot \
+         spelling (`--serve {}`) or they will not be found.",
+        docroot
+    );
+
+    // A file that does not compile is reported, not fatal: it fails the same
+    // way at request time whether or not it was warmed, and a tree with a
+    // deliberately broken fixture (a parser test, a half-written page) must
+    // not fail the `docker build` that warms it. Only a run that compiled
+    // NOTHING is an error — the docroot held no CFML, or none of it parsed.
+    if compiled == 0 {
+        eprintln!("Error: no .cfm/.cfc file under '{}' compiled", docroot);
         exit(1);
     }
 }
@@ -811,15 +822,17 @@ struct Args {
     #[arg(long)]
     production: bool,
 
-    /// Directory for persistent bytecode cache. Compiled bytecode is written
-    /// to disk and reloaded across restarts, keyed by source content hash.
-    /// Removes compilation from boot and first-page-hit latency. Use with
-    /// --warm to pre-compile at Docker build time.
+    /// Directory for the persistent bytecode cache. Compiled bytecode is
+    /// written there and reloaded across restarts, keyed by source content,
+    /// path and engine version, so boot and first hits skip compilation.
+    /// The directory is executed as code: keep it writable by trusted users
+    /// only. Pre-fill it at image build time with --warm.
     #[arg(long, value_name = "DIR")]
     bytecode_cache: Option<String>,
 
-    /// Pre-compile all .cfm/.cfc files under the given docroot and mappings
-    /// into the bytecode cache without executing them. Requires --bytecode-cache.
+    /// Pre-compile every .cfm/.cfc under the given docroot into the bytecode
+    /// cache without executing anything. Requires --bytecode-cache. Spell the
+    /// docroot exactly as --serve will see it (entries are keyed by path).
     /// For Docker: RUN rustcfml --warm /app --bytecode-cache /app/.rustcfml-bc
     #[arg(long, value_name = "DOCROOT")]
     warm: Option<String>,

@@ -201,6 +201,30 @@ RUN rustcfml-warm-extensions   # only if the app ships .rcx files
 
 A standalone web-application binary (below) copied into a `scratch`/`distroless` base remains a valid alternative, since RustCFML has no runtime dependencies.
 
+### Persistent bytecode cache (`--bytecode-cache`, `--warm`)
+
+Compiled bytecode normally lives in memory, so every process start recompiles each template on its first hit. Point the server at a cache directory and compiled programs are written there and reloaded on the next start:
+
+```bash
+rustcfml --serve /app --production --bytecode-cache /app/.rustcfml-bc
+```
+
+To take compilation out of container start-up entirely, fill the cache when the image is built:
+
+```dockerfile
+FROM ghcr.io/rustcfml/rustcfml:v0.653.3
+COPY --chown=nonroot:nonroot webroot/ /app/
+RUN rustcfml --warm /app --bytecode-cache /app/.rustcfml-bc
+```
+
+and start the server with the same `--bytecode-cache` path. `--warm` compiles every `.cfm`/`.cfc` under the docroot without executing anything and reports each file that fails to compile. Those failures are not fatal — such a file fails the same way at request time, and a tree that ships a deliberately broken fixture must not fail the build — but a run that compiles nothing is.
+
+**Spell the docroot the same way for `--warm` and `--serve`.** An entry is keyed by the source content *and the path as the engine spelled it*, because a component's qualified name depends on the path it was reached by (the same file under a mapping is a different component). `--warm /app` then `--serve /app` hits; `--warm ./webroot` then `--serve /app` compiles everything again. A handful of misses on a warmed cache are normal: files written at run time, and includes reached through a `..` path.
+
+Entries are invalidated by content (a changed file simply gets a new entry, so timestamps do not matter across `COPY` layers), by engine version, and by bytecode format version. A mismatch is a miss, never an error, and a truncated or corrupt entry is detected by checksum and recompiled. Stale entries for deleted sources are harmless but are not pruned; delete the directory to reclaim the space.
+
+**The cache directory is code.** Anything that can write to it can run arbitrary CFML in the server, so it must be writable only by the user the server runs as. A read-only directory is fine: writes are skipped and reads still work.
+
 ## CLI tools
 
 Build a command-line tool from a CFML app. Arguments are available via the `cli` scope, which works like CFML's `arguments` scope — named keys for flags, 1-based numeric keys for positional args.
