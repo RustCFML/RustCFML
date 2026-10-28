@@ -38,7 +38,7 @@ chrono-tz = { workspace = true }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bincode = "1"
+bincode = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 # MCP client transport (feature `mcp-client`). Same version as cfml-stdlib's,
 # so the two share one build of it.

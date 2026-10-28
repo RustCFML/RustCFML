@@ -40,8 +40,9 @@ use std::sync::Arc;
 /// cache entries incompatible.
 ///
 /// History:
-/// - 1: Initial disk cache implementation (v0.654.0)
-pub const BYTECODE_FORMAT_VERSION: u32 = 1;
+/// - 1: Initial disk cache implementation (v0.654.0, bincode 1.3.3)
+/// - 2: Switched to bincode 2.0.1 (v0.742.2)
+pub const BYTECODE_FORMAT_VERSION: u32 = 2;
 
 /// Compute cache key for a source file, optionally including the source path.
 /// The path component ensures that the same file compiled via different paths
@@ -152,7 +153,7 @@ struct SerializableFunction {
 
 /// Convert BytecodeFunction to serializable form
 fn serialize_function(func: &BytecodeFunction) -> Result<SerializableFunction, Box<dyn std::error::Error>> {
-    let instructions_blob = bincode::serialize(&func.instructions)?;
+    let instructions_blob = bincode::serde::encode_to_vec(&func.instructions, bincode::config::standard())?;
     
     Ok(SerializableFunction {
         name: func.name.clone(),
@@ -206,7 +207,7 @@ fn deserialize_function(
     new_global_id: u32,
     id_remap: &HashMap<u32, u32>,
 ) -> Result<BytecodeFunction, Box<dyn std::error::Error>> {
-    let mut instructions: Vec<BytecodeOp> = bincode::deserialize(&ser.instructions_blob)?;
+    let mut instructions: Vec<BytecodeOp> = bincode::serde::decode_from_slice(&ser.instructions_blob, bincode::config::standard())?.0;
     
     // Remap all function IDs in instructions
     for instruction in &mut instructions {
@@ -291,14 +292,14 @@ pub fn write_to_disk_cache(
     };
 
     // Serialize without checksum first
-    let mut data = match bincode::serialize(&serialized) {
+    let mut data = match bincode::serde::encode_to_vec(&serialized, bincode::config::standard()) {
         Ok(d) => d,
         Err(_) => return Ok(()), // Silently skip
     };
     
     // Compute checksum and add it
     serialized.header.checksum = compute_checksum(&data);
-    data = bincode::serialize(&serialized)?;
+    data = bincode::serde::encode_to_vec(&serialized, bincode::config::standard())?;
 
     // Atomic write: temp file then rename
     let temp_file = cache_file.with_extension("bc.tmp");
@@ -329,8 +330,8 @@ pub fn read_from_disk_cache(
     };
 
     // Deserialize the cache entry
-    let mut serialized: SerializedProgram = match bincode::deserialize(&data) {
-        Ok(s) => s,
+    let mut serialized: SerializedProgram = match bincode::serde::decode_from_slice(&data, bincode::config::standard()) {
+        Ok((s, _)) => s,
         Err(_) => return Ok(None), // Corrupt or incompatible → miss
     };
 
@@ -350,7 +351,7 @@ pub fn read_from_disk_cache(
     // Verify checksum
     let stored_checksum = serialized.header.checksum;
     serialized.header.checksum = 0;
-    let recomputed_data = bincode::serialize(&serialized)?;
+    let recomputed_data = bincode::serde::encode_to_vec(&serialized, bincode::config::standard())?;
     let computed_checksum = compute_checksum(&recomputed_data);
     
     if stored_checksum != computed_checksum {
@@ -478,7 +479,7 @@ mod tests {
             functions: vec![],
         };
 
-        let data = bincode::serialize(&bad_entry).unwrap();
+        let data = bincode::serde::encode_to_vec(&bad_entry, bincode::config::standard()).unwrap();
         std::fs::write(&cache_file, &data).unwrap();
 
         // Should be a cache miss
@@ -507,7 +508,7 @@ mod tests {
             functions: vec![],
         };
 
-        let data = bincode::serialize(&bad_entry).unwrap();
+        let data = bincode::serde::encode_to_vec(&bad_entry, bincode::config::standard()).unwrap();
         std::fs::write(&cache_file, &data).unwrap();
 
         // Should be a cache miss
