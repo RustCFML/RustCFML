@@ -2298,12 +2298,20 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Function(fun) => f.debug_tuple("Function").field(fun).finish(),
             CfmlValue::Query(q) => f.debug_tuple("Query").field(q).finish(),
             CfmlValue::Binary(b) => f.debug_tuple("Binary").field(b).finish(),
-            CfmlValue::NativeObject(obj) => match obj.read() {
+            // `try_read`: `call_method` runs under the write lock, so a native
+            // that formats itself (or a value holding it) would deadlock on a
+            // blocking `read()` from the same thread.
+            CfmlValue::NativeObject(obj) => match obj.try_read() {
                 Ok(g) => f
                     .debug_tuple("NativeObject")
                     .field(&g.class_name().to_string())
                     .finish(),
-                Err(_) => f.debug_tuple("NativeObject").field(&"<poisoned>").finish(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    f.debug_tuple("NativeObject").field(&"<busy>").finish()
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    f.debug_tuple("NativeObject").field(&"<poisoned>").finish()
+                }
             },
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => f.debug_tuple("Instance").field(inst).finish(),
@@ -2930,9 +2938,14 @@ impl CfmlValue {
             CfmlValue::Function(f) => (f.name.clone(), true),
             CfmlValue::Query(_) => ("<Query>".to_string(), true),
             CfmlValue::Binary(_) => ("<Binary>".to_string(), true),
-            CfmlValue::NativeObject(obj) => match obj.read() {
+            // `try_read` for the same reason as `Debug`: this can run while the
+            // object's own method holds its write lock.
+            CfmlValue::NativeObject(obj) => match obj.try_read() {
                 Ok(g) => (format!("<NativeObject:{}>", g.class_name()), true),
-                Err(_) => ("<NativeObject:poisoned>".to_string(), true),
+                Err(std::sync::TryLockError::WouldBlock) => ("<NativeObject>".to_string(), true),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    ("<NativeObject:poisoned>".to_string(), true)
+                }
             },
             // Same bounded token as a marker-struct component (which returns
             // "<Component>" via the is_component_backing branch above) — never a
@@ -3566,7 +3579,12 @@ impl CfmlValue {
             (CfmlValue::Bool(a), CfmlValue::Bool(b)) => a == b,
             (CfmlValue::Int(a), CfmlValue::Int(b)) => a == b,
             (CfmlValue::Double(a), CfmlValue::Double(b)) => a == b,
-            (CfmlValue::String(a), CfmlValue::String(b)) => a.to_lowercase() == b.to_lowercase(),
+            // Same Unicode lowercasing as `to_lowercase() ==`, compared lazily
+            // instead of allocating two folded copies.
+            (CfmlValue::String(a), CfmlValue::String(b)) => a
+                .chars()
+                .flat_map(char::to_lowercase)
+                .eq(b.chars().flat_map(char::to_lowercase)),
             (CfmlValue::Int(a), CfmlValue::Double(b)) => *a as f64 == *b,
             (CfmlValue::Double(a), CfmlValue::Int(b)) => *a == *b as f64,
             (CfmlValue::Array(a), CfmlValue::Array(b)) => {
