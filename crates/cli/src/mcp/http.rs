@@ -74,11 +74,22 @@ pub(crate) async fn post(
         Ok(caller) => caller,
         Err(deny) => return deny,
     };
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    // `server.maxRequestBodySize` caps an MCP call like any other request
+    // (`0` = unlimited); `usize::MAX` let one POST buffer without bound.
+    let limit = match state.cfconfig.server.max_request_body_size {
+        0 => usize::MAX,
+        n => n as usize,
+    };
+    let body = match axum::body::to_bytes(body, limit).await {
         Ok(b) => b,
         Err(e) => {
+            let status = if crate::body_read_error_is_length_limit(&e) {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             return rpc_error(
-                StatusCode::BAD_REQUEST,
+                status,
                 protocol::PARSE_ERROR,
                 format!("Could not read request body: {e}"),
             )

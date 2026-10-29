@@ -123,6 +123,9 @@ fn status(code: u32, what: &str) -> Result<()> {
         abi::status::NOT_FOUND => "no such key or index",
         abi::status::BAD_CTX => "the ctx is not valid for this call",
         abi::status::UNSUPPORTED => "this host does not provide that capability",
+        abi::status::UNLOCKED => "the shared scope is not locked; take ctx.lock() before writing it",
+        abi::status::TIMEOUT => "timed out waiting for the lock",
+        abi::status::NO_SCOPE => "no such scope, or no VM in this context",
         _ => "unknown host error",
     };
     Err(Error::expression(format!("{what}: {reason}")))
@@ -795,8 +798,8 @@ unsafe extern "C-unwind" fn drv_begin<D: DbDriver>(
     let ctx = Ctx::from_raw(raw);
     let this = &*(data as *const D);
     match this.begin(&ctx, isolation.as_str()) {
-        // The decl only advertises `begin` when D overrides it, so reaching
-        // here with None means the driver changed its mind at runtime.
+        // A driver that left `begin` at its default but did not set
+        // `SUPPORTS_TRANSACTIONS = false` still advertises the entry.
         None => raise(raw, &Error::new("this driver does not support transactions")),
         Some(Err(e)) => raise(raw, &e),
         Some(Ok(txn)) => {
@@ -915,11 +918,11 @@ impl<D: DbDriver> DrvVt<D> {
     pub const TABLE: abi::DbDriverVtable = abi::DbDriverVtable {
         size: core::mem::size_of::<abi::DbDriverVtable>(),
         execute: drv_execute::<D>,
-        begin: Some(drv_begin::<D>),
-        txn_execute: Some(drv_txn_execute::<D>),
-        txn_commit: Some(drv_txn_commit::<D>),
-        txn_rollback: Some(drv_txn_rollback::<D>),
-        txn_savepoint: Some(drv_txn_savepoint::<D>),
+        begin: if D::SUPPORTS_TRANSACTIONS { Some(drv_begin::<D>) } else { None },
+        txn_execute: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_execute::<D>) } else { None },
+        txn_commit: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_commit::<D>) } else { None },
+        txn_rollback: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_rollback::<D>) } else { None },
+        txn_savepoint: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_savepoint::<D>) } else { None },
         dbinfo: Some(drv_dbinfo::<D>),
         drop_fn: drv_drop::<D>,
     };
@@ -994,6 +997,13 @@ pub trait DbDriver: Send + Sync + Sized + 'static {
         params: Value<'a>,
         return_type: &str,
     ) -> Result<Value<'a>>;
+
+    /// Whether this driver implements [`DbDriver::begin`]. The method table
+    /// only advertises the transaction entries when this is `true`, so the
+    /// host can tell a driver without transactions from one with them.
+    /// Defaults to `true` so existing drivers that override `begin` keep
+    /// working; a driver with no transactions should set it to `false`.
+    const SUPPORTS_TRANSACTIONS: bool = true;
 
     /// Open a transaction. `None` — the default — means this driver has none,
     /// and `transaction { }` against it reports that rather than silently

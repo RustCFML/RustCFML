@@ -223,7 +223,9 @@ pub(crate) fn op_set_index(
             if one_based < 1 {
                 return Err(err_cannot_set_position(one_based));
             }
-            let idx = (one_based - 1) as usize;
+            // `as usize` truncated a position past `u32::MAX` on 32-bit wasm,
+            // silently writing a low element. Saturate so it meets the cap.
+            let idx = usize::try_from(one_based - 1).unwrap_or(usize::MAX);
             // Interior mutability on the shared handle: the
             // assignment is visible to every alias. Auto-grow
             // past the end leaves skipped slots as null holes
@@ -313,13 +315,15 @@ pub(crate) fn op_set_index(
             // out corrupt — and a row `< 1` was dropped in silence.
             let one_based = subscript_position(&index)?;
             let len = arc.len();
-            if one_based < 1 || (one_based as usize) > len {
+            // Compared as i64: `one_based as usize` truncates on 32-bit wasm,
+            // letting a huge row past the check.
+            if one_based < 1 || one_based > len as i64 {
                 return Err(cfml_common::vm::CfmlError::database(format!(
                     "invalid row number [{}]",
                     one_based
                 )));
             }
-            let idx = (one_based - 1) as usize;
+            let idx = (one_based - 1) as usize; // in 0..len, checked above
             let col = Arc::make_mut(arc);
             col[idx] = value;
         }
@@ -351,7 +355,7 @@ pub(crate) fn op_set_index(
             // unaffected, exactly as when `Binary` held a plain `Vec`.
             let bytes = std::sync::Arc::make_mut(bytes);
             let one_based = subscript_position(&index)?;
-            if one_based < 1 || (one_based as usize) > bytes.len() {
+            if one_based < 1 || one_based > bytes.len() as i64 {
                 return Err(cfml_common::vm::CfmlError::expression(format!(
                     "Invalid index [{}] for Native Array, can't expand Native Arrays",
                     one_based

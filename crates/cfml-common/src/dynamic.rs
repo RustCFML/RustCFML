@@ -617,7 +617,9 @@ impl CfmlArray {
         if idx < g.len() {
             g[idx] = value;
         } else {
-            let grow = idx - g.len() + 1;
+            // Saturating: `idx == usize::MAX` (reachable on 32-bit wasm) made
+            // `+ 1` wrap to 0, slip past the cap, and `resize` abort.
+            let grow = (idx - g.len()).saturating_add(1);
             if grow > crate::container_size::MAX_GROW_PER_CALL {
                 return Err(CfmlError::expression(format!(
                     "can not set Element at position [{}]: growing the array by [{}] elements \
