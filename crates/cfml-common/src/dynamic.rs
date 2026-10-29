@@ -4533,11 +4533,22 @@ mod size_probe {
         // `Query(CfmlQuery)` (72 B) — dropping the enum to 32 B, now floored
         // by `String(String)` (24 B) + discriminant. The next planned shrink
         // (interning idents / `String(Arc<str>)`, PR-B) could take it to ~24 B.
+        // `String(Arc<str>)` landed: 24 B since.
         assert!(
-            cfml_value <= 32,
-            "CfmlValue grew to {cfml_value} B (ceiling 32 B) — a perf regression. \
+            cfml_value <= 24,
+            "CfmlValue grew to {cfml_value} B (ceiling 24 B) — a perf regression. \
              If intentional, justify and raise the ceiling."
         );
+
+        // A boxed error keeps `CfmlResult` the size of a value: an inline
+        // 80-byte `CfmlError` made every result 80 bytes and pinned ~3 KB of
+        // error slots in the dispatch loop's frame (see `CfmlError`).
+        let err = size_of::<crate::vm::CfmlError>();
+        let res = size_of::<crate::vm::CfmlResult>();
+        eprintln!("size_of::<CfmlError>()      = {err} B");
+        eprintln!("size_of::<CfmlResult>()     = {res} B");
+        assert_eq!(err, size_of::<usize>(), "CfmlError must stay one pointer");
+        assert!(res <= 24, "CfmlResult grew to {res} B (ceiling 24 B)");
     }
 }
 
