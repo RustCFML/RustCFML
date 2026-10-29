@@ -268,8 +268,9 @@ impl CfRegex {
 /// semantics and compiles. A `-` forming a genuine range (`a-z`, `0-9`) or one
 /// that is leading/trailing in the class is left untouched.
 fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
-    // Only escapes can trigger either rewrite, so a pattern with no `\` is safe.
-    if !pat.contains('\\') {
+    // Every rewrite below is triggered by an escape or a character class, so a
+    // pattern with neither is safe as written.
+    if !pat.contains('\\') && !pat.contains('[') {
         return std::borrow::Cow::Borrowed(pat);
     }
     let is_shorthand = |c: char| matches!(c, 'w' | 'W' | 'd' | 'D' | 's' | 'S');
@@ -300,6 +301,20 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
                 // already literal, so this only touches the outside-class case.
                 out.push(n);
                 prev_was_shorthand = false;
+            } else if n == 'x'
+                && chars.get(i + 2).is_some_and(|d| d.is_ascii_hexdigit())
+                && !chars.get(i + 3).is_some_and(|d| d.is_ascii_hexdigit())
+            {
+                // Perl (Lucee's Oro engine) takes one OR two hex digits after
+                // `\x`; Rust's regex needs exactly two. `[\x0]` is a NUL.
+                out.push_str("\\x0");
+                out.push(chars[i + 2]);
+                prev_was_shorthand = false;
+                if in_class {
+                    class_pos += 1;
+                }
+                i += 3;
+                continue;
             } else {
                 out.push(c);
                 out.push(n);
@@ -330,6 +345,30 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
                 }
                 prev_was_shorthand = false;
             }
+            '[' if in_class => {
+                // A POSIX class (`[:alpha:]`) is copied whole; any other `[`
+                // inside a class is a literal in Perl/Java, but Rust's regex
+                // reads it as a NESTED class, so `[^[]*` failed to compile and
+                // every BBCode-style `\[b\]([^[]*)\[/b\]` silently never matched.
+                let posix_end = (chars.get(i + 1) == Some(&':'))
+                    .then(|| {
+                        (i + 2..chars.len().saturating_sub(1))
+                            .find(|&j| chars[j] == ':' && chars[j + 1] == ']')
+                    })
+                    .flatten();
+                match posix_end {
+                    Some(j) => {
+                        out.extend(&chars[i..=j + 1]);
+                        i = j + 2;
+                        class_pos += 1;
+                        prev_was_shorthand = false;
+                        continue;
+                    }
+                    None => out.push_str("\\["),
+                }
+                class_pos += 1;
+                prev_was_shorthand = false;
+            }
             '^' if in_class && class_pos == 0 => out.push('^'),
             '-' if in_class && class_pos > 0 => {
                 // Escape only when adjacent to a class shorthand on either side
@@ -357,7 +396,22 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
+/// A pattern neither regex engine accepts. Lucee throws for a malformed
+/// pattern in every `re*` BIF; answering "no match" instead hid the bug at
+/// the call site (`reReplace` returned the subject unchanged).
+fn malformed_regex(pat: &str, reason: &str) -> CfmlError {
+    // Report the caller's pattern: drop the `(?i)` the NoCase BIFs prepend,
+    // and the parser's byte position, which counts into the translated
+    // pattern rather than the one the caller wrote.
+    let pat = pat.strip_prefix("(?i)").unwrap_or(pat);
+    let reason = match reason.split_once(": ") {
+        Some((head, rest)) if head.starts_with("Parsing error at position") => rest,
+        _ => reason,
+    };
+    CfmlError::expression(format!("Malformed regular expression [{pat}]: {reason}"))
+}
+
+fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, CfmlError> {
     if let Some(e) = REGEX_CACHE.read().unwrap().get(pat) {
         // Refcount bump only — see REGEX_CACHE's note on why this must not be a
         // deep clone. Count the use under the read lock.
@@ -394,7 +448,7 @@ fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, ()> {
         // equivalent and a later `(?-s)` in the pattern still overrides it.
         Err(_) => match fancy_regex::Regex::new(&format!("(?s){}", translated)) {
             Ok(r) => CfRegex::Fancy(r),
-            Err(_) => return Err(()),
+            Err(e) => return Err(malformed_regex(pat, &e.to_string())),
         },
     };
     let re = std::sync::Arc::new(re);
@@ -1332,14 +1386,18 @@ fn get_bytes(args: &[CfmlValue], idx: usize) -> Vec<u8> {
     }
 }
 
-fn get_int(args: &[CfmlValue], idx: usize) -> i64 {
-    // A QueryColumn proxy coerces to its first-row value in scalar contexts.
-    match args.get(idx).map(|v| v.query_column_scalar()) {
-        Some(CfmlValue::Int(i)) => *i,
-        Some(CfmlValue::Double(d)) => *d as i64,
-        Some(CfmlValue::String(s)) => s.parse().unwrap_or(0),
-        Some(CfmlValue::Bool(b)) => if *b { 1 } else { 0 },
-        _ => 0,
+/// An integer argument, coerced as Lucee's `Caster.toLongValue` does (see
+/// `dates::to_long`): a numeric string is trimmed and may carry a fraction or
+/// exponent (`" 2"`, `"2.9"` and `"2e0"` are all 2), a boolean-literal string
+/// is 1/0, and a non-numeric string or a complex value throws Lucee's cast
+/// error. An absent or null argument is 0, the default callers rely on.
+///
+/// This used to parse only plain integers and turn everything else into 0,
+/// so `mid(s, " 2", 3)` started at 0 while `dateAdd` accepted the same string.
+fn get_int(args: &[CfmlValue], idx: usize) -> Result<i64, CfmlError> {
+    match args.get(idx) {
+        None | Some(CfmlValue::Null) => Ok(0),
+        Some(v) => crate::dates::to_long(v),
     }
 }
 
@@ -1802,7 +1860,7 @@ fn fn_find(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let substring = get_str(&args, 0);
         let string = arc_str_arg(&args, 1);
-        let start = if args.len() >= 3 { get_int(&args, 2).max(1) as usize - 1 } else { 0 };
+        let start = if args.len() >= 3 { get_int(&args, 2)?.max(1) as usize - 1 } else { 0 };
         Ok(CfmlValue::Int(find_substr_char(&string, &substring, start)))
     } else {
         Ok(CfmlValue::Int(0))
@@ -1813,7 +1871,7 @@ fn fn_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let substring = get_str(&args, 0);
         let string = arc_str_arg(&args, 1);
-        let start = if args.len() >= 3 { get_int(&args, 2).max(1) as usize - 1 } else { 0 };
+        let start = if args.len() >= 3 { get_int(&args, 2)?.max(1) as usize - 1 } else { 0 };
         // ASCII on both sides: fold bytes in place of lowercasing two whole
         // copies per call (offsets are unchanged by ASCII folding).
         if substring.is_ascii() && string.len() >= CHAR_INDEX_MEMO_MIN_LEN {
@@ -1851,7 +1909,7 @@ fn fn_find_one_of(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let chars = get_str(&args, 0);
         let string = get_str(&args, 1);
-        let start = if args.len() >= 3 { (get_int(&args, 2) as usize).saturating_sub(1) } else { 0 };
+        let start = if args.len() >= 3 { (get_int(&args, 2)? as usize).saturating_sub(1) } else { 0 };
         for (i, c) in string.chars().enumerate().skip(start) {
             if chars.contains(c) {
                 return Ok(CfmlValue::Int((i + 1) as i64));
@@ -1892,12 +1950,18 @@ fn char_offset_from_end(s: &str, n: usize) -> usize {
 fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let string = arc_str_arg(&args, 0);
-        let start = (get_int(&args, 1).max(1) as usize).saturating_sub(1);
+        let start = (get_int(&args, 1)?.max(1) as usize).saturating_sub(1);
         let from = char_to_byte_memo(&string, start).unwrap_or(string.len());
         let rest = &string[from..];
         let slice = if args.len() >= 3 {
-            let length = get_int(&args, 2).max(0) as usize;
-            &rest[..char_offset(rest, length)]
+            // Lucee: -1 means "to the end"; any other negative count throws.
+            let length = get_int(&args, 2)?;
+            if length < -1 {
+                return Err(CfmlError::expression(format!(
+                    "Parameter 3 of function mid which is now [{length}] must be a non-negative integer or -1 (for string length)"
+                )));
+            }
+            if length == -1 { rest } else { &rest[..char_offset(rest, length as usize)] }
         } else {
             rest
         };
@@ -1909,13 +1973,13 @@ fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_left(args: Vec<CfmlValue>) -> CfmlResult {
     let string = arc_str_arg(&args, 0);
-    let count = get_int(&args, 1).max(0) as usize;
+    let count = get_int(&args, 1)?.max(0) as usize;
     Ok(CfmlValue::string(string[..char_offset(&string, count)].to_string()))
 }
 
 fn fn_right(args: Vec<CfmlValue>) -> CfmlResult {
     let string = arc_str_arg(&args, 0);
-    let count = get_int(&args, 1).max(0) as usize;
+    let count = get_int(&args, 1)?.max(0) as usize;
     Ok(CfmlValue::string(string[char_offset_from_end(&string, count)..].to_string()))
 }
 
@@ -1925,7 +1989,7 @@ fn fn_reverse(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_repeat_string(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let count = get_int(&args, 1).max(0) as usize;
+    let count = get_int(&args, 1)?.max(0) as usize;
     Ok(CfmlValue::string(s.repeat(count)))
 }
 
@@ -1936,7 +2000,7 @@ fn fn_insert(args: Vec<CfmlValue>) -> CfmlResult {
         // `pos` is a CHARACTER offset (insert AFTER this many chars). Byte-based
         // insert_str desynced with the char-based Find/Mid family and could panic
         // on a non-char-boundary offset for non-ASCII input (GitHub #248).
-        let pos_char = get_int(&args, 2).max(0) as usize;
+        let pos_char = get_int(&args, 2)?.max(0) as usize;
         let char_count = string.chars().count();
         let mut result = string.clone();
         if pos_char <= char_count {
@@ -1955,13 +2019,13 @@ fn fn_remove_chars(args: Vec<CfmlValue>) -> CfmlResult {
         let mut chars: Vec<char> = string.chars().collect();
         // Lucee's checks and messages. An unchecked start reached
         // `drain(start..end)` with start > end and panicked the request.
-        let start = get_int(&args, 1);
+        let start = get_int(&args, 1)?;
         if start < 1 || start > chars.len() as i64 {
             return Err(CfmlError::expression(format!(
                 "Parameter 2 of function removeChars which is now [{start}] must be a greater 0 and less than the length of the first parameter"
             )));
         }
-        let count = get_int(&args, 2);
+        let count = get_int(&args, 2)?;
         if count < 0 {
             return Err(CfmlError::expression(format!(
                 "Parameter 3 of function removeChars which is now [{count}] must be a non-negative integer"
@@ -2016,7 +2080,7 @@ fn fn_asc(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_chr(args: Vec<CfmlValue>) -> CfmlResult {
-    let code = get_int(&args, 0) as u32;
+    let code = get_int(&args, 0)? as u32;
     Ok(CfmlValue::string(
         char::from_u32(code).map_or(String::new(), |c| c.to_string()),
     ))
@@ -2040,7 +2104,7 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     // offset for the regex engine. Returned match positions/lengths are mapped
     // back to characters below so reFind stays consistent with Mid/Len/Find
     // on non-ASCII input (GitHub #248).
-    let start_char = if args.len() >= 3 { (get_int(&args, 2).max(1) as usize).saturating_sub(1) } else { 0 };
+    let start_char = if args.len() >= 3 { (get_int(&args, 2)?.max(1) as usize).saturating_sub(1) } else { 0 };
     let return_sub = if args.len() >= 4 { args[3].is_true() } else { false };
     // 5th argument: scope. "all" returns EVERY match rather than the first
     // (Lucee/ACF 2016+). We dropped it silently, so a caller asking for all
@@ -2052,10 +2116,7 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
         .is_some_and(|s| s.eq_ignore_ascii_case("all"));
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
-    let re = match cached_regex(&pat) {
-        Ok(r) => r,
-        Err(_) => return Ok(CfmlValue::Int(0)),
-    };
+    let re = cached_regex(&pat)?;
 
     // Start the search at byte offset `start` WITHOUT re-anchoring `^`/`\b` to
     // that offset: `find_at`/`captures_at` advance the search position but keep
@@ -2238,10 +2299,7 @@ fn re_replace_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     let scope = get_str(&args, 3).to_lowercase();
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
-    let re = match cached_regex(&pat) {
-        Ok(r) => r,
-        Err(_) => return Ok(CfmlValue::string(string)),
-    };
+    let re = cached_regex(&pat)?;
 
     // Use a custom replacer so CFML's `\N` backreferences and `\u`/`\l`/`\U`/`\L`
     // case modifiers are honored (and `$` stays literal).
@@ -2265,10 +2323,7 @@ fn re_match_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     let string = get_str(&args, 1);
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
-    let re = match cached_regex(&pat) {
-        Ok(r) => r,
-        Err(_) => return Ok(CfmlValue::array(Vec::new())),
-    };
+    let re = cached_regex(&pat)?;
 
     let matches: Vec<CfmlValue> = re
         .find_all(&string)
@@ -2280,7 +2335,7 @@ fn re_match_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
 
 fn fn_wrap(args: Vec<CfmlValue>) -> CfmlResult {
     let string = get_str(&args, 0);
-    let limit = get_int(&args, 1).max(1) as usize;
+    let limit = get_int(&args, 1)?.max(1) as usize;
     let strip = args.get(2).map(|v| v.is_true()).unwrap_or(false);
     let input = if strip { string.replace('\n', " ").replace('\r', " ") } else { string };
     let mut result = String::new();
@@ -2729,7 +2784,7 @@ fn fn_encode_for_html(args: Vec<CfmlValue>) -> CfmlResult {
 /// u16) and `cJustify("a", -1)` cast the length to `usize::MAX` and aborted the
 /// process in `" ".repeat()`.
 fn justify_length(fn_name: &str, args: &[CfmlValue], must_be: &str) -> Result<usize, CfmlError> {
-    let length = get_int(args, 1);
+    let length = get_int(args, 1)?;
     if length < 1 {
         return Err(CfmlError::expression(format!(
             "Parameter 2 of function {} which is now [{}] must be {}",
@@ -2898,31 +2953,47 @@ fn fn_decimal_format(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_format_base_n(args: Vec<CfmlValue>) -> CfmlResult {
-    let n = get_int(&args, 0) as i32;
-    let radix = get_int(&args, 1) as u32;
-    if radix < 2 || radix > 36 {
-        return Err(CfmlError::runtime("formatBaseN: radix must be between 2 and 36".to_string()));
+    // Lucee FormatBaseN: radix first, then a number that must fit a Java
+    // `int`. A bare `as i32` wrapped 4294967296 to 0 and printed "0".
+    let radix = get_int(&args, 1)?;
+    if !(2..=36).contains(&radix) {
+        return Err(CfmlError::expression(
+            "Invalid call of the function [formatBaseN], second Argument [radix] is invalid, radix must be between 2 an 36".to_string(),
+        ));
     }
-    let is_negative = n < 0;
-    let abs_n = if is_negative { (n as i64).unsigned_abs() } else { n as u64 };
-    if abs_n == 0 { return Ok(CfmlValue::string("0".to_string())); }
-    // LOWERCASE digits: `formatBaseN(255, 16)` is `ff` on Lucee (and Java's
-    // `Long.toString(v, radix)`, which it wraps), not `FF` (GH #398).
-    let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut result = String::new();
-    let mut val = abs_n;
+    let n = i32::try_from(get_int(&args, 0)?).map_err(|_| {
+        CfmlError::expression(
+            "Invalid call of the function [formatBaseN], first Argument [number] is invalid, number to formatted must be on or between Integer.MIN_VALUE and Integer.MAX_VALUE (-2147483648, 2147483647)".to_string(),
+        )
+    })?;
+    // Radix 16 and 2 are Java's `Integer.toHexString`/`toBinaryString`: a
+    // negative number prints as its unsigned two's complement (`-1` is
+    // `ffffffff`). Every other radix is `Integer.toString`, signed.
+    let (negative, mut val) = match radix {
+        2 | 16 => (false, n as u32 as u64),
+        _ => (n < 0, (n as i64).unsigned_abs()),
+    };
+    if val == 0 {
+        return Ok(CfmlValue::string("0".to_string()));
+    }
+    // LOWERCASE digits: `formatBaseN(255, 16)` is `ff` on Lucee (GH #398).
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let radix = radix as u64;
+    let mut result = Vec::new();
     while val > 0 {
-        let d = (val % radix as u64) as usize;
-        result.push(digits.as_bytes()[d] as char);
-        val /= radix as u64;
+        result.push(digits[(val % radix) as usize]);
+        val /= radix;
     }
-    if is_negative { result.push('-'); }
-    Ok(CfmlValue::string(result.chars().rev().collect::<String>()))
+    if negative {
+        result.push(b'-');
+    }
+    result.reverse();
+    Ok(CfmlValue::string(String::from_utf8(result).unwrap_or_default()))
 }
 
 fn fn_input_base_n(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let radix = get_int(&args, 1);
+    let radix = get_int(&args, 1)?;
     // Lucee InputBaseN: "radix must be between 2 and 36". `from_str_radix`
     // panics outside that range, so `inputBaseN("111", 1)` took the engine down.
     if !(2..=36).contains(&radix) {
@@ -2932,9 +3003,16 @@ fn fn_input_base_n(args: Vec<CfmlValue>) -> CfmlResult {
             radix
         )));
     }
-    Ok(CfmlValue::Int(
-        i64::from_str_radix(&s, radix as u32).unwrap_or(0),
-    ))
+    // Java's `Long.parseLong(s.trim(), radix)`: an unparseable string throws
+    // its NumberFormatException rather than reading as 0.
+    let t = s.trim();
+    i64::from_str_radix(t, radix as u32).map(CfmlValue::Int).map_err(|_| {
+        let under = if radix == 10 { String::new() } else { format!(" under radix {radix}") };
+        CfmlError::new(
+            format!("For input string: \"{t}\"{under}"),
+            CfmlErrorType::Custom("java.lang.NumberFormatException".to_string()),
+        )
+    })
 }
 
 fn fn_replace_list(args: Vec<CfmlValue>) -> CfmlResult {
@@ -3240,18 +3318,7 @@ fn check_array_growth(
 }
 
 fn get_index_arg(args: &[CfmlValue], idx: usize) -> Result<i64, CfmlError> {
-    match args.get(idx).map(|v| v.query_column_scalar()) {
-        Some(CfmlValue::Int(i)) => Ok(*i),
-        Some(CfmlValue::Double(d)) => Ok(*d as i64),
-        Some(CfmlValue::Bool(b)) => Ok(if *b { 1 } else { 0 }),
-        Some(CfmlValue::String(s)) => s.trim().parse::<f64>().map(|f| f as i64).map_err(|_| {
-            CfmlError::expression(format!("can't cast [{}] string to a number value", s))
-        }),
-        other => Err(CfmlError::expression(format!(
-            "can't cast [{}] to a number value",
-            other.map(|v| v.as_string()).unwrap_or_default()
-        ))),
-    }
+    crate::dates::to_long(args.get(idx).unwrap_or(&CfmlValue::Null))
 }
 
 fn fn_array_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
@@ -3543,8 +3610,8 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
         // from the end (`len + offset`, repeatedly, so -2 of 5 starts at 3); a
         // length <= 0 stops that many elements before the end; an offset or
         // offset+length past the end throws rather than clamping.
-        let mut offset = get_int(&args, 1);
-        let length = if args.len() >= 3 { get_int(&args, 2) } else { 0 };
+        let mut offset = get_int(&args, 1)?;
+        let length = if args.len() >= 3 { get_int(&args, 2)? } else { 0 };
         let sliced = arr.with_read(|items| -> Result<Vec<CfmlValue>, CfmlError> {
             let n = items.len() as i64;
             if n == 0 {
@@ -3665,7 +3732,7 @@ fn fn_array_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
     // GH #340: a binary is a byte[] — see `binary_arg0_as_array`.
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
-        let idx = get_int(&args, 1) as usize;
+        let idx = get_int(&args, 1)? as usize;
         match &args[0] {
             CfmlValue::Array(arr) => {
                 return Ok(CfmlValue::Bool(idx >= 1 && idx <= arr.len()));
@@ -3747,8 +3814,8 @@ fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
                     return Err(CfmlError::expression(format!("invalid index [{}]", pos)));
                 }
             }
-            let i = (get_int(&args, 1) as usize).saturating_sub(1);
-            let j = (get_int(&args, 2) as usize).saturating_sub(1);
+            let i = (get_int(&args, 1)? as usize).saturating_sub(1);
+            let j = (get_int(&args, 2)? as usize).saturating_sub(1);
             arr.with_write(|v| {
                 if i < v.len() && j < v.len() {
                     v.swap(i, j);
@@ -5896,7 +5963,7 @@ fn fn_java_cast(args: Vec<CfmlValue>) -> CfmlResult {
                 CfmlValue::String(_) => args[1].clone(),
                 other => CfmlValue::string(other.as_string()),
             }),
-            "int" | "integer" | "long" => Ok(CfmlValue::Int(get_int(&args, 1))),
+            "int" | "integer" | "long" => Ok(CfmlValue::Int(get_int(&args, 1)?)),
             "double" | "float" => Ok(CfmlValue::Double(get_float(&args, 1))),
             "boolean" => Ok(CfmlValue::Bool(args[1].is_true())),
             "null" => Ok(CfmlValue::Null),
@@ -5933,7 +6000,7 @@ fn fn_round(args: Vec<CfmlValue>) -> CfmlResult {
     // For CFML compatibility, use floor(n + 0.5).
     let n = get_float(&args, 0);
     if args.len() >= 2 {
-        let precision = get_int(&args, 1);
+        let precision = get_int(&args, 1)?;
         let factor = 10f64.powi(precision as i32);
         Ok(CfmlValue::Double((n * factor + 0.5).floor() / factor))
     } else {
@@ -6015,8 +6082,8 @@ fn fn_rand(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_rand_range(args: Vec<CfmlValue>) -> CfmlResult {
     let alg = rand_algorithm("RandRange", &args, 2)?;
-    let mut min = get_int(&args, 0);
-    let mut max = get_int(&args, 1);
+    let mut min = get_int(&args, 0)?;
+    let mut max = get_int(&args, 1)?;
     // Lucee swaps a reversed range rather than producing garbage.
     if min > max {
         std::mem::swap(&mut min, &mut max);
@@ -6175,19 +6242,19 @@ fn fn_pow(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_bit_and(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Int(get_int(&args, 0) & get_int(&args, 1)))
+    Ok(CfmlValue::Int(get_int(&args, 0)? & get_int(&args, 1)?))
 }
 
 fn fn_bit_or(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Int(get_int(&args, 0) | get_int(&args, 1)))
+    Ok(CfmlValue::Int(get_int(&args, 0)? | get_int(&args, 1)?))
 }
 
 fn fn_bit_xor(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Int(get_int(&args, 0) ^ get_int(&args, 1)))
+    Ok(CfmlValue::Int(get_int(&args, 0)? ^ get_int(&args, 1)?))
 }
 
 fn fn_bit_not(args: Vec<CfmlValue>) -> CfmlResult {
-    let n = get_int(&args, 0) as i32;
+    let n = get_int(&args, 0)? as i32;
     Ok(CfmlValue::Int((!n) as i64))
 }
 
@@ -6197,7 +6264,7 @@ fn fn_bit_not(args: Vec<CfmlValue>) -> CfmlResult {
 /// 0..63 exactly as the JVM masks it (`bitSHLN(1, 64)` is 1). A raw `<<`
 /// panicked on both cases in a debug build and wrapped in release.
 fn bit_shift_count(fn_name: &str, args: &[CfmlValue]) -> Result<u32, CfmlError> {
-    let count = get_int(args, 1);
+    let count = get_int(args, 1)?;
     if count < 0 {
         return Err(CfmlError::expression(format!(
             "Invalid call of the function [{}], second Argument [count] is invalid, \
@@ -6210,14 +6277,14 @@ fn bit_shift_count(fn_name: &str, args: &[CfmlValue]) -> Result<u32, CfmlError> 
 
 fn fn_bit_shln(args: Vec<CfmlValue>) -> CfmlResult {
     let count = bit_shift_count("bitSHLN", &args)?;
-    Ok(CfmlValue::Int(get_int(&args, 0).wrapping_shl(count)))
+    Ok(CfmlValue::Int(get_int(&args, 0)?.wrapping_shl(count)))
 }
 
 fn fn_bit_shrn(args: Vec<CfmlValue>) -> CfmlResult {
     // Lucee uses `>>>`: a LOGICAL shift, so `bitSHRN(-1, 1)` is
     // 9223372036854775807, not -1.
     let count = bit_shift_count("bitSHRN", &args)?;
-    Ok(CfmlValue::Int(((get_int(&args, 0) as u64) >> count) as i64))
+    Ok(CfmlValue::Int(((get_int(&args, 0)? as u64) >> count) as i64))
 }
 
 /// The `(number, start, length)` triple of the `bitMask*` functions, as the
@@ -6230,7 +6297,7 @@ fn bit_mask_args(
     args: &[CfmlValue],
     start_idx: usize,
 ) -> Result<(i32, u32, u32), CfmlError> {
-    let number = get_int(args, 0);
+    let number = get_int(args, 0)?;
     let number = i32::try_from(number).map_err(|_| {
         CfmlError::expression(format!(
             "Invalid call of the function [{}], first Argument [number] is invalid, \
@@ -6239,7 +6306,7 @@ fn bit_mask_args(
         ))
     })?;
     let bits = |idx: usize, which: &str, name: &str| -> Result<u32, CfmlError> {
-        let v = get_int(args, idx);
+        let v = get_int(args, idx)?;
         if !(0..=31).contains(&v) {
             return Err(CfmlError::expression(format!(
                 "Invalid call of the function [{}], {} Argument [{}] is invalid, \
@@ -6268,7 +6335,7 @@ fn fn_bit_mask_read(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_bit_mask_set(args: Vec<CfmlValue>) -> CfmlResult {
     let (number, start, length) = bit_mask_args("bitMaskSet", &args, 2)?;
-    let mask = get_int(&args, 1) as i32;
+    let mask = get_int(&args, 1)? as i32;
     let clear_mask = low_bits_mask(length).wrapping_shl(start);
     let bits = (mask & low_bits_mask(length)).wrapping_shl(start);
     Ok(CfmlValue::Int(((number & !clear_mask) | bits) as i64))
@@ -6543,7 +6610,7 @@ fn fn_list_get_at(args: Vec<CfmlValue>) -> CfmlResult {
             p
         )
     };
-    let i = list_position(get_int(&args, 1), spans.len(), msg, |p, _| msg(p))?;
+    let i = list_position(get_int(&args, 1)?, spans.len(), msg, |p, _| msg(p))?;
     let (a, b) = spans[i];
     Ok(CfmlValue::string(list[a..b].to_string()))
 }
@@ -6561,7 +6628,7 @@ fn fn_list_set_at(args: Vec<CfmlValue>) -> CfmlResult {
     let spans = list_element_spans(&list, &delimiter, list_include_empty(&args, 4));
     let head = "Invalid call of the function [listSetAt], second Argument [position] is invalid, invalid string list index";
     let i = list_position(
-        get_int(&args, 1),
+        get_int(&args, 1)?,
         spans.len(),
         |p| format!("{} [{}]", head, p),
         |p, n| format!("{} [{}], indexes go from 1 to {}", head, p, n),
@@ -6576,7 +6643,7 @@ fn fn_list_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     let delimiter = get_delimiter(&args, 3);
     let first_delim = delimiter.chars().next().unwrap_or(',');
     let spans = list_element_spans(&list, &delimiter, list_include_empty(&args, 4));
-    let pos = get_int(&args, 1);
+    let pos = get_int(&args, 1)?;
     if spans.is_empty() && pos == 1 {
         return Ok(CfmlValue::string(value));
     }
@@ -6600,7 +6667,7 @@ fn fn_list_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
     }
     let head = "Invalid call of the function [ListDeleteAt], second Argument [index] is invalid,";
     let i = list_position(
-        get_int(&args, 1),
+        get_int(&args, 1)?,
         spans.len(),
         |_| format!("{} index must be greater than 0", head),
         |_, n| format!("{} index must be an integer between 1 and {}", head, n),
@@ -8007,7 +8074,7 @@ fn fn_query_set_cell(args: Vec<CfmlValue>) -> CfmlResult {
             let column = args[1].as_string();
             let value = args[2].clone();
             let row_idx = if args.len() >= 4 {
-                (get_int(&args, 3) as usize).saturating_sub(1)
+                (get_int(&args, 3)? as usize).saturating_sub(1)
             } else {
                 q.row_count().saturating_sub(1)
             };
@@ -8059,7 +8126,7 @@ fn fn_query_add_column(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_get_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let row_idx = (get_int(&args, 1) as usize).saturating_sub(1);
+            let row_idx = (get_int(&args, 1)? as usize).saturating_sub(1);
             if let Some(row) = q.get_row(row_idx) {
                 return Ok(CfmlValue::strukt(row));
             }
@@ -8082,7 +8149,7 @@ fn fn_query_get_cell(args: Vec<CfmlValue>) -> CfmlResult {
             // Lucee defaults to the LAST row, and hands back "" for a row
             // outside the query rather than throwing.
             let row_idx = if args.len() >= 3 {
-                (get_int(&args, 2) as usize).saturating_sub(1)
+                (get_int(&args, 2)? as usize).saturating_sub(1)
             } else {
                 q.row_count().saturating_sub(1)
             };
@@ -8164,7 +8231,7 @@ fn fn_query_column_array(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_delete_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let row = get_int(&args, 1);
+            let row = get_int(&args, 1)?;
             let removed = row >= 1 && q.with_write(|d| d.remove_row(row as usize - 1)).is_some();
             if removed {
                 return Ok(CfmlValue::Bool(true));
@@ -8233,7 +8300,7 @@ fn fn_query_append(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let index = get_int(&args, 2);
+            let index = get_int(&args, 2)?;
             let rc = q.row_count() as i64;
             if index < 1 || index > rc + 1 {
                 return Err(CfmlError::runtime(format!(
@@ -8296,8 +8363,8 @@ fn fn_query_row_swap(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
             let rc = q.row_count() as i64;
-            let src = get_int(&args, 1);
-            let dst = get_int(&args, 2);
+            let src = get_int(&args, 1)?;
+            let dst = get_int(&args, 2)?;
             for (arg, which, v) in [("second", "source", src), ("third", "destination", dst)] {
                 if v < 1 || v > rc {
                     return Err(CfmlError::runtime(format!(
@@ -8320,7 +8387,7 @@ fn fn_query_row_swap(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let row = get_int(&args, 1);
+            let row = get_int(&args, 1)?;
             let rc = q.row_count() as i64;
             if row < 1 || row > rc {
                 return Err(CfmlError::runtime(format!(
@@ -8421,7 +8488,7 @@ fn fn_duplicate(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_sleep(args: Vec<CfmlValue>) -> CfmlResult {
-    let ms = get_int(&args, 0).max(0) as u64;
+    let ms = get_int(&args, 0)?.max(0) as u64;
     std::thread::sleep(std::time::Duration::from_millis(ms));
     Ok(CfmlValue::Null)
 }
@@ -17808,7 +17875,7 @@ fn fn_jwt_decode(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_random_bytes(args: Vec<CfmlValue>) -> CfmlResult {
     use rand::RngCore;
 
-    let count = get_int(&args, 0);
+    let count = get_int(&args, 0)?;
     if count <= 0 {
         return Err(CfmlError::runtime(
             "randomBytes: count must be greater than 0".to_string(),
@@ -17840,7 +17907,7 @@ fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         get_str(&args, 0).to_uppercase()
     };
-    let key_size = if args.len() >= 2 { get_int(&args, 1) as usize } else { 0 };
+    let key_size = if args.len() >= 2 { get_int(&args, 1)? as usize } else { 0 };
 
     let num_bytes = match algorithm.as_str() {
         "AES" => {
@@ -18321,7 +18388,7 @@ fn fn_xml_elem_new(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_xml_child_pos(args: Vec<CfmlValue>) -> CfmlResult {
     let element = args.get(0).cloned().unwrap_or(CfmlValue::Null);
     let child_name = get_str(&args, 1).to_lowercase();
-    let nth = get_int(&args, 2) as usize;
+    let nth = get_int(&args, 2)? as usize;
     if let CfmlValue::Struct(ref s) = element {
         if let Some(CfmlValue::Array(ref children)) = s.get("xmlChildren") {
             let mut count = 0usize;
@@ -18806,7 +18873,7 @@ fn fn_re_escape(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_get_token(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let index = get_int(&args, 1) as usize;
+    let index = get_int(&args, 1)? as usize;
     let delims = if args.len() > 2 { get_str(&args, 2) } else { " \t\n\r".to_string() };
     let tokens: Vec<&str> = s.split(|c: char| delims.contains(c))
         .filter(|t| !t.is_empty())
@@ -18829,7 +18896,7 @@ fn fn_array_index_exists(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
-            let idx = get_int(&args, 1) as usize;
+            let idx = get_int(&args, 1)? as usize;
             Ok(CfmlValue::Bool(idx >= 1 && idx <= arr.len()))
         }
         _ => Err(CfmlError::runtime("arrayIndexExists() requires an array".to_string())),
@@ -18901,7 +18968,7 @@ fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
             // means "to the end" and anything below -1 is an error. The old
             // `as usize` casts turned -1 into usize::MAX, so `start + count`
             // overflowed (debug panic) or sliced `[1..0]` (release panic).
-            let start = get_int(&args, 1);
+            let start = get_int(&args, 1)?;
             if start < 1 {
                 return Err(CfmlError::expression(format!(
                     "Invalid call of the function [arrayMid], second Argument [start] is invalid, \
@@ -18909,7 +18976,7 @@ fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
                     start
                 )));
             }
-            let count = if args.len() > 2 { get_int(&args, 2) } else { -1 };
+            let count = if args.len() > 2 { get_int(&args, 2)? } else { -1 };
             if count < -1 {
                 return Err(CfmlError::expression(format!(
                     "Invalid call of the function [arrayMid], third Argument [count] is invalid, \
@@ -18943,14 +19010,14 @@ fn fn_array_splice(args: Vec<CfmlValue>) -> CfmlResult {
             // `as usize` casts turned -1 into usize::MAX, so `index +
             // delete_count` overflowed (debug) or drained `1..0` (release).
             let len = arr.len() as i64;
-            let mut idx = get_int(&args, 1);
+            let mut idx = get_int(&args, 1)?;
             if idx < 1 {
                 idx = len + idx + 1;
             } else if idx > len {
                 idx = len + 1;
             }
             let idx = idx.max(1);
-            let length = if args.len() > 2 { get_int(&args, 2) } else { -1 };
+            let length = if args.len() > 2 { get_int(&args, 2)? } else { -1 };
             let delete_count = if length == -1 {
                 len - idx + 1
             } else if length < -1 {
@@ -18986,8 +19053,8 @@ fn fn_array_splice(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_range(args: Vec<CfmlValue>) -> CfmlResult {
-    let from = get_int(&args, 0);
-    let to = get_int(&args, 1);
+    let from = get_int(&args, 0)?;
+    let to = get_int(&args, 1)?;
     // `arrayRange(1, 4000000000)` pushed until the process was killed.
     let span = (to as i128 - from as i128).abs() + 1;
     check_array_growth("arrayRange", "to", span.min(i64::MAX as i128) as i64, 0)?;
@@ -19235,8 +19302,8 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
             // recordcount throws. The old `as usize` casts turned a length of
             // -1 into usize::MAX, so `offset + length` overflowed (debug) or
             // sliced `[1..0]` (release).
-            let mut offset = get_int(&args, 1);
-            let length = if args.len() > 2 { get_int(&args, 2) } else { 0 };
+            let mut offset = get_int(&args, 1)?;
+            let length = if args.len() > 2 { get_int(&args, 2)? } else { 0 };
             let sliced = q.with_read(|d| -> Result<CfmlQueryData, CfmlError> {
                 let n = d.row_count() as i64;
                 if n == 0 {
@@ -19460,7 +19527,7 @@ fn fn_list_item_trim(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_list_index_exists(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let idx = get_int(&args, 1) as usize;
+    let idx = get_int(&args, 1)? as usize;
     let delim = get_delimiter(&args, 2);
     let items: Vec<&str> = cfml_list_split(&list, &delim);
     Ok(CfmlValue::Bool(idx >= 1 && idx <= items.len()))
@@ -20748,8 +20815,8 @@ fn fn_generate_pbkdf_key(args: Vec<CfmlValue>) -> CfmlResult {
     // generated. Strings still work: they are taken as their UTF-8 bytes.
     let passphrase = get_bytes(&args, 1);
     let salt = get_bytes(&args, 2);
-    let iterations = get_int(&args, 3);
-    let key_size_bits = get_int(&args, 4);
+    let iterations = get_int(&args, 3)?;
+    let key_size_bits = get_int(&args, 4)?;
 
     // Java's PBEKeySpec refuses an iterationCount or keyLength below 1
     // ("invalid iterationCount value" / "invalid keyLength value"). The old
@@ -20841,7 +20908,7 @@ fn fn_generate_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
     }
 
     let password = get_str(&args, 0);
-    let rounds = if args.len() >= 2 { get_int(&args, 1) as u32 } else { 10 };
+    let rounds = if args.len() >= 2 { get_int(&args, 1)? as u32 } else { 10 };
 
     if rounds < 4 || rounds > 31 {
         return Err(CfmlError::runtime(format!(
@@ -20883,7 +20950,7 @@ fn fn_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
         ));
     }
     let input = get_str(&args, 0);
-    let cost = if args.len() >= 2 { get_int(&args, 1) as u32 } else { 10 };
+    let cost = if args.len() >= 2 { get_int(&args, 1)? as u32 } else { 10 };
     if !(4..=31).contains(&cost) {
         return Err(CfmlError::runtime(format!(
             "BCryptHash: cost must be between 4 and 31, got {}",

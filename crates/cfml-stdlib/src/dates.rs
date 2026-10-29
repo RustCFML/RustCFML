@@ -62,12 +62,20 @@ pub fn arg_long(args: &[CfmlValue], i: usize) -> Result<i64, CfmlError> {
     to_long(v)
 }
 
-fn to_long(v: &CfmlValue) -> Result<i64, CfmlError> {
+/// The one integer coercion for BIF arguments; `builtins::get_int` and
+/// `get_index_arg` delegate here.
+pub(crate) fn to_long(v: &CfmlValue) -> Result<i64, CfmlError> {
     match v.query_column_scalar() {
         CfmlValue::Int(i) => Ok(*i),
         CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => Ok(d.trunc() as i64),
         CfmlValue::Bool(b) => Ok(*b as i64),
         CfmlValue::DateTime(d) => Ok(d.to_numeric().trunc() as i64),
+        CfmlValue::Array(_) => {
+            Err(CfmlError::expression("Can't cast Complex Object Type [Array] to a number value".into()))
+        }
+        CfmlValue::Struct(_) | CfmlValue::Component(..) => {
+            Err(CfmlError::expression("Can't cast Complex Object Type [Struct] to a number value".into()))
+        }
         other => {
             let s = other.as_string();
             let t = s.trim();

@@ -27,7 +27,7 @@ pub struct CfmlError {
     pub extras: Option<Box<ValueMap>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfmlErrorType {
     Runtime,
     Compile,
@@ -221,6 +221,10 @@ impl std::fmt::Display for CfmlErrorType {
         }
     }
 }
+
+/// Lets a `CfmlError` be boxed as `dyn Error`, chained as a `source()` and
+/// `?`-converted by host code (the CLI, an embedder).
+impl std::error::Error for CfmlError {}
 
 impl std::fmt::Display for CfmlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -200,5 +200,49 @@ invalidTime = timeFormat(createTime(1, 99999999999, 0), "HH:mm:ss");
 assert("createTime huge hour is the invalid-field time", timeFormat(createTime(9223372036854775807), "HH:mm:ss"), invalidTime);
 assert("createTime hour 25 still rolls over", timeFormat(createTime(25, 0, 0), "HH:mm:ss"), "01:00:00");
 
+// ---- Integer arguments coerce as Lucee's Caster does: trimmed, a fraction
+// truncates, a boolean literal is 1/0, anything else throws. A non-integer
+// string used to read as 0 (mid started at the first character).
+assert("mid start ' 2'", mid("abcdef", " 2", 3), "bcd");
+assert("mid start '2.9' truncates", mid("abcdef", "2.9", 3), "bcd");
+assert("mid start '2e0'", mid("abcdef", "2e0", 3), "bcd");
+assert("left count ' 2'", left("abcdef", " 2"), "ab");
+assert("left count 'yes' is 1", left("abcdef", "yes"), "a");
+assert("repeatString count ' 2'", repeatString("ab", " 2"), "abab");
+assert("listGetAt position ' 2'", listGetAt("a,b,c", " 2"), "b");
+assertThrows("mid start 'abc' throws", function() { mid("abcdef", "abc", 3); });
+assertThrows("mid start '' throws", function() { mid("abcdef", "", 3); });
+assertThrows("left count '0x2' throws", function() { left("abcdef", "0x2"); });
+assertThrows("left count [] throws", function() { left("abcdef", []); });
+assert("mid count -1 is the rest", mid("abcdef", 2, -1), "bcdef");
+assertThrows("mid count below -1 throws", function() { mid("abcdef", 2, -2); });
+
+// ---- formatBaseN takes a Java int: 4294967296 wrapped to 0 and printed "0".
+// Radix 2 and 16 print a negative as its unsigned two's complement.
+assertThrows("formatBaseN past Integer.MAX_VALUE throws", function() { formatBaseN(4294967296, 16); });
+assert("formatBaseN -1 radix 16", formatBaseN(-1, 16), "ffffffff");
+assert("formatBaseN -255 radix 16", formatBaseN(-255, 16), "ffffff01");
+assert("formatBaseN -1 radix 2", formatBaseN(-1, 2), "11111111111111111111111111111111");
+assert("formatBaseN -1 radix 10 stays signed", formatBaseN(-1, 10), "-1");
+assert("formatBaseN Integer.MIN_VALUE radix 16", formatBaseN(-2147483648, 16), "80000000");
+assertThrows("formatBaseN radix 1 throws", function() { formatBaseN(10, 1); });
+
+// ---- inputBaseN: an unparseable string throws, as Java's parseLong does.
+assert("inputBaseN trims", inputBaseN(" ff", 16), 255);
+assertThrows("inputBaseN 'zz' radix 10 throws", function() { inputBaseN("zz", 10); });
+assertThrows("inputBaseN '' throws", function() { inputBaseN("", 16); });
+
+// ---- Image sizes: a negative or huge size wrapped through `as u32`.
+function br_img() { return imageNew("", 20, 10, "rgb", "white"); }
+i = br_img(); imageCrop(i, -10, 0, 5, 5);
+assert("imageCrop clamps a negative origin", imageGetWidth(i) & "x" & imageGetHeight(i), "5x5");
+i = br_img(); imageCrop(i, 15, 0, 10, 5);
+assert("imageCrop clips the size to the image", imageGetWidth(i) & "x" & imageGetHeight(i), "5x5");
+assert("image width property", i.width, 5);
+assertThrows("imageCrop past the edge throws", function() { var j = br_img(); imageCrop(j, 30, 0, 5, 5); });
+assertThrows("imageCrop negative width throws", function() { var j = br_img(); imageCrop(j, 0, 0, -5, 5); });
+assertThrows("imageResize to 1e12 throws", function() { var j = br_img(); imageResize(j, 1e12, 5); });
+assertThrows("imageResize to 100000x100000 throws", function() { var j = br_img(); imageResize(j, 100000, 100000); });
+
 suiteEnd();
 </cfscript>

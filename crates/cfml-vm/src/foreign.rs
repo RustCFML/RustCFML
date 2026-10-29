@@ -1283,7 +1283,11 @@ impl ForeignDbDriver {
     }
 
     /// Release the instance.
-    pub fn release(&self, data: *mut c_void) {
+    ///
+    /// # Safety
+    /// `data` must be an instance this driver's constructor produced, not yet
+    /// released: the module's `drop_fn` frees it.
+    pub unsafe fn release(&self, data: *mut c_void) {
         if !data.is_null() {
             unsafe { ((*self.vtable).drop_fn)(data) };
         }
