@@ -1963,11 +1963,15 @@ impl CfmlStruct {
     /// `key` currently holds one; `None` (and no change) otherwise. Used by the
     /// `x &= <simple>` move-out load so the concat appends to a uniquely-owned
     /// buffer; the store that follows puts the result back under the same key.
+    ///
+    /// No `shape_id` bump: the key set is unchanged, and the store that follows
+    /// writes the same key back (S6 — an `&=` loop must not look structural).
     pub fn take_if_string(&self, key: impl ProbeKey) -> Option<CfmlValue> {
-        self.with_write(|m| match m.get_mut(key) {
+        let mut g = self.0.write();
+        match g.map.get_mut(key) {
             Some(v) if matches!(v, CfmlValue::String(_)) => Some(std::mem::replace(v, CfmlValue::Null)),
             _ => None,
-        })
+        }
     }
 
     pub fn with_write<R>(&self, f: impl FnOnce(&mut ValueMap) -> R) -> R {

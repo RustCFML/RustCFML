@@ -698,19 +698,12 @@ pub(crate) fn op_load_local_key(
             && k != "super"
             && !k.starts_with("__")
     };
-    let name_lower: &str = prop_name.lower();
-    // Exact hit first (the common case), then a case-insensitive
-    // scan — mirrors GetProperty's resolution order.
+    // The probe is already case-insensitive (`Key` folds), and keys are unique
+    // under that fold, so a scan after a miss could never find a visible key
+    // the probe missed. It used to run anyway: O(locals) per `local.x` miss.
     let val = locals
         .get_key_value(prop_name.as_str())
         .filter(|(k, _)| is_visible(k))
-        .or_else(|| {
-            locals
-                .iter()
-                .find(|(k, _)| {
-                    k.eq_ignore_ascii_case(name_lower) && is_visible(k)
-                })
-        })
         .map(|(_, v)| v.clone());
     match val {
         Some(v) => stack.push(v),

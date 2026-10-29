@@ -295,13 +295,10 @@ pub(crate) fn op_imp(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
 
 #[inline(always)]
 pub(crate) fn op_build_array(stack: &mut Vec<CfmlValue>, count: usize) {
-    let mut elements = Vec::new();
-    for _ in 0..count {
-        if let Some(val) = stack.pop() {
-            elements.push(val);
-        }
-    }
-    elements.reverse();
+    // The elements sit on the stack in source order: drain them into an
+    // exactly-sized Vec (pop-push-reverse regrew it log2(n) times).
+    let base = stack.len().saturating_sub(count);
+    let elements: Vec<CfmlValue> = stack.drain(base..).collect();
     stack.push(CfmlValue::array(elements));
 }
 

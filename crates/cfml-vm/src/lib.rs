@@ -9152,7 +9152,9 @@ impl CfmlVirtualMachine {
                     if s.eq_ignore_ascii_case("arguments") =>
                 {
                     match instructions.get(i + 1) {
-                        Some(BytecodeOp::GetProperty(_)) | Some(BytecodeOp::TryGetProperty(_)) => {}
+                        Some(BytecodeOp::GetProperty(_))
+                        | Some(BytecodeOp::TryGetProperty(_))
+                        | Some(BytecodeOp::TakeProperty(_)) => {}
                         _ => return false,
                     }
                 }
@@ -13839,6 +13841,30 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::LoadSuper => { ops::locals::op_load_super(self, &mut stack, &mut locals)?; }
                 BytecodeOp::GetProperty(name) | BytecodeOp::TryGetProperty(name) => { ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, matches!(op, BytecodeOp::GetProperty(_)))?; }
+                BytecodeOp::TakeProperty(name) => {
+                    // Stack: [.., rhs, base]. Move the String out only when the
+                    // right operand is simple, so the Concat that follows cannot
+                    // throw and leave the member holding the placeholder; the
+                    // store that follows writes the result back.
+                    let n = stack.len();
+                    let simple_rhs = n >= 2
+                        && matches!(
+                            stack[n - 2],
+                            CfmlValue::String(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::Bool(_)
+                        );
+                    if simple_rhs {
+                        if let Some(CfmlValue::Struct(s)) = stack.last() {
+                            if !s.is_read_only() {
+                                if let Some(taken) = s.take_if_string(name) {
+                                    stack.pop();
+                                    stack.push(taken);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, false)?;
+                }
                 BytecodeOp::LoadStaticHolder(name) => { ops::frame::op_load_static_holder(self, &mut stack, &locals, name); }
                 BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
                 BytecodeOp::SetProperty(name) => {
@@ -24509,7 +24535,15 @@ impl CfmlVirtualMachine {
         name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
-        let name_lower = name.to_lowercase();
+        // Borrow the name when it is already lowercase (nearly always), as
+        // `scope_aware_store` avoids the copy too; it was a String per call.
+        let lower_owned;
+        let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+            lower_owned = name.to_lowercase();
+            &lower_owned
+        } else {
+            name
+        };
         // GH #351: only a frame that owns a function `local` scope resolves the
         // name as a SCOPE. At page level / in a pseudo-constructor Lucee has no
         // local scope, and `local` is an ordinary variable name — fall through.
@@ -33142,14 +33176,15 @@ impl CfmlVirtualMachine {
             "cookie" => self.globals.get("cookie").cloned(),
             "static" => self.find_static_scope(locals).map(CfmlValue::Struct),
             _ => {
-                // Unscoped: locals (exact then CI), the component `variables`
-                // scope, request, then globals — the variable READ order.
+                // Unscoped: locals, the component `variables` scope, request,
+                // then globals — the variable READ order. Every probe is
+                // case-insensitive already; a second lowercased probe of
+                // `locals` and a scan of the ~730-entry globals table after a
+                // miss could never find anything and ran on every unscoped
+                // `isDefined`/`evaluate` miss.
                 locals
                     .get(root)
                     .cloned()
-                    .or_else(|| {
-                        locals.get(&root_lower).cloned()
-                    })
                     .or_else(|| {
                         locals
                             .get(&*cfml_common::key::well_known::VARIABLES)
@@ -33158,12 +33193,6 @@ impl CfmlVirtualMachine {
                     })
                     .or_else(|| self.request_scope.get_ci(&root_lower))
                     .or_else(|| self.globals.get(root).cloned())
-                    .or_else(|| {
-                        self.globals
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&root_lower))
-                            .map(|(_, v)| v.clone())
-                    })
             }
         }
     }
@@ -36156,17 +36185,11 @@ impl CfmlVirtualMachine {
         }
 
         // Data-only member read (skips the method table) for accessor values.
+        // One case-insensitive probe per map. `iter()` cloned the whole public
+        // map, then the whole private map, on every probe — up to three per
+        // onMissingMethod dispatch.
         let data_get = |name: &str| -> Option<CfmlValue> {
-            this_members
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v)
-                .or_else(|| {
-                    variables_members
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .map(|(_, v)| v)
-                })
+            this_members.data_get(name).or_else(|| variables_members.data_get(name))
         };
 
         // 2. Implicit getX/setX accessors. These exist ONLY for a component
@@ -46032,6 +46055,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value
         BytecodeOp::TryGetProperty(_) => (1, 1), // obj → value (Null-tolerant twin)
+        BytecodeOp::TakeProperty(_) => (1, 1),   // obj → value (moved out when it can be)
         BytecodeOp::LoadStaticHolder(_) => (0, 1), // → holder
         BytecodeOp::GetStaticProperty(_) => (1, 1), // holder → value
         BytecodeOp::LoadLocalProperty(_, _) | BytecodeOp::LoadSlotProperty(..) => (1, 0), // pushes value, reads nothing

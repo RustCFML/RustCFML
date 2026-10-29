@@ -430,10 +430,13 @@ impl<'a> KeyRef<'a> {
         self.name
     }
 
-    /// Promote to an owned [`Key`], reusing the already-computed hash.
+    /// Promote to an owned [`Key`], reusing the already-computed hash. Interned
+    /// like [`Key::new`]: this is the first-write path of every `&str` insert,
+    /// and a private `Arc` here skipped both the dedup and `Key::eq`'s
+    /// pointer-equality fast path for exactly those keys.
     #[inline]
     pub fn to_key(&self) -> Key {
-        Key { hash: self.hash, name: Arc::from(self.name) }
+        Key { hash: self.hash, name: intern::intern(self.name, self.hash) }
     }
 }
 

@@ -95,6 +95,7 @@ include "harness.cfm";
 <!--- `+`, `++`, `+=`, `*=`, loop increments and incrementValue() past i64 --->
 <!--- promote to a double (Lucee computes in doubles); they used to panic/wrap. --->
 <cf_runtest file="core/test_integer_overflow_promotion.cfm" />
+<cf_runtest file="core/test_concat_assign_struct_member.cfm" />
 <cf_runtest file="core/test_strict_equality.cfm" />
 <cf_runtest file="core/test_subscript_autovivify.cfm" />
 <!--- Scope-qualified nested auto-vivification (variables.$class.name = ...): the residual --->

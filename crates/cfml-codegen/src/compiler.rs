@@ -1517,6 +1517,13 @@ pub enum BytecodeOp {
     // right operand that could make Concat throw) it is exactly LoadLocal.
     TakeLocal(Name),
     TakeSlot(u16, Name),
+    // `s.x &= <rhs>` with `s` a plain identifier: TryGetProperty that MOVES a
+    // String out of the struct when the right operand is simple, for the same
+    // reason as TakeLocal. Without it `variables.s &= "x"` copied the whole
+    // string per append (quadratic: 3.2 µs/op at 400k appends against 79 ns
+    // for a local). Anywhere the fast path does not apply it is exactly
+    // TryGetProperty.
+    TakeProperty(Name),
 
     // A template's literal text: `__writeText("<literal>")` as a statement, which
     // is what the tag preprocessor emits for every run of text (and whitespace)
@@ -1749,11 +1756,12 @@ impl BytecodeOp {
             Self::WriteText(..) => 134,
             Self::ForInStep(..) => 135,
             Self::ApplyParamDefault(..) => 136,
+            Self::TakeProperty(..) => 137,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 137] = [
+    pub const CENSUS_NAMES: [&'static str; 138] = [
         "Null",
         "True",
         "False",
@@ -1891,6 +1899,7 @@ impl BytecodeOp {
         "WriteText",
         "ForInStep",
         "ApplyParamDefault",
+        "TakeProperty",
     ];
 }
 
@@ -3267,6 +3276,23 @@ impl CfmlCompiler {
                         match &assign.target {
                             AssignTarget::Variable(name) if !Self::is_reserved_scope_name(name) => {
                                 instructions.push(BytecodeOp::TakeLocal(Name::from(&name)));
+                            }
+                            // `s.x &= v` on a plain identifier base. Not a
+                            // call or other expression (the store evaluates the
+                            // base again, so the value must come back to the
+                            // same struct), not `local` (its own op), and not a
+                            // scope other requests read concurrently, where
+                            // the placeholder left between take and store
+                            // would be visible.
+                            AssignTarget::StructAccess(obj, member)
+                                if matches!(&**obj, Expression::Identifier(id)
+                                    if !matches!(
+                                        id.name.to_ascii_lowercase().as_str(),
+                                        "local" | "application" | "session" | "server" | "client"
+                                    )) =>
+                            {
+                                self.compile_expression(obj, instructions);
+                                instructions.push(BytecodeOp::TakeProperty(Name::from(&member)));
                             }
                             _ => self.emit_load_current_target(&assign.target, instructions),
                         }
