@@ -1952,10 +1952,23 @@ fn fn_insert(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_remove_chars(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         let string = get_str(&args, 0);
-        let start = (get_int(&args, 1).max(1) as usize).saturating_sub(1);
-        let count = get_int(&args, 2).max(0) as usize;
         let mut chars: Vec<char> = string.chars().collect();
-        let end = (start + count).min(chars.len());
+        // Lucee's checks and messages. An unchecked start reached
+        // `drain(start..end)` with start > end and panicked the request.
+        let start = get_int(&args, 1);
+        if start < 1 || start > chars.len() as i64 {
+            return Err(CfmlError::expression(format!(
+                "Parameter 2 of function removeChars which is now [{start}] must be a greater 0 and less than the length of the first parameter"
+            )));
+        }
+        let count = get_int(&args, 2);
+        if count < 0 {
+            return Err(CfmlError::expression(format!(
+                "Parameter 3 of function removeChars which is now [{count}] must be a non-negative integer"
+            )));
+        }
+        let start = (start - 1) as usize;
+        let end = start.saturating_add(count as usize).min(chars.len());
         chars.drain(start..end);
         Ok(CfmlValue::string(chars.into_iter().collect::<String>()))
     } else {

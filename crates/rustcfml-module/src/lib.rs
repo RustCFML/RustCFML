@@ -564,7 +564,14 @@ pub mod internal {
     /// job takes a few hundred nanoseconds.
     const INLINE_ARGS: usize = 8;
 
-    pub fn with_args<'a, R>(
+    /// Borrow the host's argument array as `Value`s for the duration of `f`.
+    ///
+    /// # Safety
+    /// `args` must point to `argc` initialised `ValueHandle`s that stay valid
+    /// for the call (the host's contract for every shim below), or `argc`
+    /// must be 0. A safe signature here let any caller build a slice from an
+    /// arbitrary pointer.
+    pub unsafe fn with_args<'a, R>(
         ctx: &'a Ctx,
         args: *const ValueHandle,
         argc: usize,
@@ -573,6 +580,7 @@ pub mod internal {
         if argc == 0 {
             return f(&[]);
         }
+        // SAFETY: the caller guarantees `args` points to `argc` live handles.
         let handles = unsafe { core::slice::from_raw_parts(args, argc) };
         if argc <= INLINE_ARGS {
             // Build on the stack. `Value` is Copy and two words wide, so a
@@ -676,12 +684,19 @@ unsafe extern "C-unwind" fn vt_call_method<C: NativeClass>(
     })
 }
 
+// The three plain `extern "C"` entries below (`method_params`, `drop_fn` for
+// a class and a driver) run module code with no host `with_call` backstop,
+// and unwinding out of an `extern "C"` fn aborts the process. Each catches a
+// panic itself, so a panicking `Drop` or `method_params` cannot take the
+// server down. (`class_name` returns a constant and cannot panic.)
+
 unsafe extern "C" fn vt_method_params<C: NativeClass>(
     _data: *mut c_void,
     name: StrRef,
     out: *mut StrRef,
 ) -> u32 {
-    match C::method_params(name.as_str()) {
+    let declared = std::panic::catch_unwind(|| C::method_params(name.as_str())).unwrap_or(None);
+    match declared {
         Some(list) => {
             *out = StrRef::new(list);
             abi::status::OK
@@ -737,7 +752,10 @@ unsafe extern "C-unwind" fn vt_set_property<C: NativeClass>(
 
 unsafe extern "C" fn vt_drop<C: NativeClass>(data: *mut c_void) {
     if !data.is_null() {
-        drop(Box::from_raw(data as *mut C));
+        let boxed = Box::from_raw(data as *mut C);
+        // A panic in `Drop for C` is reported by the panic hook and otherwise
+        // ignored: there is no caller to hand an error to.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(boxed)));
     }
 }
 
@@ -865,7 +883,9 @@ unsafe extern "C-unwind" fn drv_dbinfo<D: DbDriver>(
 
 unsafe extern "C" fn drv_drop<D: DbDriver>(data: *mut c_void) {
     if !data.is_null() {
-        drop(Box::from_raw(data as *mut D));
+        let boxed = Box::from_raw(data as *mut D);
+        // See `vt_drop`: a panicking `Drop` must not unwind out of `extern "C"`.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(boxed)));
     }
 }
 

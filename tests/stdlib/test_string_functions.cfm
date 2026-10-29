@@ -37,6 +37,13 @@ assert("insert X into hello at 3", insert("X", "hello", 3), "helXlo");
 
 // --- removeChars ---
 assert("removeChars hello 2 3", removeChars("hello", 2, 3), "ho");
+assert("removeChars last char", removeChars("abc", 3, 1), "ab");
+assert("removeChars count past the end", removeChars("abc", 2, 10), "a");
+// An out-of-range start panicked the request; Lucee throws an expression error.
+assertThrows("removeChars start past the end throws", function() { removeChars("abc", 10, 1); });
+assertThrows("removeChars start 0 throws", function() { removeChars("abc", 0, 1); });
+assertThrows("removeChars on empty string throws", function() { removeChars("", 1, 1); });
+assertThrows("removeChars negative count throws", function() { removeChars("abc", 2, -1); });
 
 // --- chr / asc ---
 assert("chr(65)", chr(65), "A");

@@ -577,23 +577,27 @@ pub fn make_date(
             day, dim, month, year
         )));
     }
-    Ok(lenient_wall(tz, y, month, day, hour, minute, second, milli))
+    // Every field was range-checked above, so the offset always fits.
+    lenient_wall(tz, y, month, day, hour, minute, second, milli)
+        .ok_or_else(|| err(format!("Date [{year}-{month}-{day}] is out of range")))
 }
 
 /// A wall clock from fields that may overflow (hour 24, 1500 ms, hour 25 for
-/// `createTime`), rolled forward as a lenient `Calendar` does.
+/// `createTime`), rolled forward as a lenient `Calendar` does. `None` when the
+/// fields do not fit a `Duration` at all (`createTime(9223372036854775807)`);
+/// the infallible `Duration::hours` family panicked the request there.
 #[allow(clippy::too_many_arguments)]
-fn lenient_wall(tz: &Tz, y: i32, month: i64, day: i64, hour: i64, minute: i64, second: i64, milli: i64) -> CfmlDate {
+fn lenient_wall(tz: &Tz, y: i32, month: i64, day: i64, hour: i64, minute: i64, second: i64, milli: i64) -> Option<CfmlDate> {
     let base = NaiveDate::from_ymd_opt(y, month.clamp(1, 12) as u32, 1)
         .and_then(|d| d.and_hms_opt(0, 0, 0))
         .unwrap_or_default();
-    let offset = Duration::days(day - 1)
-        + Duration::hours(hour)
-        + Duration::minutes(minute)
-        + Duration::seconds(second)
-        + Duration::milliseconds(milli);
+    let offset = Duration::try_days(day.checked_sub(1)?)?
+        .checked_add(&Duration::try_hours(hour)?)?
+        .checked_add(&Duration::try_minutes(minute)?)?
+        .checked_add(&Duration::try_seconds(second)?)?
+        .checked_add(&Duration::try_milliseconds(milli)?)?;
     let wall = base.checked_add_signed(offset).unwrap_or(base);
-    from_wall(tz, &wall)
+    Some(from_wall(tz, &wall))
 }
 
 /// `createTime(h, m, s, ms)`: a time on Lucee's 1899-12-30 base. Lucee uses
@@ -603,7 +607,10 @@ pub fn make_time(tz: &Tz, hour: i64, minute: i64, second: i64, milli: i64) -> Cf
     let d = if valid || hour > 24 {
         // Lucee's toTime(…, defaultValue) rejects hour > 24, but the observed
         // createTime(25,0,0) is {t '01:00:00'}: the lenient calendar wins.
+        // Lucee answers epoch 0 for an hour too large to roll, as for any
+        // other invalid field (observed: createTime(9223372036854775807)).
         lenient_wall(tz, 1899, 12, 30, hour, minute, second, milli)
+            .unwrap_or_else(|| CfmlDate::from_epoch_millis(0))
     } else {
         CfmlDate::from_epoch_millis(0)
     };
@@ -788,10 +795,11 @@ pub fn format_date(d: &CfmlDate, mask: &str, tz: &Tz) -> String {
                 if c == 'w' || next == 'w' {
                     week = calendar_week_of_year(w.date());
                 }
-                // Lucee's condition, kept as written:
+                // Lucee's condition is
                 // next == 'w' || next == 'W' && next_1 == 'w' || next_1 == 'W'
-                // where next_1 is the same character as next.
-                if next == 'w' || (next == 'W' && next == 'w') || next == 'W' {
+                // where next_1 is the same character as next, so it reduces
+                // to "the next character is a w of either case".
+                if next == 'w' || next == 'W' {
                     out.push_str(&format!("{:02}", week));
                     pos += 1;
                 } else {

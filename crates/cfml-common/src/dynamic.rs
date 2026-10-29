@@ -400,6 +400,9 @@ impl<K: IntoKey> FromIterator<(K, CfmlValue)> for ValueMap {
 
 impl<K: IntoKey> Extend<(K, CfmlValue)> for ValueMap {
     fn extend<I: IntoIterator<Item = (K, CfmlValue)>>(&mut self, iter: I) {
+        // Every `&mut` path bumps `version()`; callers treat an unchanged
+        // version as "no mutation" and skip a write-back.
+        self.1 = self.1.wrapping_add(1);
         self.0.extend(iter.into_iter().map(|(k, v)| (k.into_key(), v)));
     }
 }
@@ -427,6 +430,8 @@ impl<'a> IntoIterator for &'a mut ValueMap {
     type IntoIter = indexmap::map::IterMut<'a, Key, CfmlValue>;
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
+        // Hands out `&mut` values: assume a mutation, as `DerefMut` does.
+        self.1 = self.1.wrapping_add(1);
         self.0.iter_mut()
     }
 }

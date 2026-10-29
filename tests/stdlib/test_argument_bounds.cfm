@@ -194,5 +194,11 @@ if (isRustCFML() && fileExists("/etc/hosts") && !findNoCase("windows", server.os
 	assertTrue("fileRead of a regular file still works", len(fileRead("/etc/hosts")) > 0);
 }
 
+// ---- createTime: an hour too large for a Duration panicked inside chrono.
+// Lucee answers the same epoch-0 time it gives for any other invalid field.
+invalidTime = timeFormat(createTime(1, 99999999999, 0), "HH:mm:ss");
+assert("createTime huge hour is the invalid-field time", timeFormat(createTime(9223372036854775807), "HH:mm:ss"), invalidTime);
+assert("createTime hour 25 still rolls over", timeFormat(createTime(25, 0, 0), "HH:mm:ss"), "01:00:00");
+
 suiteEnd();
 </cfscript>

@@ -297,6 +297,36 @@ fn new_tally<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
     Ok(ctx.new_object(Tally { count: AtomicI64::new(0) }))
 }
 
+fn new_grenade<'a>(ctx: &'a Ctx, _args: &[Value<'a>]) -> Result<Value<'a>> {
+    Ok(ctx.new_object(Grenade))
+}
+
+/// A class whose `Drop` and `method_params` panic. Both run through plain
+/// `extern "C"` vtable entries, where an unwinding panic aborts the process.
+pub struct Grenade;
+
+impl NativeClass for Grenade {
+    const CLASS_NAME: &'static str = "Grenade";
+
+    fn new(_ctx: &Ctx, _args: &[Value]) -> Result<Self> {
+        Ok(Grenade)
+    }
+
+    fn method_params(_method: &str) -> Option<&'static str> {
+        panic!("deliberate panic in method_params");
+    }
+
+    fn call<'a>(&self, ctx: &'a Ctx, _method: &str, _args: &[Value<'a>]) -> Result<Value<'a>> {
+        Ok(ctx.null())
+    }
+}
+
+impl Drop for Grenade {
+    fn drop(&mut self) {
+        panic!("deliberate panic in Drop");
+    }
+}
+
 pub struct Tally {
     count: AtomicI64,
 }
@@ -478,8 +508,9 @@ module! {
         "abiInject"      => inject,
         "abiCallClosure" => call_a_closure,
         "abiRecurser"    => new_recurser,
+        "abiNewGrenade"  => new_grenade,
     },
-    classes: { Tally, Recurser },
+    classes: { Tally, Recurser, Grenade },
     qoq_scalars: { "abiDouble" => sql_double },
     qoq_aggregates: { "abiTotal" => sql_total },
     drivers: { FakeDb },
@@ -518,8 +549,8 @@ fn the_declaration_is_adopted_with_everything_it_provides() {
     let m = load();
     assert_eq!(&*m.name, "abitest");
     assert_eq!(m.version, "9.9.9");
-    assert_eq!(m.bifs.len(), 27);
-    assert_eq!(m.classes.len(), 2);
+    assert_eq!(m.bifs.len(), 28);
+    assert_eq!(m.classes.len(), 3);
     assert_eq!(m.classes[0].0, "Tally");
     assert_eq!(m.drivers.len(), 1);
     assert_eq!(m.drivers[0].0, "fakedb");
@@ -855,6 +886,22 @@ fn constructing_through_the_class_declaration_passes_arguments() {
     let obj = class.construct(vec![CfmlValue::Int(100)]).expect("construct");
     let handle = native_of(&obj);
     assert_eq!(handle.write().unwrap().call_method("value", vec![]).unwrap().as_string(), "100");
+}
+
+#[test]
+fn a_panicking_drop_or_method_params_does_not_abort_the_host() {
+    // Both entries are plain `extern "C"`: a panic unwinding out of them
+    // aborts the whole process, so reaching the end of this test is the check.
+    let m = load();
+    let obj = call(&m, "abiNewGrenade", vec![]);
+    let handle = native_of(&obj);
+    assert!(
+        handle.read().unwrap().method_params("anything").is_none(),
+        "a panicking method_params reads as undeclared"
+    );
+    drop(handle);
+    drop(obj);
+    assert_eq!(call(&m, "abiEcho", vec![CfmlValue::Int(1)]).as_string(), "1");
 }
 
 #[test]

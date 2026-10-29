@@ -4113,11 +4113,19 @@ async fn handle_request_inner(
             Some(hit) => hit,
             None => {
                 let r = resolve_file(&state.doc_root, &path, state.vfs.as_ref(), welcome_files, cfml_exts);
-                state
-                    .resolved_file_cache
-                    .write()
-                    .unwrap()
-                    .insert(path.clone(), r.clone());
+                // The key is the client's path, so caching every distinct one
+                // let `GET /x1`, `/x2`, ... grow the map until memory shedding
+                // refused all traffic. Misses are not cached at all; hits are
+                // still unbounded (`/index.cfm/<anything>` is a path-info hit,
+                // `//` and `/./` variants resolve too), so the map is capped and
+                // starts over when full, letting the hot paths back in.
+                if r.is_some() {
+                    let mut cache = state.resolved_file_cache.write().unwrap();
+                    if cache.len() >= RESOLVED_FILE_CACHE_CAP {
+                        cache.clear();
+                    }
+                    cache.insert(path.clone(), r.clone());
+                }
                 r
             }
         }
@@ -4278,9 +4286,10 @@ async fn handle_request_inner(
             // The request thread owns the only sender, so `None` here means it
             // finished without ever flushing.
             match flush_rx.recv().await {
-                None => match handle.await.unwrap() {
-                    Ok(response) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
-                    Err(e) => render_error_response(&state, &e),
+                None => match handle.await {
+                    Ok(Ok(response)) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
+                    Ok(Err(e)) => render_error_response(&state, &e),
+                    Err(join_err) => request_task_failed_response(&path, join_err),
                 },
                 Some(FlushEvent::Commit(commit, first_chunk)) => build_streaming_response(
                     *commit,
@@ -4426,7 +4435,11 @@ async fn handle_request_inner(
                             sandbox,
                         )
                     })
-                }).await.unwrap();
+                }).await;
+                let result = match result {
+                    Ok(r) => r,
+                    Err(join_err) => return request_task_failed_response(&path, join_err),
+                };
 
                 match result {
                     Ok(response) if response.missing_template_handled => {
@@ -4452,6 +4465,36 @@ async fn handle_request_inner(
                 .unwrap()
         }
     }
+}
+
+/// Entries kept in the production-mode URL-path → file cache before it is
+/// cleared and repopulated. A site has far fewer distinct live URLs than this.
+const RESOLVED_FILE_CACHE_CAP: usize = 10_000;
+
+/// The request's blocking task panicked (or was cancelled) instead of
+/// returning. Unwrapping the `JoinError` panicked the async handler, which
+/// tokio swallowed: the client saw a reset with no status line and nothing
+/// was logged against the request. Log it and answer a plain 500.
+fn request_task_failed_response(
+    path: &str,
+    join_err: tokio::task::JoinError,
+) -> axum::response::Response {
+    let reason = match join_err.try_into_panic() {
+        Ok(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".to_string()),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("Request failed [{path}]: {reason}");
+    axum::response::Response::builder()
+        .status(500)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(axum::body::Body::from(
+            "<html><body><h1>500 Internal Server Error</h1></body></html>",
+        ))
+        .unwrap_or_default()
 }
 
 /// One `<cfflush>` crossing from the request's blocking thread to the async

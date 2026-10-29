@@ -12135,22 +12135,9 @@ impl CfmlVirtualMachine {
 
                 // Control flow
                 BytecodeOp::Jump(target) => {
-                    // Cooperative cancellation checkpoint. A backward jump is a
-                    // loop back-edge — the bounded place a terminated thread
-                    // aborts. `cancel_flag` is `None` on the main VM, so this is
-                    // a single predictable branch only on back-edges; the whole
-                    // check vanishes when the `real-threads` feature is off.
-                    #[cfg(feature = "real-threads")]
-                    {
-                        if *target <= ip {
-                            if let Some(flag) = &self.cancel_flag {
-                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                    return Err(CfmlError::runtime(
-                                        "thread terminated".to_string(),
-                                    ));
-                                }
-                            }
-                        }
+                    // A backward jump is a loop back-edge: see `poll_cancel`.
+                    if *target <= ip {
+                        self.poll_cancel()?;
                     }
                     ip = *target;
                 }
@@ -12169,12 +12156,20 @@ impl CfmlVirtualMachine {
                             },
                         };
                         if !truth {
+                            if *target < ip {
+                                self.poll_cancel()?;
+                            }
                             ip = *target;
                         }
                     }
                 }
                 BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, target)
-                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => { ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize); }
+                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => {
+                    if (*target as usize) < ip {
+                        self.poll_cancel()?;
+                    }
+                    ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize);
+                }
                 BytecodeOp::ForLoopStep(name, limit, cmp, step, target)
                 | BytecodeOp::ForSlotStep(_, name, limit, cmp, step, target) => {
                     // The op carries its constants as i32 (op-size budget); the
@@ -12235,6 +12230,8 @@ impl CfmlVirtualMachine {
                                 }
                             };
                             if matched {
+                                // The fused step is always a back-edge.
+                                self.poll_cancel()?;
                                 ip = *target as usize;
                             }
                             continue;
@@ -12313,6 +12310,7 @@ impl CfmlVirtualMachine {
                         _ => false,
                     };
                     if matched {
+                        self.poll_cancel()?;
                         ip = *target as usize;
                     }
                 }
@@ -12331,6 +12329,10 @@ impl CfmlVirtualMachine {
                             },
                         };
                         if truth {
+                            // `do {} while (cond)` closes its loop with this op.
+                            if *target < ip {
+                                self.poll_cancel()?;
+                            }
                             ip = *target;
                         }
                     }
@@ -16544,7 +16546,13 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::CallSpread => { ops::locals::op_call_spread(self, &mut stack, func, &mut locals, &mut slots, &mut slot_blocked)?; }
 
-                BytecodeOp::TagLoopBack(body_start) => { ops::effect::op_tag_loop_back(self, &mut stack, &mut ip, *body_start); }
+                BytecodeOp::TagLoopBack(body_start) => {
+                    // `<cfexit method="loop">` re-enters the body: a back-edge.
+                    if self.pending_tag_loop {
+                        self.poll_cancel()?;
+                    }
+                    ops::effect::op_tag_loop_back(self, &mut stack, &mut ip, *body_start);
+                }
                 BytecodeOp::AbandonTagPairs(n) => { ops::effect::op_abandon_tag_pairs(self, *n); }
                 BytecodeOp::LineInfo(line, col) => { ops::locals::op_line_info(self, *line, *col); }
 
@@ -28020,6 +28028,25 @@ impl CfmlVirtualMachine {
         }
         seed.thread_name = thread_name;
         seed
+    }
+
+    /// Cooperative cancellation checkpoint, called on every loop back-edge
+    /// (`Jump` backwards, the fused for-loop steps, a backward conditional
+    /// jump, a custom-tag loop). A terminated `cfthread` or a cancelled task
+    /// future stops here. Polling only `Jump` let `for` and `do {} while`
+    /// loops run on after `thread action="terminate"`.
+    ///
+    /// `cancel_flag` is `None` on the main VM, so this is one predictable
+    /// branch; the whole check vanishes without the `real-threads` feature.
+    #[inline(always)]
+    fn poll_cancel(&self) -> Result<(), CfmlError> {
+        #[cfg(feature = "real-threads")]
+        if let Some(flag) = &self.cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(CfmlError::runtime("thread terminated".to_string()));
+            }
+        }
+        Ok(())
     }
 
     /// The `java.lang.Thread` methods that need VM state. The running thread's
