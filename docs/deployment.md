@@ -209,17 +209,24 @@ Compiled bytecode normally lives in memory, so every process start recompiles ea
 rustcfml --serve /app --production --bytecode-cache /app/.rustcfml-bc
 ```
 
-To take compilation out of container start-up entirely, fill the cache when the image is built:
+To take compilation out of container start-up entirely, fill the cache when the image is built. The [official image](https://github.com/RustCFML/RustCFML-Docker) wraps this: it serves with the cache at `/home/nonroot/.rustcfml/bytecode-cache` by default (`RUSTCFML_BYTECODE_CACHE`, empty to disable), and a derived image warms it with one optional line:
 
 ```dockerfile
-FROM ghcr.io/rustcfml/rustcfml:v0.653.3
+FROM ghcr.io/rustcfml/rustcfml:v0.743.0
+COPY --chown=nonroot:nonroot webroot/ /srv/app/
+RUN rustcfml-warm-bytecode
+```
+
+With your own image, run the flags directly and start the server with the same `--bytecode-cache` path:
+
+```dockerfile
 COPY --chown=nonroot:nonroot webroot/ /app/
 RUN rustcfml --warm /app --bytecode-cache /app/.rustcfml-bc
 ```
 
-and start the server with the same `--bytecode-cache` path. `--warm` compiles every `.cfm`/`.cfc` under the docroot without executing anything and reports each file that fails to compile. Those failures are not fatal — such a file fails the same way at request time, and a tree that ships a deliberately broken fixture must not fail the build — but a run that compiles nothing is.
+`--warm` compiles every `.cfm`/`.cfc` under the docroot without executing anything and reports each file that fails to compile. Those failures are not fatal — such a file fails the same way at request time, and a tree that ships a deliberately broken fixture must not fail the build — but a run that compiles nothing is.
 
-**Spell the docroot the same way for `--warm` and `--serve`.** An entry is keyed by the source content *and the path as the engine spelled it*, because a component's qualified name depends on the path it was reached by (the same file under a mapping is a different component). `--warm /app` then `--serve /app` hits; `--warm ./webroot` then `--serve /app` compiles everything again. A handful of misses on a warmed cache are normal: files written at run time, and includes reached through a `..` path.
+**Spell the docroot the same way for `--warm` and `--serve`.** An entry is keyed by the source content *and the path as the engine spelled it*, because a component's qualified name depends on the path it was reached by (the same file under a mapping is a different component). The string is used literally, not canonicalised: `--warm /app` then `--serve /app` hits, `--warm /app/` (trailing slash) also hits, but `--warm .` from inside the webroot then `--serve /app` compiles everything again, and so does `--warm /app` followed by `--serve .`. Whether the cache is being hit is observable from outside: a warmed request adds no file to the cache directory; a miss adds one. A handful of misses on a warmed cache are normal: files written at run time, and includes reached through a `..` path.
 
 Entries are invalidated by content (a changed file simply gets a new entry, so timestamps do not matter across `COPY` layers), by engine version, and by bytecode format version. A mismatch is a miss, never an error, and a truncated or corrupt entry is detected by checksum and recompiled. Stale entries for deleted sources are harmless but are not pruned; delete the directory to reclaim the space.
 
