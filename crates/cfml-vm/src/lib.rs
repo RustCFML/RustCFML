@@ -1615,6 +1615,16 @@ fn exists_neg_generation() -> u64 {
 /// dispatch's many early `return`s, an error path, or a panic. Bumping only on
 /// the way in is not enough: the operation itself probes its own output path
 /// (finding it absent), and that fresh negative would then outlive the write.
+/// How `call_function_slow` reaches a builtin that no VM intercept handles:
+/// the same entry point `CallBuiltin` binds at compile time, resolved once per
+/// callee name instead of on every call.
+#[derive(Clone, Copy)]
+struct PureBuiltinRoute {
+    func: BuiltinFunction,
+    /// `builtin_may_create_path`, answered once.
+    retires_negatives: bool,
+}
+
 struct RetireNegativesOnDrop;
 
 impl Drop for RetireNegativesOnDrop {
@@ -2472,6 +2482,10 @@ pub struct CfmlVirtualMachine {
     /// A native module re-registered a compiled-in builtin's name (see
     /// `register_native_fn`): disables the per-`Name` entry-point cache.
     native_overrides_builtin: bool,
+    /// Generic-dispatch route per callee NAME (source casing) for builtins the
+    /// VM does not intercept — see [`Self::pure_builtin_route`]. `None` caches
+    /// the answer "take the full path" just as cheaply as a route.
+    pure_builtin_routes: FxHashMap<Box<str>, Option<PureBuiltinRoute>>,
     /// Memoized `isValid` builtin, for the §29 declared-type checks (which need
     /// the format predicates but must not pay a case-insensitive scan of the
     /// whole builtin table on every typed call). `Some(None)` = looked up and
@@ -5012,6 +5026,7 @@ impl CfmlVirtualMachine {
             builtins: HashMap::new(),
             builtin_names_lc: HashMap::default(),
             native_overrides_builtin: false,
+            pure_builtin_routes: FxHashMap::default(),
             builtin_lc_src_len: usize::MAX, // no index yet — probe takes the slow path
             type_check_is_valid: None,
             output_buffer: String::new(),
@@ -7131,6 +7146,47 @@ impl CfmlVirtualMachine {
                 Ok(())
             }
         }
+    }
+
+    /// The [`PureBuiltinRoute`] for a callee name, or `None` when the call
+    /// must take `call_function_slow`'s full path. A route exists only where
+    /// that path could do nothing but look the builtin up and call it:
+    ///
+    /// - the name is a registered builtin outside `VM_INTERCEPTED` — the same
+    ///   test that lets codegen emit `CallBuiltin`, so the declaration guard
+    ///   that keeps `CallBuiltin` honest covers this too;
+    /// - no sandbox (`sandbox_intercept` handles a few undeclared names);
+    /// - not an `s3*`/`storeGetMetadata` call, which `s3_intercept` gives the
+    ///   application's S3 settings first;
+    /// - no extension or native module has taken the name, and the
+    ///   lowercase index is armed (an embedder may edit `builtins` directly).
+    ///
+    /// Memoised per VM by source spelling, misses included.
+    fn pure_builtin_route(&mut self, name: &str) -> Option<PureBuiltinRoute> {
+        if self.sandbox
+            || self.native_overrides_builtin
+            || self.builtin_lc_src_len != self.builtins.len()
+        {
+            return None;
+        }
+        if let Some(route) = self.pure_builtin_routes.get(name) {
+            return *route;
+        }
+        let lower = name.to_ascii_lowercase();
+        let route = if cfml_common::builtins_meta::is_pure_builtin(&lower)
+            && !lower.starts_with("s3")
+            && lower != "storegetmetadata"
+            && !self.foreign_builtins.contains_key(&lower)
+        {
+            self.builtin_lookup_ci(name, &lower).map(|(_, func)| PureBuiltinRoute {
+                func,
+                retires_negatives: Self::builtin_may_create_path(&lower),
+            })
+        } else {
+            None
+        };
+        self.pure_builtin_routes.insert(name.into(), route);
+        route
     }
 
     fn builtin_lookup_ci(&self, name: &str, name_lower: &str) -> Option<(&str, BuiltinFunction)> {
@@ -17552,6 +17608,18 @@ impl CfmlVirtualMachine {
                         return self.call_resolved_user_function(func, user_func, args, parent_locals);
                     }
                 }
+            }
+
+            // A builtin no VM intercept handles: call it the way `CallBuiltin`
+            // would, skipping the per-call lowercase, the intercept chain and
+            // the name matches below, none of which can apply to it. Reached by
+            // the calls codegen could not bind — `isNull(a.b)`, a BIF passed as
+            // a value, `argumentCollection` — 6,670 per Preside sitetree render.
+            if let Some(route) = self.pure_builtin_route(&func.name) {
+                let _retire_negatives = route.retires_negatives.then(|| RetireNegativesOnDrop);
+                #[cfg(feature = "bif-census")]
+                cfml_common::perf_counters::bif_census::record(&func.name.to_lowercase(), &args);
+                return (route.func)(args);
             }
 
             // Check builtin functions (case-insensitive)
