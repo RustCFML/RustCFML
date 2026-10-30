@@ -430,13 +430,15 @@ impl<'a> KeyRef<'a> {
         self.name
     }
 
-    /// Promote to an owned [`Key`], reusing the already-computed hash. Interned
-    /// like [`Key::new`]: this is the first-write path of every `&str` insert,
-    /// and a private `Arc` here skipped both the dedup and `Key::eq`'s
-    /// pointer-equality fast path for exactly those keys.
+    /// Promote to an owned [`Key`], reusing the already-computed hash.
+    ///
+    /// Deliberately NOT interned. Routing this first-write path through the
+    /// interner (2026-10-29) saved an allocation on 99.7% of calls but cost
+    /// +1.2% server CPU on the Wheels core suite (aligned A/B, 6.34 vs 6.26 s):
+    /// a shard lock and hash probe per new key outweighs one small malloc.
     #[inline]
     pub fn to_key(&self) -> Key {
-        Key { hash: self.hash, name: intern::intern(self.name, self.hash) }
+        Key { hash: self.hash, name: Arc::from(self.name) }
     }
 }
 
