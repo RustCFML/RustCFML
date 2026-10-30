@@ -2383,6 +2383,46 @@ enum DispatchCaller<'a> {
     Engine,
 }
 
+/// Lowercased name -> `(canonical registry key, fn ptr, ambiguous)`; see
+/// `CfmlVirtualMachine::builtin_names_lc`.
+type BuiltinNameIndex =
+    HashMap<String, (String, BuiltinFunction, bool), cfml_common::dynamic::ValueBuildHasher>;
+
+fn build_builtin_index(builtins: &HashMap<String, BuiltinFunction>) -> BuiltinNameIndex {
+    let mut idx: BuiltinNameIndex =
+        HashMap::with_capacity_and_hasher(builtins.len(), Default::default());
+    for (k, f) in builtins.iter() {
+        match idx.entry(k.to_ascii_lowercase()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((k.clone(), *f, false));
+            }
+            // Two registry keys differing only by case: one lowercased slot
+            // cannot represent both, so mark the entry ambiguous and let
+            // every lookup of it keep the exact-match-first probe.
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().2 = true;
+            }
+        }
+    }
+    idx
+}
+
+/// The builtin tables a VM starts from — the function values for `globals`,
+/// the dispatch map and its lowercased index — built once and installed into
+/// each new VM with [`CfmlVirtualMachine::install_builtin_tables`].
+pub struct BuiltinTables {
+    globals: ValueMap,
+    builtins: HashMap<String, BuiltinFunction>,
+    names_lc: BuiltinNameIndex,
+}
+
+impl BuiltinTables {
+    pub fn new(globals: ValueMap, builtins: HashMap<String, BuiltinFunction>) -> Self {
+        let names_lc = build_builtin_index(&builtins);
+        Self { globals, builtins, names_lc }
+    }
+}
+
 pub struct CfmlVirtualMachine {
     /// Live-VM counter (see [`VmLiveGuard`]). First field so it is constructed
     /// and dropped with the VM itself.
@@ -2427,11 +2467,7 @@ pub struct CfmlVirtualMachine {
     /// represent. Those — and only those — keep the exact-match-first probe, so
     /// resolution is unchanged for them while the other ~700 names stay on the
     /// single-probe path.
-    builtin_names_lc: HashMap<
-        String,
-        (String, BuiltinFunction, bool),
-        cfml_common::dynamic::ValueBuildHasher,
-    >,
+    builtin_names_lc: BuiltinNameIndex,
     builtin_lc_src_len: usize,
     /// A native module re-registered a compiled-in builtin's name (see
     /// `register_native_fn`): disables the per-`Name` entry-point cache.
@@ -6867,26 +6903,32 @@ impl CfmlVirtualMachine {
     /// `builtins` field MUST call this afterwards, otherwise the hot-path probe
     /// silently falls back to the O(n) scan it exists to replace.
     pub fn refresh_builtin_index(&mut self) {
-        let mut idx: HashMap<
-            String,
-            (String, BuiltinFunction, bool),
-            cfml_common::dynamic::ValueBuildHasher,
-        > = HashMap::with_capacity_and_hasher(self.builtins.len(), Default::default());
-        for (k, f) in self.builtins.iter() {
-            match idx.entry(k.to_ascii_lowercase()) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((k.clone(), *f, false));
-                }
-                // Two registry keys differing only by case: one lowercased slot
-                // cannot represent both, so mark the entry ambiguous and let
-                // every lookup of it keep the exact-match-first probe.
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    e.get_mut().2 = true;
-                }
+        self.builtin_names_lc = build_builtin_index(&self.builtins);
+        self.builtin_lc_src_len = self.builtins.len();
+    }
+
+    /// Install the stdlib builtins from tables built once per process, instead
+    /// of rebuilding them. Every request VM and every `cfthread`/scheduled-task
+    /// VM starts this way, and the rebuild — ~750 name strings and function
+    /// values, two SipHash maps and a lowercased index — measured ~1.2 ms of a
+    /// ~5.8 ms Preside heartbeat tick. Copying the finished tables skips the
+    /// hashing, the lowercasing and the per-builtin `Arc<CfmlFunction>`.
+    pub fn install_builtin_tables(&mut self, tables: &BuiltinTables) {
+        if self.globals.is_empty() {
+            self.globals = tables.globals.clone();
+        } else {
+            for (k, v) in tables.globals.iter() {
+                self.globals.insert(k.clone(), v.clone());
             }
         }
-        self.builtin_names_lc = idx;
-        self.builtin_lc_src_len = self.builtins.len();
+        if self.builtins.is_empty() {
+            self.builtins = tables.builtins.clone();
+            self.builtin_names_lc = tables.names_lc.clone();
+            self.builtin_lc_src_len = self.builtins.len();
+        } else {
+            self.builtins.extend(tables.builtins.iter().map(|(k, f)| (k.clone(), *f)));
+            self.refresh_builtin_index();
+        }
     }
 
     /// `is_builtin_name_ci` for a bytecode operand: the compiled-in answer was

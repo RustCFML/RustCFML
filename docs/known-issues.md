@@ -2046,10 +2046,13 @@ CLI run can never catch a JIT bug (nothing gets hot in one request), so
 
 **Independent confirmation.** MatchBox (`ortus-boxlang/matchbox`) is the same
 idea with more machinery — four tiers, real side-exit deopt, inline caches in
-Tier-2 loops — and hits the identical exclusion list: no member/index access, no
-`new`/array/struct literals, no dynamic calls, no exceptions. Its own docs say
-"most effective for pure computational functions", it publishes no perf numbers,
-and it ships opt-in and off in WASM/embedded builds.
+Tier-2 loops. *Re-checked 2026-10-28 against MatchBox v0.12.0*, which added
+guarded readonly array/struct reads, two-field struct literals, OSR loop regions
+and append-only construction loops: still no method or function calls, strings,
+exceptions, `while`, `%` or nested loops. Its published numbers are a 254 → 87 ms
+hot-path result on one hand-picked bx-lint helper and 3–4% on whole-LSP edit
+medians with overlapping ranges — inside our A/B rig's null calibration. It ships
+opt-in and off in WASM/embedded builds. Same conclusion, better evidence.
 
 Removed: the module, the `jit` feature on `cfml-vm` and `rustcfml-cli`, five
 Cranelift dependencies (29 crates in the tree), and the `--no-jit`,

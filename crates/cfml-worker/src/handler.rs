@@ -311,22 +311,20 @@ pub(crate) fn run_cfml(
     vm.base_template_path = Some(file_path.to_string());
     vm.source_file = Some(std::sync::Arc::from(file_path));
 
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-
+    // The stdlib builtin tables are built once per isolate and copied into
+    // each request's VM (see `CfmlVirtualMachine::install_builtin_tables`).
+    //
     // `<cfhttp>` has no native implementation in this build: cfml-stdlib is
     // compiled without its `http` feature because ureq/ring have no wasm32
-    // target. Register the fetch-backed one so the VM's cfhttp intercept finds
-    // a provider instead of reporting "HTTP support is not enabled in this
-    // build". Must precede refresh_builtin_index() so the name is indexed.
-    vm.builtins
-        .insert("cfhttp".to_string(), crate::http_provider::cfhttp_worker);
-
-    vm.refresh_builtin_index();
+    // target. The fetch-backed one is registered in the cached tables, so the
+    // VM's cfhttp intercept finds a provider instead of reporting "HTTP
+    // support is not enabled in this build".
+    static BUILTIN_TABLES: std::sync::OnceLock<cfml_vm::BuiltinTables> = std::sync::OnceLock::new();
+    vm.install_builtin_tables(BUILTIN_TABLES.get_or_init(|| {
+        let mut functions = get_builtin_functions();
+        functions.insert("cfhttp".to_string(), crate::http_provider::cfhttp_worker);
+        cfml_vm::BuiltinTables::new(get_builtins(), functions)
+    }));
 
     // Wire queryExecute to the dynamic-driver-only variant. The worker
     // build of cfml-stdlib intentionally compiles without any per-engine

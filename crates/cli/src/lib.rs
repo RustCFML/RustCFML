@@ -1493,6 +1493,9 @@ fn run_missing_template(
     compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true, None)
 }
 
+/// The stdlib builtin tables, built on first use and copied into every VM.
+static BUILTIN_TABLES: OnceLock<cfml_vm::BuiltinTables> = OnceLock::new();
+
 /// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
 /// functions, any native modules registered via `set_registrar` /
 /// `run_with_registrar`, and the DB transaction/query function pointers.
@@ -1500,13 +1503,9 @@ fn run_missing_template(
 /// Shared by per-request execution (`compile_and_run`) and by spawned
 /// `cfthread` child VMs so both get byte-for-byte identical wiring.
 fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-    vm.refresh_builtin_index();
+    vm.install_builtin_tables(BUILTIN_TABLES.get_or_init(|| {
+        cfml_vm::BuiltinTables::new(get_builtins(), get_builtin_functions())
+    }));
     apply_native_modules(vm);
     vm.txn_begin = Some(cfml_stdlib::builtins::txn_begin_boxed);
     vm.txn_commit = Some(cfml_stdlib::builtins::txn_commit_boxed);

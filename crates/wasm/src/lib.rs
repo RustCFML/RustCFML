@@ -49,14 +49,11 @@ impl CfmlEngine {
         // Execute
         let mut vm = CfmlVirtualMachine::new(program);
 
-        // Register builtins
-        for (name, value) in get_builtins() {
-            vm.globals.insert(name, value);
-        }
-        for (name, func) in get_builtin_functions() {
-            vm.builtins.insert(name, func);
-        }
-        vm.refresh_builtin_index();
+        // Register builtins: tables built once, copied into each VM.
+        static BUILTIN_TABLES: std::sync::OnceLock<cfml_vm::BuiltinTables> = std::sync::OnceLock::new();
+        vm.install_builtin_tables(BUILTIN_TABLES.get_or_init(|| {
+            cfml_vm::BuiltinTables::new(get_builtins(), get_builtin_functions())
+        }));
 
         match vm.execute() {
             Ok(_) => {
