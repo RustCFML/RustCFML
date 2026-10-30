@@ -4761,7 +4761,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
                 if src_is_component || src_has_methods {
                     b.all_entries_keyed()
                 } else {
-                    b.iter().collect()
+                    b.with_map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 };
             for (k, v) in entries {
                 if (src_is_component || src_has_methods)

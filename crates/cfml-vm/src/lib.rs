@@ -10153,11 +10153,13 @@ impl CfmlVirtualMachine {
                         {
                             _p4_main_seed = true;
                         }
-                        for (k, v) in parent_args.snapshot() {
-                            if !arguments_map.contains_key(&k) {
-                                arguments_map.insert(k, v);
+                        parent_args.with_map(|m| {
+                            for (k, v) in m {
+                                if !arguments_map.contains_key(k) {
+                                    arguments_map.insert(k.clone(), v.clone());
+                                }
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -31380,13 +31382,7 @@ impl CfmlVirtualMachine {
                 // this guard, keys colliding with a struct helper name
                 // (filter/map/each/find/append/...) were unreachable via
                 // dot-call. Falls through to the stored-function dispatch below.
-                _ if s
-                    .iter()
-                    .any(|(k, v)| {
-                        k.eq_ignore_ascii_case(&method_lower)
-                            && matches!(v, CfmlValue::Function(_))
-                    }) =>
-                {
+                _ if matches!(s.data_get(method_lower), Some(CfmlValue::Function(_))) => {
                     None
                 }
                 "count" | "len" | "size" => Some("structCount"),
@@ -34380,19 +34376,18 @@ impl CfmlVirtualMachine {
             _ => return attrs,
         };
         let mut merged: ValueMap = ac.snapshot();
-        for (k, v) in s.snapshot() {
-            if k.eq_ignore_ascii_case("attributeCollection") {
-                continue;
+        s.with_map(|m| {
+            for (k, v) in m {
+                if k.eq_ignore_ascii_case("attributeCollection") {
+                    continue;
+                }
+                // `Key` compares case-insensitively: this drops the
+                // collection's entry under any spelling, so the explicit
+                // attribute lands last with its own.
+                merged.shift_remove(k);
+                merged.insert(k.clone(), v.clone());
             }
-            if let Some(existing_key) = merged
-                .keys()
-                .find(|ek| ek.eq_ignore_ascii_case(&k))
-                .cloned()
-            {
-                merged.shift_remove(&existing_key);
-            }
-            merged.insert(k, v);
-        }
+        });
         CfmlValue::strukt(merged)
     }
 
@@ -34405,7 +34400,9 @@ impl CfmlVirtualMachine {
     /// template supplied via `attributeCollection` is a top-level key here.
     fn split_module_path(attrs: CfmlValue) -> (String, CfmlValue) {
         let mut map: ValueMap = match attrs {
-            CfmlValue::Struct(s) => s.snapshot(),
+            // Usually the struct `merge_attribute_collection` just built, held
+            // by nobody else: take it rather than copy it.
+            CfmlValue::Struct(s) => s.try_into_map().unwrap_or_else(|s| s.snapshot()),
             other => return (String::new(), other),
         };
         if let Some(k) = map.keys().find(|k| k.eq_ignore_ascii_case("template")).cloned() {
@@ -36443,16 +36440,18 @@ impl CfmlVirtualMachine {
                     if name.eq_ignore_ascii_case("argumentcollection") {
                         match &a {
                             CfmlValue::Struct(s) => {
-                                for (k, v) in s.iter() {
-                                    if let Ok(pos) = k.parse::<usize>() {
-                                        if pos >= 1 {
-                                            positional += 1;
-                                            missing_args.insert(positional.to_string(), v);
-                                            continue;
+                                s.with_map(|m| {
+                                    for (k, v) in m {
+                                        if let Ok(pos) = k.parse::<usize>() {
+                                            if pos >= 1 {
+                                                positional += 1;
+                                                missing_args.insert(positional.to_string(), v.clone());
+                                                continue;
+                                            }
                                         }
+                                        missing_args.insert(k.clone(), v.clone());
                                     }
-                                    missing_args.insert(k, v);
-                                }
+                                });
                                 continue;
                             }
                             CfmlValue::Array(items) => {
