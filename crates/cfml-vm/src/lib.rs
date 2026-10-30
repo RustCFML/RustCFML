@@ -4273,6 +4273,28 @@ fn scope_insert_ci(map: &mut ValueMap, name: &str, val: CfmlValue) {
     map.insert(name, val);
 }
 
+/// A method body that only reads one value and returns it — answered
+/// without running a frame (`CfmlVirtualMachine::getter_shape`).
+#[derive(Clone, Copy)]
+enum GetterShape<'a> {
+    /// `return x;`
+    Bare(&'a cfml_common::name::Name),
+    /// `return x.y;`
+    Prop(&'a cfml_common::name::Name, &'a cfml_common::name::Name),
+    /// `return variables.x;`
+    VarsKey(&'a cfml_common::name::Name),
+    /// `return variables.x ?: <fallback>;` / `return request.x ?: <fallback>;`
+    Elvis(ElvisScope, &'a cfml_common::name::Name),
+    /// An `accessors="true"` getter.
+    Accessor(&'a cfml_common::name::Name),
+}
+
+#[derive(Clone, Copy)]
+enum ElvisScope {
+    Variables,
+    Request,
+}
+
 /// Deferred inputs for the fused call-parent merge (see the field doc on
 /// `pending_fused_parent`): the callee's captured env and the caller's
 /// inherited-key filter, both held by Arc so building the plan is two
@@ -9354,6 +9376,203 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// The getter shape of a function body, decided from its instructions
+    /// alone (no lookups), so a body that is not a getter costs a few
+    /// compares. See the callers of [`Self::trivial_getter_value`].
+    #[inline]
+    fn getter_shape(func: &BytecodeFunction) -> Option<GetterShape<'_>> {
+        use BytecodeOp as Op;
+        if !func.params.is_empty() || func.is_template_frame {
+            return None;
+        }
+        let is_vars = |scope: &cfml_common::name::Name, key: &cfml_common::name::Name| {
+            scope.lower() == "variables" && key.lower() != "this"
+        };
+        match func.instructions.as_slice() {
+            // An engine-generated accessor (`accessors="true"`): no line marker.
+            [Op::LoadLocal(scope), Op::TryGetProperty(key), Op::Return] if is_vars(scope, key) => {
+                Some(GetterShape::Accessor(key))
+            }
+            [Op::LineInfo(..), Op::LoadLocal(name), Op::Return, Op::Null, Op::Return]
+                if !name.is_reserved_word() =>
+            {
+                Some(GetterShape::Bare(name))
+            }
+            [Op::LineInfo(..), Op::LoadLocalProperty(base, prop), Op::Return, Op::Null, Op::Return]
+                if !base.is_reserved_word() =>
+            {
+                Some(GetterShape::Prop(base, prop))
+            }
+            [Op::LineInfo(..), Op::LoadVariablesKey(name), Op::Return, Op::Null, Op::Return] => {
+                Some(GetterShape::VarsKey(name))
+            }
+            // `return variables.k ?: <fallback>;` / `return request.k ?: …;` —
+            // on a hit the fallback never runs, so it may be anything.
+            [Op::LineInfo(..), Op::LoadLocal(scope), Op::TryGetProperty(key), Op::JumpIfNotNull(target), Op::Pop, .., Op::Return, Op::Null, Op::Return]
+                if *target == func.instructions.len() - 3 && key.lower() != "this" =>
+            {
+                match scope.lower() {
+                    "variables" => Some(GetterShape::Elvis(ElvisScope::Variables, key)),
+                    "request" => Some(GetterShape::Elvis(ElvisScope::Request, key)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A plain class method dispatched with its ready-made scope map: the
+    /// getter's value, already checked against the declared return type.
+    #[inline(never)]
+    fn member_getter_value(&mut self, func_ref: &CfmlValue, method_locals: &ValueMap) -> Option<CfmlValue> {
+        let CfmlValue::Function(f) = func_ref else { return None };
+        let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body else { return None };
+        let CfmlValue::Int(idx) = body.as_ref() else { return None };
+        let user_func = self.resolve_fn(*idx)?;
+        let shape = Self::getter_shape(&user_func)?;
+        let v = Self::trivial_getter_value(
+            &user_func,
+            shape,
+            method_locals,
+            &mut FrameScopeCache::default(),
+            &self.request_scope,
+        )?;
+        self.check_declared_return_type(&user_func, v).ok()
+    }
+
+    /// Whether an observer wants function enter/exit events — then every call
+    /// must run through `execute_function_with_args`, which fires them.
+    #[inline]
+    fn function_hooks_active(&self) -> bool {
+        #[cfg(feature = "observability")]
+        {
+            self.interest.contains(observe::Interest::FUNCTION) && self.observer.is_some()
+        }
+        #[cfg(not(feature = "observability"))]
+        {
+            false
+        }
+    }
+
+    /// [`Self::trivial_getter_value`] for a bare call, answered from the
+    /// callee's captured env and the caller's frame instead of a seeded
+    /// `locals`. Mirrors the two rules of `fused_parent_merge` the getter can
+    /// observe: the frame's `variables` handle is the env's when it holds one
+    /// (caller data never overrides an env entry) and the caller's otherwise;
+    /// and a name the seed would place in the frame's own map shadows
+    /// `variables` — any such name sends the call down the normal path.
+    #[inline(never)]
+    fn getter_value_before_seed(
+        &self,
+        func: &cfml_common::dynamic::CfmlFunction,
+        shape: GetterShape<'_>,
+        caller: &ValueMap,
+    ) -> Option<CfmlValue> {
+        let env_guard = match &func.captured_scope {
+            Some(e) => Some(e.read().ok()?),
+            None => None,
+        };
+        let env = env_guard.as_deref();
+        let vars_key = &*cfml_common::key::well_known::VARIABLES;
+        let vars = match env.and_then(|e| e.get(vars_key)).or_else(|| caller.get(vars_key))? {
+            CfmlValue::Struct(s) => s.clone(),
+            _ => return None,
+        };
+        // `fused_call_parent_plan`'s filter: a function caller carries only
+        // what its inherited set names; a page/template caller carries all.
+        let filter = match self.frame_ctx.last() {
+            Some((inh, false)) => Some(inh),
+            _ => None,
+        };
+        let seeded = |name: &cfml_common::name::Name| -> bool {
+            let k = name.key();
+            if env.is_some_and(|e| e.contains_key(k)) {
+                return true;
+            }
+            match (caller.get(k), filter) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(v), Some(inh)) => {
+                    matches!(v, CfmlValue::Function(f) if f.captured_scope.is_none())
+                        || (inh.has_data_keys() && inh.contains_key(k))
+                }
+            }
+        };
+        let bare = |name: &cfml_common::name::Name| -> Option<CfmlValue> {
+            if seeded(name) {
+                return None;
+            }
+            let v = vars.get(name)?;
+            (!matches!(v, CfmlValue::Function(_))).then_some(v)
+        };
+        match shape {
+            GetterShape::Bare(name) => bare(name),
+            GetterShape::Prop(base, prop) => {
+                // A plain struct only: other receivers' reads depend on the
+                // reading frame, which does not exist here.
+                let receiver = bare(base)?;
+                if !matches!(receiver, CfmlValue::Struct(_)) {
+                    return None;
+                }
+                Self::lookup_property_opt(&receiver, prop, None)
+            }
+            GetterShape::VarsKey(name) => vars.get(name),
+            GetterShape::Accessor(key) => {
+                let v = vars.get(key)?;
+                (!matches!(v, CfmlValue::Function(_))).then_some(v)
+            }
+            GetterShape::Elvis(scope, key) => {
+                let v = match scope {
+                    ElvisScope::Variables => vars.get(key)?,
+                    ElvisScope::Request => self.request_scope.get(key)?,
+                };
+                (!matches!(v, CfmlValue::Null | CfmlValue::Function(_))).then_some(v)
+            }
+        }
+    }
+
+    /// The value a getter-shaped body (see the caller in
+    /// `execute_function_body`) would return, resolved exactly as its one load
+    /// op resolves it on a hit. `None` = not a hit: run the body.
+    #[inline(never)]
+    fn trivial_getter_value(
+        func: &BytecodeFunction,
+        shape: GetterShape<'_>,
+        locals: &ValueMap,
+        scope_cache: &mut FrameScopeCache,
+        request_scope: &CfmlStruct,
+    ) -> Option<CfmlValue> {
+        // A bare name read: the frame's own map first, then the `variables`
+        // handle — the two probes `LoadLocal`'s direct path makes. A function
+        // value is left to the generic path, which binds its receiver.
+        let mut bare = |name: &cfml_common::name::Name| -> Option<CfmlValue> {
+            if let Some(v) = locals.get(name) {
+                return Some(v.clone());
+            }
+            let v = scope_cache.direct_vars(locals, &func.params)?.get(name)?;
+            (!matches!(v, CfmlValue::Function(_))).then_some(v)
+        };
+        match shape {
+            GetterShape::Bare(name) => bare(name),
+            GetterShape::Prop(base, prop) => {
+                let receiver = bare(base)?;
+                Self::lookup_property_opt(&receiver, prop, Some(locals))
+            }
+            GetterShape::VarsKey(name) => scope_cache.vars_handle(locals, &func.params)?.get(name),
+            GetterShape::Accessor(key) => {
+                let v = scope_cache.vars_handle(locals, &func.params)?.get(key)?;
+                (!matches!(v, CfmlValue::Function(_))).then_some(v)
+            }
+            GetterShape::Elvis(scope, key) => {
+                let v = match scope {
+                    ElvisScope::Variables => scope_cache.vars_handle(locals, &func.params)?.get(key)?,
+                    ElvisScope::Request => request_scope.get(key)?,
+                };
+                (!matches!(v, CfmlValue::Null | CfmlValue::Function(_))).then_some(v)
+            }
+        }
+    }
+
     #[cfg(feature = "scope-pool")]
     #[inline]
     fn recycle_locals_map(&mut self, mut m: ValueMap) {
@@ -9771,6 +9990,29 @@ impl CfmlVirtualMachine {
                 && !locals.contains_key(&*cfml_common::key::well_known::CLOSURE_FRAME_ENV),
             "direct_frame derived from the seed disagrees with the map"
         );
+        // A one-expression getter — `return _objects;`, `return variables.x;`,
+        // `return services.requestService;`, `return variables.x ?: nullValue();`
+        // — answered from the scope this frame was just seeded with, without
+        // binding arguments, pushing a stack-trace frame or running the
+        // dispatch loop. ~40% of the frames on a Preside render execute five ops
+        // or fewer and most of them are exactly these. Only a HIT returns here:
+        // a miss, a function value or any other shape runs the body as before,
+        // so every error and fall-through is still produced by the real ops.
+        // The wrapper still enforces the declared return type and fires the
+        // function enter/exit hooks.
+        if args.is_empty() && direct_frame && self.pending_extra_named_args.is_none() {
+            if let Some(v) = Self::getter_shape(func)
+                .and_then(|shape| {
+                    Self::trivial_getter_value(func, shape, &locals, &mut scope_cache, &self.request_scope)
+                })
+            {
+                self.pending_called_name = None;
+                #[cfg(feature = "scope-pool")]
+                self.recycle_locals_map(locals);
+                self.recycle_stack(stack);
+                return Ok(v);
+            }
+        }
         #[cfg(feature = "call-phases")]
         {
             // phase 2: parent-scope seed copy
@@ -17429,6 +17671,26 @@ impl CfmlVirtualMachine {
         args: Vec<CfmlValue>,
         parent_locals: &ValueMap,
     ) -> CfmlResult {
+        // A bare call to a getter-shaped method (`_getObjects()` from a sibling
+        // method) is answered before the frame is even seeded: the value comes
+        // from the `variables` handle the seed would have installed. The same
+        // shapes are caught after the seed in `execute_function_body` for every
+        // other way in (member calls arrive with their scope already built).
+        if args.is_empty()
+            && !Self::is_closure_value(func)
+            && self.pending_extra_named_args.is_none()
+            && !self.function_hooks_active()
+        {
+            if let Some(v) = Self::getter_shape(&user_func)
+                .and_then(|shape| self.getter_value_before_seed(func, shape, parent_locals))
+            {
+                if let Ok(v) = self.check_declared_return_type(&user_func, v) {
+                    // Drained by the frame this call no longer builds.
+                    self.pending_called_name = None;
+                    return Ok(v);
+                }
+            }
+        }
         #[cfg(feature = "call-phases")]
         let _cp_disp = std::time::Instant::now();
         // Handle closure scope merging. A callee's DATA scope is
@@ -36345,6 +36607,23 @@ impl CfmlVirtualMachine {
             // general way with the same map as its parent.
             let plain_method = matches!(&func_ref,
                 CfmlValue::Function(f) if f.captured_scope.is_none());
+            // A getter-shaped method answers from the scope map just built,
+            // without a frame (see `trivial_getter_value`).
+            if plain_method
+                && args.is_empty()
+                && self.pending_extra_named_args.is_none()
+                && self.disallowed_functions.is_empty()
+                && !self.function_hooks_active()
+            {
+                if let Some(v) = self.member_getter_value(&func_ref, &method_locals) {
+                    self.pending_called_name = None;
+                    #[cfg(feature = "scope-pool")]
+                    self.recycle_locals_map(method_locals);
+                    self.closure_parent_writeback = None;
+                    self.closure_parent_deletes = None;
+                    return Ok(v);
+                }
+            }
             let result = if plain_method {
                 self.pending_instance_frame = Some((method_locals, true));
                 let r = self.call_function(&func_ref, args, &ValueMap::default());
