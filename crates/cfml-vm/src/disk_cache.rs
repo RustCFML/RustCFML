@@ -42,7 +42,9 @@ use std::sync::Arc;
 /// History:
 /// - 1: Initial disk cache implementation (v0.654.0, bincode 1.3.3)
 /// - 2: Switched to bincode 2.0.1 (v0.742.2)
-pub const BYTECODE_FORMAT_VERSION: u32 = 2;
+/// - 3: `BytecodeOp::TakeProperty` added after `TakeSlot`, shifting the
+///   variant indices of every later op (serde encodes enums by index)
+pub const BYTECODE_FORMAT_VERSION: u32 = 3;
 
 /// Compute cache key for a source file, optionally including the source path.
 /// The path component ensures that the same file compiled via different paths
