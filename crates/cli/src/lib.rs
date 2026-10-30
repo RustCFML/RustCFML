@@ -4227,11 +4227,19 @@ async fn handle_request_inner(
             Some(hit) => hit,
             None => {
                 let r = resolve_file(&state.doc_root, &path, state.vfs.as_ref(), welcome_files, cfml_exts);
-                state
-                    .resolved_file_cache
-                    .write()
-                    .unwrap()
-                    .insert(path.clone(), r.clone());
+                // The key is the client's path, so caching every distinct one
+                // let `GET /x1`, `/x2`, ... grow the map until memory shedding
+                // refused all traffic. Misses are not cached at all; hits are
+                // still unbounded (`/index.cfm/<anything>` is a path-info hit,
+                // `//` and `/./` variants resolve too), so the map is capped and
+                // starts over when full, letting the hot paths back in.
+                if r.is_some() {
+                    let mut cache = state.resolved_file_cache.write().unwrap();
+                    if cache.len() >= RESOLVED_FILE_CACHE_CAP {
+                        cache.clear();
+                    }
+                    cache.insert(path.clone(), r.clone());
+                }
                 r
             }
         }
@@ -4392,9 +4400,10 @@ async fn handle_request_inner(
             // The request thread owns the only sender, so `None` here means it
             // finished without ever flushing.
             match flush_rx.recv().await {
-                None => match handle.await.unwrap() {
-                    Ok(response) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
-                    Err(e) => render_error_response(&state, &e),
+                None => match handle.await {
+                    Ok(Ok(response)) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
+                    Ok(Err(e)) => render_error_response_off_worker(&state, e).await,
+                    Err(join_err) => request_task_failed_response(&path, join_err),
                 },
                 Some(FlushEvent::Commit(commit, first_chunk)) => build_streaming_response(
                     *commit,
@@ -4540,7 +4549,11 @@ async fn handle_request_inner(
                             sandbox,
                         )
                     })
-                }).await.unwrap();
+                }).await;
+                let result = match result {
+                    Ok(r) => r,
+                    Err(join_err) => return request_task_failed_response(&path, join_err),
+                };
 
                 match result {
                     Ok(response) if response.missing_template_handled => {
@@ -4551,7 +4564,7 @@ async fn handle_request_inner(
                     // A throw inside onMissingTemplate (with no onError) surfaces as
                     // a normal 500 error page, like any other uncaught CFML error.
                     Err(e) => {
-                        return render_error_response(&state, &e);
+                        return render_error_response_off_worker(&state, e).await;
                     }
                 }
             }
@@ -4566,6 +4579,36 @@ async fn handle_request_inner(
                 .unwrap()
         }
     }
+}
+
+/// Entries kept in the production-mode URL-path → file cache before it is
+/// cleared and repopulated. A site has far fewer distinct live URLs than this.
+const RESOLVED_FILE_CACHE_CAP: usize = 10_000;
+
+/// The request's blocking task panicked (or was cancelled) instead of
+/// returning. Unwrapping the `JoinError` panicked the async handler, which
+/// tokio swallowed: the client saw a reset with no status line and nothing
+/// was logged against the request. Log it and answer a plain 500.
+fn request_task_failed_response(
+    path: &str,
+    join_err: tokio::task::JoinError,
+) -> axum::response::Response {
+    let reason = match join_err.try_into_panic() {
+        Ok(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".to_string()),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("Request failed [{path}]: {reason}");
+    axum::response::Response::builder()
+        .status(500)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(axum::body::Body::from(
+            "<html><body><h1>500 Internal Server Error</h1></body></html>",
+        ))
+        .unwrap_or_default()
 }
 
 /// One `<cfflush>` crossing from the request's blocking thread to the async
@@ -4889,6 +4932,23 @@ fn html_escape(s: &str) -> String {
 ///   * `errorTemplate`   — when set, the file is rendered as a fresh CFML
 ///                        request with the error available as request._error.
 ///                        Render failure falls back to the inline page.
+/// `render_error_response` from an async handler. With
+/// `debugging.errorTemplate` set the render compiles and runs CFML, so it goes
+/// to the blocking pool like the page itself: run inline, a burst of 500s
+/// pinned the runtime's worker threads.
+async fn render_error_response_off_worker(
+    state: &Arc<AppState>,
+    e: CfmlRunError,
+) -> axum::response::Response {
+    if state.cfconfig.debugging.error_template.is_empty() {
+        return render_error_response(state, &e);
+    }
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || render_error_response(&st, &e))
+        .await
+        .unwrap_or_else(|join_err| request_task_failed_response("errorTemplate", join_err))
+}
+
 fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::response::Response {
     let dbg = &state.cfconfig.debugging;
     let status: u16 = if dbg.error_status_code { 500 } else { 200 };
@@ -6093,8 +6153,9 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             embedded_status(&pid_file);
         }
         "start" => {
+            // On unix this re-executes the binary detached and exits; the
+            // code below is the non-unix fallback, which runs in place.
             embedded_start(&pid_file, port, file_count);
-            // After daemonizing, the child process continues here
             if sandbox { println!("Sandbox mode: host filesystem access disabled"); }
             println!("RustCFML self-contained app ({} embedded files)", file_count);
             let doc_root = PathBuf::from(base_dir);
@@ -6150,10 +6211,19 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
     }
 }
 
-/// Daemonize: fork to background and write PID file.
+/// Daemonize: start a detached copy of this binary and write its PID file.
+///
+/// This used to `fork()` in place. By the time `start` runs, the process
+/// already has other threads (the big-stack VM thread, the memory watchdog)
+/// and mimalloc's per-thread state; `fork` copies only the calling thread, so
+/// any lock another thread held at that instant stayed held forever in the
+/// child, an occasional hang at daemon start. Re-executing the binary gives
+/// the daemon a fresh process instead. The child runs the same server as the
+/// foreground mode, which is what `start` ran after the fork.
 #[cfg(unix)]
 fn embedded_start(pid_file: &str, port: u16, file_count: usize) {
     use std::io::Write;
+    use std::os::unix::process::CommandExt;
 
     // Check if already running
     if let Ok(pid_str) = fs::read_to_string(pid_file) {
@@ -6166,43 +6236,62 @@ fn embedded_start(pid_file: &str, port: u16, file_count: usize) {
         }
     }
 
-    // Fork
-    let pid = unsafe { libc::fork() };
-    match pid {
-        -1 => {
-            eprintln!("Failed to fork");
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to start: cannot locate this binary: {e}");
             exit(1);
         }
-        0 => {
-            // Child process — continue to run the server
-            // Create new session
-            unsafe { libc::setsid() };
-
-            // Write PID file
-            let child_pid = std::process::id();
-            let mut f = std::fs::File::create(pid_file).expect("Cannot create PID file");
-            write!(f, "{}", child_pid).expect("Cannot write PID file");
-
-            // Redirect stdout/stderr to log file
-            let log_path = pid_file.replace(".pid", ".log");
-            if let Ok(log_file) = std::fs::File::create(&log_path) {
-                use std::os::unix::io::AsRawFd;
-                let fd = log_file.as_raw_fd();
-                unsafe {
-                    libc::dup2(fd, 1); // stdout
-                    libc::dup2(fd, 2); // stderr
-                }
+    };
+    // Every argument except the `start` command itself: without it the child
+    // takes the foreground path with the same flags.
+    let mut dropped = false;
+    let args: Vec<std::ffi::OsString> = std::env::args_os()
+        .skip(1)
+        .filter(|a| {
+            if !dropped && a == "start" {
+                dropped = true;
+                false
+            } else {
+                true
             }
-            // Child continues to the server startup code
-        }
-        _ => {
-            // Parent process — report and exit
-            println!("Started in background (PID {})", pid);
-            println!("Listening on http://127.0.0.1:{} ({} embedded files)", port, file_count);
-            println!("Stop with: {} stop", std::env::args().next().unwrap_or_default());
-            exit(0);
-        }
+        })
+        .collect();
+
+    let log_path = pid_file.replace(".pid", ".log");
+    let (stdout, stderr) = match std::fs::File::create(&log_path)
+        .and_then(|f| Ok((f.try_clone()?, f)))
+    {
+        Ok((out, err)) => (std::process::Stdio::from(out), std::process::Stdio::from(err)),
+        Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: `setsid` is async-signal-safe, which is all `pre_exec` allows.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
     }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to start: {e}");
+            exit(1);
+        }
+    };
+    let pid = child.id();
+    let mut f = std::fs::File::create(pid_file).expect("Cannot create PID file");
+    write!(f, "{}", pid).expect("Cannot write PID file");
+
+    println!("Started in background (PID {})", pid);
+    println!("Listening on http://127.0.0.1:{} ({} embedded files)", port, file_count);
+    println!("Stop with: {} stop", std::env::args().next().unwrap_or_default());
+    exit(0);
 }
 
 #[cfg(not(unix))]

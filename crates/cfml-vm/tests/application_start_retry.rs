@@ -101,7 +101,7 @@ fn run_request(
     vm.server_state = Some(server_state.clone());
     match vm.execute_with_lifecycle() {
         Ok(_) => Ok(vm.output_buffer.trim().to_string()),
-        Err(e) => Err(e.message),
+        Err(e) => Err(e.into_inner().message),
     }
 }
 

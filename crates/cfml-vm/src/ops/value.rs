@@ -121,7 +121,10 @@ pub(crate) fn op_mul(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
 pub(crate) fn op_mod(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
     arith_binary_op(stack, |a, b| {
         Ok(match (&a, &b) {
-            (CfmlValue::Int(i), CfmlValue::Int(j)) if *j != 0 => CfmlValue::Int(i % j),
+            // `i64::MIN % -1` overflows (and panics) in Rust; the answer is 0.
+            (CfmlValue::Int(i), CfmlValue::Int(j)) if *j != 0 => {
+                CfmlValue::Int(i.checked_rem(*j).unwrap_or(0))
+            }
             _ => {
                 let y = arith_operand(&b)?;
                 let x = arith_operand(&a)?;
@@ -159,7 +162,11 @@ pub(crate) fn op_int_div(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
 pub(crate) fn op_negate(stack: &mut Vec<CfmlValue>) {
     if let Some(val) = stack.pop() {
         match val {
-            CfmlValue::Int(i) => stack.push(CfmlValue::Int(-i)),
+            // `-i64::MIN` does not fit: promote, as `op_add` does on overflow.
+            CfmlValue::Int(i) => stack.push(match i.checked_neg() {
+                Some(n) => CfmlValue::Int(n),
+                None => CfmlValue::Double(-(i as f64)),
+            }),
             CfmlValue::Double(d) => stack.push(CfmlValue::Double(-d)),
             _ => {
                 if let Some(n) = to_number(&val) {
@@ -288,13 +295,10 @@ pub(crate) fn op_imp(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
 
 #[inline(always)]
 pub(crate) fn op_build_array(stack: &mut Vec<CfmlValue>, count: usize) {
-    let mut elements = Vec::new();
-    for _ in 0..count {
-        if let Some(val) = stack.pop() {
-            elements.push(val);
-        }
-    }
-    elements.reverse();
+    // The elements sit on the stack in source order: drain them into an
+    // exactly-sized Vec (pop-push-reverse regrew it log2(n) times).
+    let base = stack.len().saturating_sub(count);
+    let elements: Vec<CfmlValue> = stack.drain(base..).collect();
     stack.push(CfmlValue::array(elements));
 }
 

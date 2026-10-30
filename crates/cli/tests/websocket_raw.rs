@@ -511,13 +511,9 @@ async fn onconnect_rejection_closes_handshake() {
     let closed = match connect_async(&url).await {
         Err(_) => true,
         Ok((mut ws, _)) => tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Close(_))) | None => return true,
-                    Some(Ok(_)) => return false, // any data frame = not rejected
-                    Some(Err(_)) => return true,
-                }
-            }
+            // Only the first frame matters: a close (or the stream ending) is
+            // the rejection, any data frame means the connection was fed.
+            !matches!(ws.next().await, Some(Ok(m)) if !matches!(m, Message::Close(_)))
         })
         .await
         .expect("timed out"),

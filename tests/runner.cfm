@@ -95,6 +95,7 @@ include "harness.cfm";
 <!--- `+`, `++`, `+=`, `*=`, loop increments and incrementValue() past i64 --->
 <!--- promote to a double (Lucee computes in doubles); they used to panic/wrap. --->
 <cf_runtest file="core/test_integer_overflow_promotion.cfm" />
+<cf_runtest file="core/test_concat_assign_struct_member.cfm" />
 <cf_runtest file="core/test_strict_equality.cfm" />
 <cf_runtest file="core/test_subscript_autovivify.cfm" />
 <!--- Scope-qualified nested auto-vivification (variables.$class.name = ...): the residual --->
@@ -243,6 +244,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_string_split_member.cfm" />
 <cf_runtest file="stdlib/test_regex_backspace_in_class.cfm" />
 <cf_runtest file="stdlib/test_regex_lookaround.cfm" rustcfmlOnly="true" />
+<cf_runtest file="stdlib/test_regex_malformed_and_perl_classes.cfm" />
 <cf_runtest file="stdlib/test_inetaddress_loopback.cfm" />
 <cf_runtest file="stdlib/test_java_fileoutputstream_shim.cfm" />
 <cf_runtest file="stdlib/test_java_files_shims.cfm" />
@@ -713,6 +715,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfthread_metadata.cfm" />
 <cf_runtest file="tags/test_tags_cfthread_concurrency.cfm" />
 <cf_runtest file="tags/test_cfthread_shared_component.cfm" />
+<cf_runtest file="tags/test_cfthread_terminate_loop_shapes.cfm" />
 <cf_runtest file="functions/test_extends_missing_parent.cfm" />
 <cf_runtest file="tags/test_application_scope_concurrency.cfm" />
 <cf_runtest file="tags/test_cflock_timeout_semantics.cfm" />

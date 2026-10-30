@@ -168,7 +168,7 @@ pub fn handle_factory(
             // XMPCore rejects an empty or non-XML packet outright; so does the
             // builtin, whose error we retype as the XMPException callers catch.
             let parsed = parse_xmp(vec![CfmlValue::string(xml)])
-                .map_err(|e| xmp_exception(e.message))?;
+                .map_err(|e| xmp_exception(e.into_inner().message))?;
             let mut m = shim(META_CLASS);
             m.insert("__props".to_string(), props_from_parsed(parsed));
             Ok(CfmlValue::strukt(m))

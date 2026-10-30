@@ -9229,7 +9229,9 @@ impl CfmlVirtualMachine {
                     if s.eq_ignore_ascii_case("arguments") =>
                 {
                     match instructions.get(i + 1) {
-                        Some(BytecodeOp::GetProperty(_)) | Some(BytecodeOp::TryGetProperty(_)) => {}
+                        Some(BytecodeOp::GetProperty(_))
+                        | Some(BytecodeOp::TryGetProperty(_))
+                        | Some(BytecodeOp::TakeProperty(_)) => {}
                         _ => return false,
                     }
                 }
@@ -12212,22 +12214,9 @@ impl CfmlVirtualMachine {
 
                 // Control flow
                 BytecodeOp::Jump(target) => {
-                    // Cooperative cancellation checkpoint. A backward jump is a
-                    // loop back-edge — the bounded place a terminated thread
-                    // aborts. `cancel_flag` is `None` on the main VM, so this is
-                    // a single predictable branch only on back-edges; the whole
-                    // check vanishes when the `real-threads` feature is off.
-                    #[cfg(feature = "real-threads")]
-                    {
-                        if *target <= ip {
-                            if let Some(flag) = &self.cancel_flag {
-                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                    return Err(CfmlError::runtime(
-                                        "thread terminated".to_string(),
-                                    ));
-                                }
-                            }
-                        }
+                    // A backward jump is a loop back-edge: see `poll_cancel`.
+                    if *target <= ip {
+                        self.poll_cancel()?;
                     }
                     ip = *target;
                 }
@@ -12246,12 +12235,20 @@ impl CfmlVirtualMachine {
                             },
                         };
                         if !truth {
+                            if *target < ip {
+                                self.poll_cancel()?;
+                            }
                             ip = *target;
                         }
                     }
                 }
                 BytecodeOp::JumpIfLocalCmpConstFalse(name, c, cmp, target)
-                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => { ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize); }
+                | BytecodeOp::JumpIfSlotCmpConstFalse(_, name, c, cmp, target) => {
+                    if (*target as usize) < ip {
+                        self.poll_cancel()?;
+                    }
+                    ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize);
+                }
                 BytecodeOp::ForLoopStep(name, limit, cmp, step, target)
                 | BytecodeOp::ForSlotStep(_, name, limit, cmp, step, target) => {
                     // The op carries its constants as i32 (op-size budget); the
@@ -12312,6 +12309,8 @@ impl CfmlVirtualMachine {
                                 }
                             };
                             if matched {
+                                // The fused step is always a back-edge.
+                                self.poll_cancel()?;
                                 ip = *target as usize;
                             }
                             continue;
@@ -12390,6 +12389,7 @@ impl CfmlVirtualMachine {
                         _ => false,
                     };
                     if matched {
+                        self.poll_cancel()?;
                         ip = *target as usize;
                     }
                 }
@@ -12408,6 +12408,10 @@ impl CfmlVirtualMachine {
                             },
                         };
                         if truth {
+                            // `do {} while (cond)` closes its loop with this op.
+                            if *target < ip {
+                                self.poll_cancel()?;
+                            }
                             ip = *target;
                         }
                     }
@@ -13914,6 +13918,30 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::LoadSuper => { ops::locals::op_load_super(self, &mut stack, &mut locals)?; }
                 BytecodeOp::GetProperty(name) | BytecodeOp::TryGetProperty(name) => { ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, matches!(op, BytecodeOp::GetProperty(_)))?; }
+                BytecodeOp::TakeProperty(name) => {
+                    // Stack: [.., rhs, base]. Move the String out only when the
+                    // right operand is simple, so the Concat that follows cannot
+                    // throw and leave the member holding the placeholder; the
+                    // store that follows writes the result back.
+                    let n = stack.len();
+                    let simple_rhs = n >= 2
+                        && matches!(
+                            stack[n - 2],
+                            CfmlValue::String(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::Bool(_)
+                        );
+                    if simple_rhs {
+                        if let Some(CfmlValue::Struct(s)) = stack.last() {
+                            if !s.is_read_only() {
+                                if let Some(taken) = s.take_if_string(name) {
+                                    stack.pop();
+                                    stack.push(taken);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    ops::access::op_get_property(self, &mut stack, &mut ip, &locals, name, false)?;
+                }
                 BytecodeOp::LoadStaticHolder(name) => { ops::frame::op_load_static_holder(self, &mut stack, &locals, name); }
                 BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
                 BytecodeOp::SetProperty(name) => {
@@ -16621,7 +16649,13 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::CallSpread => { ops::locals::op_call_spread(self, &mut stack, func, &mut locals, &mut slots, &mut slot_blocked)?; }
 
-                BytecodeOp::TagLoopBack(body_start) => { ops::effect::op_tag_loop_back(self, &mut stack, &mut ip, *body_start); }
+                BytecodeOp::TagLoopBack(body_start) => {
+                    // `<cfexit method="loop">` re-enters the body: a back-edge.
+                    if self.pending_tag_loop {
+                        self.poll_cancel()?;
+                    }
+                    ops::effect::op_tag_loop_back(self, &mut stack, &mut ip, *body_start);
+                }
                 BytecodeOp::AbandonTagPairs(n) => { ops::effect::op_abandon_tag_pairs(self, *n); }
                 BytecodeOp::LineInfo(line, col) => { ops::locals::op_line_info(self, *line, *col); }
 
@@ -17326,11 +17360,171 @@ impl CfmlVirtualMachine {
         Ok(FileCursorOpts { chunking, charset })
     }
 
+    /// The user-defined-function fast path of [`Self::call_function`]: a
+    /// callee resolved by its global id, dispatched straight to
+    /// `execute_function_with_args`.
+    #[inline(always)]
+    fn call_resolved_user_function(
+        &mut self,
+        func: &Arc<cfml_common::dynamic::CfmlFunction>,
+        user_func: Arc<BytecodeFunction>,
+        args: Vec<CfmlValue>,
+        parent_locals: &ValueMap,
+    ) -> CfmlResult {
+        #[cfg(feature = "call-phases")]
+        let _cp_disp = std::time::Instant::now();
+        // Handle closure scope merging. A callee's DATA scope is
+        // its lexical/defining scope (`captured_scope`) — for a
+        // CFC method that already carries the component's `this`
+        // /`variables`. The CALL SITE's local data vars must NOT
+        // leak in (CFML is not dynamically scoped); only helper
+        // functions are carried so bare-name sibling/var-scoped
+        // helpers stay callable (PR #198). See
+        // `build_call_parent_scope`.
+        // Live lexical parent chain for deferred nested closures.
+        // Gated to synthesized lexical closures (`__closure_`/
+        // `__arrow_`) so named functions and CFC methods keep the
+        // copy-and-writeback path untouched. Must run BEFORE
+        // `build_call_parent_scope` copies the captured env into the
+        // callee's locals — otherwise the refresh lands too late to
+        // be seen by this invocation.
+        if (func.name.starts_with("__closure_")
+            || func.name.starts_with("__arrow_"))
+            && func.captured_scope.is_some()
+        {
+            // (1) Refresh this closure's captured env from its
+            // ancestors so an outer var reassigned by a sibling
+            // (e.g. a TestBox `beforeEach`) is seen by this deferred
+            // `it`, which was seeded with a now-stale copy.
+            // (2) Hand our captured (defining) env down so any env
+            // this invocation mints links back to it as its parent —
+            // building the chain (1) walks. Each invocation still owns
+            // its scope (closure factories stay independent), unlike
+            // adopting the parent env outright.
+            self.pending_closure_env = func.captured_scope.clone();
+        }
+        let fused_parent_plan = self.fused_call_parent_plan(func, parent_locals);
+        // Lexical relative-component resolution: while a user
+        // function runs, a bare createObject("component","X")/
+        // `new X()` inside it must resolve X relative to the
+        // package of the file that DEFINES the function, not the
+        // caller's file. call_member_function does this for
+        // receiver dispatch (this.m()/child.m(), the #132/#133
+        // fixes); a BARE call to an inherited method (e.g. a
+        // child-defined `go()` calling the inherited
+        // `makeSibling()`) routes here instead, so it needs the
+        // same swap or it would search the outer frame's dir.
+        // Skip when the callee carries no source (dynamic
+        // closures) or already matches the active file — the
+        // common same-file / self-recursion case pays only a
+        // cheap comparison, no clone. (Wheels migrator shape:
+        // migration up() -> inherited createTable() ->
+        // createObject("TableDefinition").)
+        // §2.1: a pointer test first. The byte compare of two
+        // equal ~60-char paths ran on EVERY same-file call (3.6% of
+        // a UDF→UDF frame); when the paths match but the handles
+        // differ, adopt the callee's shared handle so the next
+        // call from this file is a pointer test.
+        let saved_source_file = match (user_func.source_file_arc_ref(), self.source_file.as_ref()) {
+            (None, _) => None,
+            (Some(f), Some(cur)) if Arc::ptr_eq(f, cur) => None,
+            (Some(f), Some(cur)) if **f == **cur => {
+                self.source_file = Some(f.clone());
+                None
+            }
+            (Some(f), _) => {
+                let prev = self.source_file.clone();
+                self.source_file = Some(f.clone());
+                Some(prev)
+            }
+        };
+        // Alias attribution for getFunctionCalledName(). The frame's
+        // called_name falls back to the RESOLVED function's declared
+        // name (`user_func.name`, keyed by global_id) — but a call
+        // through an ALIAS carries the alias only on `func_ref.name`
+        // (set when the callee was loaded, e.g. FW/1 beanProxy's
+        // `variables.doFront` holding the proxy's `$callPrivateMethod`,
+        // renamed to "doFront" at resolution). `pending_called_name`
+        // is the channel for that, but a nested call in an ARGUMENT
+        // (`doRear(doFront(x))`) drains it before this outer call
+        // runs — the callee is loaded before its args (compiler.rs).
+        // Re-derive it HERE, immediately before execution (args are
+        // already evaluated, so nothing can drain it): if the alias on
+        // `func` differs from the resolved name and nothing more
+        // specific is pending, surface the alias. A CallMethod alias
+        // (set just before this call) is already pending and wins.
+        if self.pending_called_name.is_none()
+            && !func.name.eq_ignore_ascii_case(&user_func.name)
+        {
+            self.pending_called_name = Some(Arc::from(func.name.as_str()));
+        }
+        self.pending_fused_parent = Some(fused_parent_plan);
+        #[cfg(feature = "call-phases")]
+        {
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                10, _n.duration_since(_cp_disp).as_nanos() as u64);
+        }
+        let result = self.execute_function_with_args(
+            &user_func,
+            args,
+            Some(parent_locals),
+        );
+        #[cfg(feature = "call-phases")]
+        let _cp_disp = std::time::Instant::now();
+        if let Some(prev) = saved_source_file {
+            self.source_file = prev;
+        }
+        #[cfg(feature = "call-phases")]
+        {
+            let _n = std::time::Instant::now();
+            cfml_common::perf_counters::call_phases::add(
+                11, _n.duration_since(_cp_disp).as_nanos() as u64);
+        }
+        result
+    }
+
+    /// Call a function value. Only the user-function fast path lives here; the
+    /// builtin matching and the VM intercept chain are in
+    /// [`Self::call_function_slow`], kept out of line on purpose. LLVM gives a
+    /// function ONE stack frame sized for its largest branch, so with the
+    /// intercepts inline every CFML call reserved (and page-probed) 12.6 KB of
+    /// native stack here even when it only dispatched a UDF — most of the
+    /// 22.4 KB each CFML call cost.
+    #[inline(never)]
     fn call_function(
+        &mut self,
+        func_ref: &CfmlValue,
+        args: Vec<CfmlValue>,
+        parent_locals: &ValueMap,
+    ) -> CfmlResult {
+        // security.disallowedFunctions must be checked before any dispatch;
+        // when it is configured, the slow path does that and then tries the
+        // fast path itself.
+        let fast_path_tried = self.disallowed_functions.is_empty();
+        if fast_path_tried {
+            if let CfmlValue::Function(func) = func_ref {
+                if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = func.body {
+                    if let CfmlValue::Int(idx) = body.as_ref() {
+                        if let Some(user_func) = self.resolve_fn(*idx) {
+                            return self.call_resolved_user_function(func, user_func, args, parent_locals);
+                        }
+                    }
+                }
+            }
+        }
+        self.call_function_slow(func_ref, args, parent_locals, fast_path_tried)
+    }
+
+    /// `fast_path_tried`: `call_function` already looked for a resolvable
+    /// user function and found none, so the probe is not repeated here.
+    #[inline(never)]
+    fn call_function_slow(
         &mut self,
         func_ref: &CfmlValue,
         mut args: Vec<CfmlValue>,
         parent_locals: &ValueMap,
+        fast_path_tried: bool,
     ) -> CfmlResult {
         #[cfg(feature = "call-phases")]
         let _cp_disp = std::time::Instant::now();
@@ -17352,118 +17546,10 @@ impl CfmlVirtualMachine {
             // Resolution is an O(1) registry index — no hashing — and independent
             // of the active program; an unregistered id yields `None` and falls
             // through to the by-name dispatch below.
-            if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = func.body {
+            if let (false, cfml_common::dynamic::CfmlClosureBody::Expression(ref body)) = (fast_path_tried, &func.body) {
                 if let CfmlValue::Int(idx) = body.as_ref() {
                     if let Some(user_func) = self.resolve_fn(*idx) {
-                        // Handle closure scope merging. A callee's DATA scope is
-                        // its lexical/defining scope (`captured_scope`) — for a
-                        // CFC method that already carries the component's `this`
-                        // /`variables`. The CALL SITE's local data vars must NOT
-                        // leak in (CFML is not dynamically scoped); only helper
-                        // functions are carried so bare-name sibling/var-scoped
-                        // helpers stay callable (PR #198). See
-                        // `build_call_parent_scope`.
-                        // Live lexical parent chain for deferred nested closures.
-                        // Gated to synthesized lexical closures (`__closure_`/
-                        // `__arrow_`) so named functions and CFC methods keep the
-                        // copy-and-writeback path untouched. Must run BEFORE
-                        // `build_call_parent_scope` copies the captured env into the
-                        // callee's locals — otherwise the refresh lands too late to
-                        // be seen by this invocation.
-                        if (func.name.starts_with("__closure_")
-                            || func.name.starts_with("__arrow_"))
-                            && func.captured_scope.is_some()
-                        {
-                            // (1) Refresh this closure's captured env from its
-                            // ancestors so an outer var reassigned by a sibling
-                            // (e.g. a TestBox `beforeEach`) is seen by this deferred
-                            // `it`, which was seeded with a now-stale copy.
-                            // (2) Hand our captured (defining) env down so any env
-                            // this invocation mints links back to it as its parent —
-                            // building the chain (1) walks. Each invocation still owns
-                            // its scope (closure factories stay independent), unlike
-                            // adopting the parent env outright.
-                            self.pending_closure_env = func.captured_scope.clone();
-                        }
-                        let fused_parent_plan = self.fused_call_parent_plan(func, parent_locals);
-                        // Lexical relative-component resolution: while a user
-                        // function runs, a bare createObject("component","X")/
-                        // `new X()` inside it must resolve X relative to the
-                        // package of the file that DEFINES the function, not the
-                        // caller's file. call_member_function does this for
-                        // receiver dispatch (this.m()/child.m(), the #132/#133
-                        // fixes); a BARE call to an inherited method (e.g. a
-                        // child-defined `go()` calling the inherited
-                        // `makeSibling()`) routes here instead, so it needs the
-                        // same swap or it would search the outer frame's dir.
-                        // Skip when the callee carries no source (dynamic
-                        // closures) or already matches the active file — the
-                        // common same-file / self-recursion case pays only a
-                        // cheap comparison, no clone. (Wheels migrator shape:
-                        // migration up() -> inherited createTable() ->
-                        // createObject("TableDefinition").)
-                        // §2.1: a pointer test first. The byte compare of two
-                        // equal ~60-char paths ran on EVERY same-file call (3.6% of
-                        // a UDF→UDF frame); when the paths match but the handles
-                        // differ, adopt the callee's shared handle so the next
-                        // call from this file is a pointer test.
-                        let saved_source_file = match (user_func.source_file_arc_ref(), self.source_file.as_ref()) {
-                            (None, _) => None,
-                            (Some(f), Some(cur)) if Arc::ptr_eq(f, cur) => None,
-                            (Some(f), Some(cur)) if **f == **cur => {
-                                self.source_file = Some(f.clone());
-                                None
-                            }
-                            (Some(f), _) => {
-                                let prev = self.source_file.clone();
-                                self.source_file = Some(f.clone());
-                                Some(prev)
-                            }
-                        };
-                        // Alias attribution for getFunctionCalledName(). The frame's
-                        // called_name falls back to the RESOLVED function's declared
-                        // name (`user_func.name`, keyed by global_id) — but a call
-                        // through an ALIAS carries the alias only on `func_ref.name`
-                        // (set when the callee was loaded, e.g. FW/1 beanProxy's
-                        // `variables.doFront` holding the proxy's `$callPrivateMethod`,
-                        // renamed to "doFront" at resolution). `pending_called_name`
-                        // is the channel for that, but a nested call in an ARGUMENT
-                        // (`doRear(doFront(x))`) drains it before this outer call
-                        // runs — the callee is loaded before its args (compiler.rs).
-                        // Re-derive it HERE, immediately before execution (args are
-                        // already evaluated, so nothing can drain it): if the alias on
-                        // `func` differs from the resolved name and nothing more
-                        // specific is pending, surface the alias. A CallMethod alias
-                        // (set just before this call) is already pending and wins.
-                        if self.pending_called_name.is_none()
-                            && !func.name.eq_ignore_ascii_case(&user_func.name)
-                        {
-                            self.pending_called_name = Some(Arc::from(func.name.as_str()));
-                        }
-                        self.pending_fused_parent = Some(fused_parent_plan);
-                        #[cfg(feature = "call-phases")]
-                        {
-                            let _n = std::time::Instant::now();
-                            cfml_common::perf_counters::call_phases::add(
-                                10, _n.duration_since(_cp_disp).as_nanos() as u64);
-                        }
-                        let result = self.execute_function_with_args(
-                            &user_func,
-                            args,
-                            Some(parent_locals),
-                        );
-                        #[cfg(feature = "call-phases")]
-                        let _cp_disp = std::time::Instant::now();
-                        if let Some(prev) = saved_source_file {
-                            self.source_file = prev;
-                        }
-                        #[cfg(feature = "call-phases")]
-                        {
-                            let _n = std::time::Instant::now();
-                            cfml_common::perf_counters::call_phases::add(
-                                11, _n.duration_since(_cp_disp).as_nanos() as u64);
-                        }
-                        return result;
+                        return self.call_resolved_user_function(func, user_func, args, parent_locals);
                     }
                 }
             }
@@ -24562,7 +24648,15 @@ impl CfmlVirtualMachine {
         name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
-        let name_lower = name.to_lowercase();
+        // Borrow the name when it is already lowercase (nearly always), as
+        // `scope_aware_store` avoids the copy too; it was a String per call.
+        let lower_owned;
+        let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+            lower_owned = name.to_lowercase();
+            &lower_owned
+        } else {
+            name
+        };
         // GH #351: only a frame that owns a function `local` scope resolves the
         // name as a SCOPE. At page level / in a pseudo-constructor Lucee has no
         // local scope, and `local` is an ordinary variable name — fall through.
@@ -28081,6 +28175,25 @@ impl CfmlVirtualMachine {
         }
         seed.thread_name = thread_name;
         seed
+    }
+
+    /// Cooperative cancellation checkpoint, called on every loop back-edge
+    /// (`Jump` backwards, the fused for-loop steps, a backward conditional
+    /// jump, a custom-tag loop). A terminated `cfthread` or a cancelled task
+    /// future stops here. Polling only `Jump` let `for` and `do {} while`
+    /// loops run on after `thread action="terminate"`.
+    ///
+    /// `cancel_flag` is `None` on the main VM, so this is one predictable
+    /// branch; the whole check vanishes without the `real-threads` feature.
+    #[inline(always)]
+    fn poll_cancel(&self) -> Result<(), CfmlError> {
+        #[cfg(feature = "real-threads")]
+        if let Some(flag) = &self.cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(CfmlError::runtime("thread terminated".to_string()));
+            }
+        }
+        Ok(())
     }
 
     /// The `java.lang.Thread` methods that need VM state. The running thread's
@@ -33176,14 +33289,15 @@ impl CfmlVirtualMachine {
             "cookie" => self.globals.get("cookie").cloned(),
             "static" => self.find_static_scope(locals).map(CfmlValue::Struct),
             _ => {
-                // Unscoped: locals (exact then CI), the component `variables`
-                // scope, request, then globals — the variable READ order.
+                // Unscoped: locals, the component `variables` scope, request,
+                // then globals — the variable READ order. Every probe is
+                // case-insensitive already; a second lowercased probe of
+                // `locals` and a scan of the ~730-entry globals table after a
+                // miss could never find anything and ran on every unscoped
+                // `isDefined`/`evaluate` miss.
                 locals
                     .get(root)
                     .cloned()
-                    .or_else(|| {
-                        locals.get(&root_lower).cloned()
-                    })
                     .or_else(|| {
                         locals
                             .get(&*cfml_common::key::well_known::VARIABLES)
@@ -33192,12 +33306,6 @@ impl CfmlVirtualMachine {
                     })
                     .or_else(|| self.request_scope.get_ci(&root_lower))
                     .or_else(|| self.globals.get(root).cloned())
-                    .or_else(|| {
-                        self.globals
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&root_lower))
-                            .map(|(_, v)| v.clone())
-                    })
             }
         }
     }
@@ -36190,17 +36298,11 @@ impl CfmlVirtualMachine {
         }
 
         // Data-only member read (skips the method table) for accessor values.
+        // One case-insensitive probe per map. `iter()` cloned the whole public
+        // map, then the whole private map, on every probe — up to three per
+        // onMissingMethod dispatch.
         let data_get = |name: &str| -> Option<CfmlValue> {
-            this_members
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v)
-                .or_else(|| {
-                    variables_members
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .map(|(_, v)| v)
-                })
+            this_members.data_get(name).or_else(|| variables_members.data_get(name))
         };
 
         // 2. Implicit getX/setX accessors. These exist ONLY for a component
@@ -46068,6 +46170,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value
         BytecodeOp::TryGetProperty(_) => (1, 1), // obj → value (Null-tolerant twin)
+        BytecodeOp::TakeProperty(_) => (1, 1),   // obj → value (moved out when it can be)
         BytecodeOp::LoadStaticHolder(_) => (0, 1), // → holder
         BytecodeOp::GetStaticProperty(_) => (1, 1), // holder → value
         BytecodeOp::LoadLocalProperty(_, _) | BytecodeOp::LoadSlotProperty(..) => (1, 0), // pushes value, reads nothing

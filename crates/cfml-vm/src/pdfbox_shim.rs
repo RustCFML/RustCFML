@@ -128,7 +128,7 @@ pub fn dispatch(
                         CfmlValue::string(p)
                     }
                 };
-                let doc = pdf_read(vec![source]).map_err(|e| io_exception(e.message))?;
+                let doc = pdf_read(vec![source]).map_err(|e| io_exception(e.into_inner().message))?;
                 let mut m = shim(PD_DOCUMENT);
                 m.insert("__doc".to_string(), doc);
                 Ok(CfmlValue::strukt(m))
@@ -238,7 +238,7 @@ pub fn dispatch(
                         CfmlValue::Null,
                         CfmlValue::Bool(true),
                     ])
-                    .map_err(|e| io_exception(e.message))?;
+                    .map_err(|e| io_exception(e.into_inner().message))?;
                 }
                 Ok(CfmlValue::Bool(true))
             }

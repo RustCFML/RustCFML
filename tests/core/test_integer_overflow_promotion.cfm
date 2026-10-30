@@ -59,5 +59,15 @@ assertThrows("Duration.ofDays(i64::MAX)", function() { createObject("java", "jav
 assert("Instant.ofEpochSecond valid", createObject("java", "java.time.Instant").ofEpochSecond(10).toEpochMilli(), 10000);
 assert("Duration.ofDays valid", createObject("java", "java.time.Duration").ofDays(1).toMillis(), 86400000);
 
+// `i64::MIN mod -1` panicked the request (Rust's `%` overflows there) and
+// negating i64::MIN wrapped. Lucee computes both in doubles.
+lo = -9223372036854775807 - 1;
+minusOne = -1;
+assert("i64::MIN mod -1 is 0", lo mod minusOne, 0);
+assert("i64::MIN % -1 is 0", lo % minusOne, 0);
+r = lo; r %= minusOne;
+assert("i64::MIN %= -1 is 0", r, 0);
+assertTrue("-(i64::MIN) is positive, not wrapped", -lo > 0);
+
 suiteEnd();
 </cfscript>

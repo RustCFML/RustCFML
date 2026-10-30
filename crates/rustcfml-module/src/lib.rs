@@ -123,6 +123,9 @@ fn status(code: u32, what: &str) -> Result<()> {
         abi::status::NOT_FOUND => "no such key or index",
         abi::status::BAD_CTX => "the ctx is not valid for this call",
         abi::status::UNSUPPORTED => "this host does not provide that capability",
+        abi::status::UNLOCKED => "the shared scope is not locked; take ctx.lock() before writing it",
+        abi::status::TIMEOUT => "timed out waiting for the lock",
+        abi::status::NO_SCOPE => "no such scope, or no VM in this context",
         _ => "unknown host error",
     };
     Err(Error::expression(format!("{what}: {reason}")))
@@ -564,7 +567,14 @@ pub mod internal {
     /// job takes a few hundred nanoseconds.
     const INLINE_ARGS: usize = 8;
 
-    pub fn with_args<'a, R>(
+    /// Borrow the host's argument array as `Value`s for the duration of `f`.
+    ///
+    /// # Safety
+    /// `args` must point to `argc` initialised `ValueHandle`s that stay valid
+    /// for the call (the host's contract for every shim below), or `argc`
+    /// must be 0. A safe signature here let any caller build a slice from an
+    /// arbitrary pointer.
+    pub unsafe fn with_args<'a, R>(
         ctx: &'a Ctx,
         args: *const ValueHandle,
         argc: usize,
@@ -573,6 +583,7 @@ pub mod internal {
         if argc == 0 {
             return f(&[]);
         }
+        // SAFETY: the caller guarantees `args` points to `argc` live handles.
         let handles = unsafe { core::slice::from_raw_parts(args, argc) };
         if argc <= INLINE_ARGS {
             // Build on the stack. `Value` is Copy and two words wide, so a
@@ -676,12 +687,19 @@ unsafe extern "C-unwind" fn vt_call_method<C: NativeClass>(
     })
 }
 
+// The three plain `extern "C"` entries below (`method_params`, `drop_fn` for
+// a class and a driver) run module code with no host `with_call` backstop,
+// and unwinding out of an `extern "C"` fn aborts the process. Each catches a
+// panic itself, so a panicking `Drop` or `method_params` cannot take the
+// server down. (`class_name` returns a constant and cannot panic.)
+
 unsafe extern "C" fn vt_method_params<C: NativeClass>(
     _data: *mut c_void,
     name: StrRef,
     out: *mut StrRef,
 ) -> u32 {
-    match C::method_params(name.as_str()) {
+    let declared = std::panic::catch_unwind(|| C::method_params(name.as_str())).unwrap_or(None);
+    match declared {
         Some(list) => {
             *out = StrRef::new(list);
             abi::status::OK
@@ -737,7 +755,10 @@ unsafe extern "C-unwind" fn vt_set_property<C: NativeClass>(
 
 unsafe extern "C" fn vt_drop<C: NativeClass>(data: *mut c_void) {
     if !data.is_null() {
-        drop(Box::from_raw(data as *mut C));
+        let boxed = Box::from_raw(data as *mut C);
+        // A panic in `Drop for C` is reported by the panic hook and otherwise
+        // ignored: there is no caller to hand an error to.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(boxed)));
     }
 }
 
@@ -777,8 +798,8 @@ unsafe extern "C-unwind" fn drv_begin<D: DbDriver>(
     let ctx = Ctx::from_raw(raw);
     let this = &*(data as *const D);
     match this.begin(&ctx, isolation.as_str()) {
-        // The decl only advertises `begin` when D overrides it, so reaching
-        // here with None means the driver changed its mind at runtime.
+        // A driver that left `begin` at its default but did not set
+        // `SUPPORTS_TRANSACTIONS = false` still advertises the entry.
         None => raise(raw, &Error::new("this driver does not support transactions")),
         Some(Err(e)) => raise(raw, &e),
         Some(Ok(txn)) => {
@@ -865,7 +886,9 @@ unsafe extern "C-unwind" fn drv_dbinfo<D: DbDriver>(
 
 unsafe extern "C" fn drv_drop<D: DbDriver>(data: *mut c_void) {
     if !data.is_null() {
-        drop(Box::from_raw(data as *mut D));
+        let boxed = Box::from_raw(data as *mut D);
+        // See `vt_drop`: a panicking `Drop` must not unwind out of `extern "C"`.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(boxed)));
     }
 }
 
@@ -895,11 +918,11 @@ impl<D: DbDriver> DrvVt<D> {
     pub const TABLE: abi::DbDriverVtable = abi::DbDriverVtable {
         size: core::mem::size_of::<abi::DbDriverVtable>(),
         execute: drv_execute::<D>,
-        begin: Some(drv_begin::<D>),
-        txn_execute: Some(drv_txn_execute::<D>),
-        txn_commit: Some(drv_txn_commit::<D>),
-        txn_rollback: Some(drv_txn_rollback::<D>),
-        txn_savepoint: Some(drv_txn_savepoint::<D>),
+        begin: if D::SUPPORTS_TRANSACTIONS { Some(drv_begin::<D>) } else { None },
+        txn_execute: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_execute::<D>) } else { None },
+        txn_commit: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_commit::<D>) } else { None },
+        txn_rollback: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_rollback::<D>) } else { None },
+        txn_savepoint: if D::SUPPORTS_TRANSACTIONS { Some(drv_txn_savepoint::<D>) } else { None },
         dbinfo: Some(drv_dbinfo::<D>),
         drop_fn: drv_drop::<D>,
     };
@@ -974,6 +997,13 @@ pub trait DbDriver: Send + Sync + Sized + 'static {
         params: Value<'a>,
         return_type: &str,
     ) -> Result<Value<'a>>;
+
+    /// Whether this driver implements [`DbDriver::begin`]. The method table
+    /// only advertises the transaction entries when this is `true`, so the
+    /// host can tell a driver without transactions from one with them.
+    /// Defaults to `true` so existing drivers that override `begin` keep
+    /// working; a driver with no transactions should set it to `false`.
+    const SUPPORTS_TRANSACTIONS: bool = true;
 
     /// Open a transaction. `None` — the default — means this driver has none,
     /// and `transaction { }` against it reports that rather than silently

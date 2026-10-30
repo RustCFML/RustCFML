@@ -218,7 +218,7 @@ pub fn dispatch(
                 };
 
                 let img = read_svg(vec![CfmlValue::string(src.clone()), width, height])
-                    .map_err(|e| transcoder_exception(e.message))?;
+                    .map_err(|e| transcoder_exception(e.into_inner().message))?;
                 write_image(vec![
                     img,
                     CfmlValue::string(dest),
@@ -227,7 +227,7 @@ pub fn dispatch(
                     CfmlValue::Null,
                     CfmlValue::Bool(true),
                 ])
-                .map_err(|e| transcoder_exception(e.message))?;
+                .map_err(|e| transcoder_exception(e.into_inner().message))?;
                 Ok(CfmlValue::Null)
             }
             other => Err(unsupported(

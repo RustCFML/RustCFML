@@ -350,16 +350,10 @@ impl AsRef<str> for Key {
     }
 }
 
-impl std::borrow::Borrow<str> for Key {
-    /// Only for `&str`-keyed *side* structures that a caller builds from
-    /// `Key`s; it is NOT used for `ValueMap` lookups (which go through
-    /// [`KeyRef`]), because `str`'s own `Hash` is case-sensitive and would not
-    /// agree with [`Key::hash`].
-    #[inline]
-    fn borrow(&self) -> &str {
-        &self.name
-    }
-}
+// No `Borrow<str>`: `Borrow` requires `Hash`/`Eq`/`Ord` to agree with the
+// borrowed form, and `Key` hashes and compares case-folded while `str` does
+// not, so a `HashMap<Key, V>::get("foo")` would compile and never match.
+// `Deref<Target = str>` and `AsRef<str>` cover reading the name.
 
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -436,10 +430,13 @@ impl<'a> KeyRef<'a> {
         self.name
     }
 
-    /// Promote to an owned [`Key`], reusing the already-computed hash.
+    /// Promote to an owned [`Key`], reusing the already-computed hash. Interned
+    /// like [`Key::new`]: this is the first-write path of every `&str` insert,
+    /// and a private `Arc` here skipped both the dedup and `Key::eq`'s
+    /// pointer-equality fast path for exactly those keys.
     #[inline]
     pub fn to_key(&self) -> Key {
-        Key { hash: self.hash, name: Arc::from(self.name) }
+        Key { hash: self.hash, name: intern::intern(self.name, self.hash) }
     }
 }
 

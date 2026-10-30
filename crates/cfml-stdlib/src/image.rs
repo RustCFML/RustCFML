@@ -19,7 +19,7 @@
 
 use crate::builtins::{base64_decode_bytes, base64_encode_bytes};
 use cfml_common::dynamic::{CfmlNative, CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use std::io::Cursor;
 use std::sync::{Arc, RwLock};
@@ -127,6 +127,21 @@ impl CfmlImage {
 impl CfmlNative for CfmlImage {
     fn class_name(&self) -> &str {
         "Image"
+    }
+
+    /// `img.width`, `img.height`, `img.colormodel`, `img.source`: Lucee reads
+    /// an image like a struct of these four `imageInfo` keys.
+    fn get_property(&self, name: &str) -> Option<CfmlValue> {
+        match name.to_ascii_lowercase().as_str() {
+            "width" => Some(CfmlValue::Int(self.img.width() as i64)),
+            "height" => Some(CfmlValue::Int(self.img.height() as i64)),
+            "source" => Some(CfmlValue::string(self.source.clone())),
+            "colormodel" => match self.info_struct() {
+                CfmlValue::Struct(s) => s.get("colormodel"),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
@@ -430,6 +445,7 @@ pub fn fn_image_new(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn make_blank(w: u32, h: u32, img_type: &str, canvas: &str) -> Result<CfmlImage, CfmlError> {
+    let (w, h) = check_canvas(w as i64, h as i64)?;
     let color = if canvas.trim().is_empty() {
         None
     } else {
@@ -744,10 +760,18 @@ impl CfmlImage {
 
     /// crop(x, y, width, height)
     fn crop(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
-        let x = int_arg(a.first(), "x")? as u32;
-        let y = int_arg(a.get(1), "y")? as u32;
-        let w = int_arg(a.get(2), "width")? as u32;
-        let h = int_arg(a.get(3), "height")? as u32;
+        let x = int_arg(a.first(), "x")?;
+        let y = int_arg(a.get(1), "y")?;
+        let w = int_arg(a.get(2), "width")?;
+        let h = int_arg(a.get(3), "height")?;
+        for (v, pos, name) in [(w, "third", "width"), (h, "fourth", "height")] {
+            if v < 0 {
+                return Err(CfmlError::expression(format!(
+                    "Invalid call of the function [ImageCrop], {pos} Argument [{name}] is invalid, {name} must contain a none negative value"
+                )));
+            }
+        }
+        let (x, y, w, h) = clip_rect(x, y, w, h, self.img.width(), self.img.height())?;
         self.img = self.img.crop_imm(x, y, w, h);
         Ok(())
     }
@@ -1064,7 +1088,7 @@ impl CfmlImage {
 
     fn draw_rect(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
         let (x, y) = (int_arg(a.first(), "x")? as i32, int_arg(a.get(1), "y")? as i32);
-        let (w, h) = (int_arg(a.get(2), "width")? as u32, int_arg(a.get(3), "height")? as u32);
+        let (w, h) = (sat_u32(int_arg(a.get(2), "width")?), sat_u32(int_arg(a.get(3), "height")?));
         let filled = a.get(4).map(|v| v.is_true()).unwrap_or(false);
         let color = self.draw.rgba();
         let offs = self.stroke_offsets();
@@ -1296,7 +1320,7 @@ impl CfmlImage {
     /// clearRect(x, y, width, height) — fill with the background colour.
     fn clear_rect(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
         let (x, y) = (int_arg(a.first(), "x")? as i32, int_arg(a.get(1), "y")? as i32);
-        let (w, h) = (int_arg(a.get(2), "width")? as u32, int_arg(a.get(3), "height")? as u32);
+        let (w, h) = (sat_u32(int_arg(a.get(2), "width")?), sat_u32(int_arg(a.get(3), "height")?));
         let bg = self.draw.background;
         let color = Rgba([bg[0], bg[1], bg[2], 255]);
         self.with_canvas(|c| {
@@ -1338,10 +1362,12 @@ impl CfmlImage {
 
     /// copy(x, y, width, height [, dx, dy]) — copy a region to (dx, dy).
     fn copy_region(&mut self, a: &[CfmlValue]) -> Result<(), CfmlError> {
-        let x = int_arg(a.first(), "x")? as u32;
-        let y = int_arg(a.get(1), "y")? as u32;
-        let w = int_arg(a.get(2), "width")? as u32;
-        let h = int_arg(a.get(3), "height")? as u32;
+        // Clamped like a crop (Lucee accepts a negative origin here too);
+        // `crop_imm` clips the size to the image.
+        let x = sat_u32(int_arg(a.first(), "x")?);
+        let y = sat_u32(int_arg(a.get(1), "y")?);
+        let w = sat_u32(int_arg(a.get(2), "width")?);
+        let h = sat_u32(int_arg(a.get(3), "height")?);
         let dx = a.get(4).map(|v| int_arg(Some(v), "dx")).transpose()?.unwrap_or(x as i64);
         let dy = a.get(5).map(|v| int_arg(Some(v), "dy")).transpose()?.unwrap_or(y as i64);
         let mut base = self.img.to_rgba8();
@@ -1365,7 +1391,8 @@ impl CfmlImage {
         };
         let src = self.img.to_rgba8();
         let (w, h) = (src.width(), src.height());
-        let mut out = RgbaImage::from_pixel(w + 2 * t, h + 2 * t, color);
+        let (ow, oh) = check_canvas(w as i64 + 2 * t as i64, h as i64 + 2 * t as i64)?;
+        let mut out = RgbaImage::from_pixel(ow, oh, color);
         image::imageops::overlay(&mut out, &src, t as i64, t as i64);
         self.img = DynamicImage::ImageRgba8(out);
         Ok(())
@@ -1823,6 +1850,42 @@ fn resolve_dimension(v: Option<&CfmlValue>, current: u32, label: &str) -> Result
     Ok(n.round() as i64)
 }
 
+/// A user coordinate or size as `u32` for a drawing call that clips to the
+/// canvas. `as u32` wrapped a negative into ~4 billion.
+fn sat_u32(v: i64) -> u32 {
+    v.clamp(0, u32::MAX as i64) as u32
+}
+
+/// Refuse a canvas Java could not allocate, with Lucee's message: Java caps a
+/// raster at `Integer.MAX_VALUE` pixels and reports the int-saturated sizes
+/// (`imageResize(img, 1e12, 5)` names width 2147483647). Without this a
+/// wrapped or huge size reached the allocator and took the process down.
+fn check_canvas(w: i64, h: i64) -> Result<(u32, u32), CfmlError> {
+    let (w, h) = (w.clamp(0, i32::MAX as i64), h.clamp(0, i32::MAX as i64));
+    if w.saturating_mul(h) > i32::MAX as i64 {
+        return Err(CfmlError::new(
+            format!("Dimensions (width={w} height={h}) are too large"),
+            CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
+        ));
+    }
+    Ok((w as u32, h as u32))
+}
+
+/// Lucee's crop rectangle: a negative origin is clamped to the edge, the size
+/// is clipped to the image, and an empty result throws.
+fn clip_rect(x: i64, y: i64, w: i64, h: i64, img_w: u32, img_h: u32) -> Result<(u32, u32, u32, u32), CfmlError> {
+    let (x, y) = (x.max(0), y.max(0));
+    let w = w.min(img_w as i64 - x);
+    let h = h.min(img_h as i64 - y);
+    if w <= 0 || h <= 0 {
+        return Err(CfmlError::new(
+            format!("Width ({w}) and height ({h}) cannot be <= 0"),
+            CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
+        ));
+    }
+    Ok((x as u32, y as u32, w as u32, h as u32))
+}
+
 /// Apply Lucee's aspect-preservation rule when exactly one of w/h is the -1
 /// sentinel.
 fn fill_aspect(w: i64, h: i64, cur_w: u32, cur_h: u32) -> Result<(u32, u32), CfmlError> {
@@ -1837,7 +1900,7 @@ fn fill_aspect(w: i64, h: i64, cur_w: u32, cur_h: u32) -> Result<(u32, u32), Cfm
         (w, -1) => (w, ((ch / cw) * w as f64).round() as i64),
         (w, h) => (w, h),
     };
-    Ok((w.max(1) as u32, h.max(1) as u32))
+    check_canvas(w.max(1), h.max(1))
 }
 
 fn dim_or_max(v: Option<&CfmlValue>) -> Result<u32, CfmlError> {

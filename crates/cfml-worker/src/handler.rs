@@ -29,6 +29,21 @@ use worker::*;
 ///     cfml_worker::handle_fetch(req, env, ctx, &config).await
 /// }
 /// ```
+/// A plain-text 500. The detail (the engine's error, its `Debug` form, the
+/// page output so far) is always logged, but only reaches the client outside
+/// `production_mode`, as the native server shows it only with debugging on.
+fn error_500(config: &WorkerConfig, public: &str, detail: &str) -> Result<Response> {
+    worker::console_error!("{public}: {detail}");
+    let body = if config.production_mode {
+        format!("{public}. The server encountered an error processing your request.")
+    } else {
+        format!("{public}:\n\n{detail}")
+    };
+    let headers = Headers::new();
+    let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
+    Ok(Response::ok(body)?.with_status(500).with_headers(headers))
+}
+
 pub async fn handle_fetch(
     mut req: Request,
     _env: Env,
@@ -66,7 +81,7 @@ pub async fn handle_fetch(
     let (globals, http_request_data) =
         match scopes::build_from_request(&mut req, &script_name, &path_info).await {
             Ok(p) => p,
-            Err(e) => return Response::error(format!("scope build error: {e:?}"), 500),
+            Err(e) => return error_500(config, "Request could not be read", &format!("{e:?}")),
         };
 
     // Discover session id from the cookie scope. We DON'T mint a fresh
@@ -154,21 +169,11 @@ pub async fn handle_fetch(
         session_id: cookie_session_id.clone(),
     });
     if let Err(msg) = crate::jspi::invoke_run_sync().await {
-        let headers = Headers::new();
-        let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
-        return Ok(Response::ok(format!("CFML dispatch error:\n\n{msg}"))?
-            .with_status(500)
-            .with_headers(headers));
+        return error_500(config, "CFML dispatch error", &msg);
     }
     let response_data = match crate::sync_runner::take_result() {
         Some(Ok(r)) => r,
-        Some(Err(msg)) => {
-            let headers = Headers::new();
-            let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
-            return Ok(Response::ok(format!("CFML error:\n\n{msg}"))?
-                .with_status(500)
-                .with_headers(headers));
-        }
+        Some(Err(msg)) => return error_500(config, "CFML error", &msg),
         None => {
             let headers = Headers::new();
             let _ = headers.set("Content-Type", "text/plain; charset=utf-8");

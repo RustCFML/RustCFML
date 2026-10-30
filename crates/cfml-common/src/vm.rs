@@ -9,8 +9,48 @@ pub type CfmlResult = Result<CfmlValue, CfmlError>;
 /// it is consumed by the VM's java-shim dispatch and never escapes.
 const SHIM_UNHANDLED_TYPE: &str = "__rustcfml_shim_unhandled__";
 
+/// An engine error. One pointer wide: the fields live in a [`CfmlErrorInner`]
+/// box and are reached through `Deref`/`DerefMut`, so `e.message` reads and
+/// writes as before.
+///
+/// Inline, the struct was 80 bytes, which made every `CfmlResult` 80 bytes and
+/// every by-value hand-off of an error (`catch_op_error(e)`,
+/// `route_call_error(e)`) an 80-byte stack slot. rustc gives such argument
+/// copies no lifetime markers, so LLVM could not share them: they were 3 KB of
+/// the dispatch loop's frame, paid by every CFML call for errors that almost
+/// never happen. Boxed, an error costs one allocation when it is raised.
+#[derive(Clone)]
+pub struct CfmlError(Box<CfmlErrorInner>);
+
+impl std::ops::Deref for CfmlError {
+    type Target = CfmlErrorInner;
+    #[inline]
+    fn deref(&self) -> &CfmlErrorInner {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CfmlError {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut CfmlErrorInner {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for CfmlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CfmlError")
+            .field("message", &self.message)
+            .field("error_type", &self.error_type)
+            .field("stack_trace", &self.stack_trace)
+            .field("extras", &self.extras)
+            .finish()
+    }
+}
+
+/// The fields of a [`CfmlError`].
 #[derive(Debug, Clone)]
-pub struct CfmlError {
+pub struct CfmlErrorInner {
     pub message: String,
     pub error_type: CfmlErrorType,
     pub stack_trace: Vec<StackFrame>,
@@ -27,7 +67,7 @@ pub struct CfmlError {
     pub extras: Option<Box<ValueMap>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfmlErrorType {
     Runtime,
     Compile,
@@ -46,12 +86,18 @@ pub struct StackFrame {
 
 impl CfmlError {
     pub fn new(message: String, error_type: CfmlErrorType) -> Self {
-        Self {
+        Self(Box::new(CfmlErrorInner {
             message,
             error_type,
             stack_trace: Vec::new(),
             extras: None,
-        }
+        }))
+    }
+
+    /// Take the fields out by value.
+    #[inline]
+    pub fn into_inner(self) -> CfmlErrorInner {
+        *self.0
     }
 
     /// Attach (or merge into) the structured `cfcatch` extras — see
@@ -221,6 +267,10 @@ impl std::fmt::Display for CfmlErrorType {
         }
     }
 }
+
+/// Lets a `CfmlError` be boxed as `dyn Error`, chained as a `source()` and
+/// `?`-converted by host code (the CLI, an embedder).
+impl std::error::Error for CfmlError {}
 
 impl std::fmt::Display for CfmlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -400,6 +400,9 @@ impl<K: IntoKey> FromIterator<(K, CfmlValue)> for ValueMap {
 
 impl<K: IntoKey> Extend<(K, CfmlValue)> for ValueMap {
     fn extend<I: IntoIterator<Item = (K, CfmlValue)>>(&mut self, iter: I) {
+        // Every `&mut` path bumps `version()`; callers treat an unchanged
+        // version as "no mutation" and skip a write-back.
+        self.1 = self.1.wrapping_add(1);
         self.0.extend(iter.into_iter().map(|(k, v)| (k.into_key(), v)));
     }
 }
@@ -427,6 +430,8 @@ impl<'a> IntoIterator for &'a mut ValueMap {
     type IntoIter = indexmap::map::IterMut<'a, Key, CfmlValue>;
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
+        // Hands out `&mut` values: assume a mutation, as `DerefMut` does.
+        self.1 = self.1.wrapping_add(1);
         self.0.iter_mut()
     }
 }
@@ -612,7 +617,9 @@ impl CfmlArray {
         if idx < g.len() {
             g[idx] = value;
         } else {
-            let grow = idx - g.len() + 1;
+            // Saturating: `idx == usize::MAX` (reachable on 32-bit wasm) made
+            // `+ 1` wrap to 0, slip past the cap, and `resize` abort.
+            let grow = (idx - g.len()).saturating_add(1);
             if grow > crate::container_size::MAX_GROW_PER_CALL {
                 return Err(CfmlError::expression(format!(
                     "can not set Element at position [{}]: growing the array by [{}] elements \
@@ -1956,11 +1963,15 @@ impl CfmlStruct {
     /// `key` currently holds one; `None` (and no change) otherwise. Used by the
     /// `x &= <simple>` move-out load so the concat appends to a uniquely-owned
     /// buffer; the store that follows puts the result back under the same key.
+    ///
+    /// No `shape_id` bump: the key set is unchanged, and the store that follows
+    /// writes the same key back (S6 — an `&=` loop must not look structural).
     pub fn take_if_string(&self, key: impl ProbeKey) -> Option<CfmlValue> {
-        self.with_write(|m| match m.get_mut(key) {
+        let mut g = self.0.write();
+        match g.map.get_mut(key) {
             Some(v) if matches!(v, CfmlValue::String(_)) => Some(std::mem::replace(v, CfmlValue::Null)),
             _ => None,
-        })
+        }
     }
 
     pub fn with_write<R>(&self, f: impl FnOnce(&mut ValueMap) -> R) -> R {
@@ -2291,12 +2302,20 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Function(fun) => f.debug_tuple("Function").field(fun).finish(),
             CfmlValue::Query(q) => f.debug_tuple("Query").field(q).finish(),
             CfmlValue::Binary(b) => f.debug_tuple("Binary").field(b).finish(),
-            CfmlValue::NativeObject(obj) => match obj.read() {
+            // `try_read`: `call_method` runs under the write lock, so a native
+            // that formats itself (or a value holding it) would deadlock on a
+            // blocking `read()` from the same thread.
+            CfmlValue::NativeObject(obj) => match obj.try_read() {
                 Ok(g) => f
                     .debug_tuple("NativeObject")
                     .field(&g.class_name().to_string())
                     .finish(),
-                Err(_) => f.debug_tuple("NativeObject").field(&"<poisoned>").finish(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    f.debug_tuple("NativeObject").field(&"<busy>").finish()
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    f.debug_tuple("NativeObject").field(&"<poisoned>").finish()
+                }
             },
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => f.debug_tuple("Instance").field(inst).finish(),
@@ -2923,9 +2942,14 @@ impl CfmlValue {
             CfmlValue::Function(f) => (f.name.clone(), true),
             CfmlValue::Query(_) => ("<Query>".to_string(), true),
             CfmlValue::Binary(_) => ("<Binary>".to_string(), true),
-            CfmlValue::NativeObject(obj) => match obj.read() {
+            // `try_read` for the same reason as `Debug`: this can run while the
+            // object's own method holds its write lock.
+            CfmlValue::NativeObject(obj) => match obj.try_read() {
                 Ok(g) => (format!("<NativeObject:{}>", g.class_name()), true),
-                Err(_) => ("<NativeObject:poisoned>".to_string(), true),
+                Err(std::sync::TryLockError::WouldBlock) => ("<NativeObject>".to_string(), true),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    ("<NativeObject:poisoned>".to_string(), true)
+                }
             },
             // Same bounded token as a marker-struct component (which returns
             // "<Component>" via the is_component_backing branch above) — never a
@@ -3559,7 +3583,12 @@ impl CfmlValue {
             (CfmlValue::Bool(a), CfmlValue::Bool(b)) => a == b,
             (CfmlValue::Int(a), CfmlValue::Int(b)) => a == b,
             (CfmlValue::Double(a), CfmlValue::Double(b)) => a == b,
-            (CfmlValue::String(a), CfmlValue::String(b)) => a.to_lowercase() == b.to_lowercase(),
+            // Same Unicode lowercasing as `to_lowercase() ==`, compared lazily
+            // instead of allocating two folded copies.
+            (CfmlValue::String(a), CfmlValue::String(b)) => a
+                .chars()
+                .flat_map(char::to_lowercase)
+                .eq(b.chars().flat_map(char::to_lowercase)),
             (CfmlValue::Int(a), CfmlValue::Double(b)) => *a as f64 == *b,
             (CfmlValue::Double(a), CfmlValue::Int(b)) => *a == *b as f64,
             (CfmlValue::Array(a), CfmlValue::Array(b)) => {
@@ -4504,11 +4533,22 @@ mod size_probe {
         // `Query(CfmlQuery)` (72 B) — dropping the enum to 32 B, now floored
         // by `String(String)` (24 B) + discriminant. The next planned shrink
         // (interning idents / `String(Arc<str>)`, PR-B) could take it to ~24 B.
+        // `String(Arc<str>)` landed: 24 B since.
         assert!(
-            cfml_value <= 32,
-            "CfmlValue grew to {cfml_value} B (ceiling 32 B) — a perf regression. \
+            cfml_value <= 24,
+            "CfmlValue grew to {cfml_value} B (ceiling 24 B) — a perf regression. \
              If intentional, justify and raise the ceiling."
         );
+
+        // A boxed error keeps `CfmlResult` the size of a value: an inline
+        // 80-byte `CfmlError` made every result 80 bytes and pinned ~3 KB of
+        // error slots in the dispatch loop's frame (see `CfmlError`).
+        let err = size_of::<crate::vm::CfmlError>();
+        let res = size_of::<crate::vm::CfmlResult>();
+        eprintln!("size_of::<CfmlError>()      = {err} B");
+        eprintln!("size_of::<CfmlResult>()     = {res} B");
+        assert_eq!(err, size_of::<usize>(), "CfmlError must stay one pointer");
+        assert!(res <= 24, "CfmlResult grew to {res} B (ceiling 24 B)");
     }
 }
 
