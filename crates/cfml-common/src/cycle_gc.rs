@@ -1425,8 +1425,12 @@ pub fn collect() -> usize {
     // Survivors are carried into the cross-request set rather than abandoned —
     // see [`PersistentSet`] for why dropping them was a permanent loss of
     // tracking, and for the sweep's cost and correctness argument.
-    let mut live: Vec<(usize, TrackedAlloc)> = Vec::new();
+    // Sized from the previous collect's survivor count: this vector grew by
+    // doubling through its ~10k pushes on every Preside render (~1.9 MiB of
+    // realloc churn per request).
+    let mut live: Vec<(usize, TrackedAlloc)> = Vec::with_capacity(LAST_SURVIVORS.with(|c| c.get()));
     let reclaimed = collect_from_log_carrying(log, Some(&mut live));
+    LAST_SURVIVORS.with(|c| c.set(live.len().min(SPARE_CAP)));
     RELOG_SEEN.with(|c| trim_set(&mut c.borrow_mut()));
     reclaimed + carry_survivors(live)
 }
@@ -1600,8 +1604,10 @@ pub fn collect_incremental() -> usize {
     // distinct live node — and must not be re-entered from the raw log: doing
     // so once inflated `live` to 15.8M for ~260k nodes and stopped all sweeps
     // for the rest of a request (known-issues §81).
-    let mut survivors: Vec<(usize, TrackedAlloc)> = Vec::new();
+    let mut survivors: Vec<(usize, TrackedAlloc)> =
+        Vec::with_capacity(LAST_SURVIVORS.with(|c| c.get()));
     let reclaimed = collect_from_log_carrying(log, Some(&mut survivors));
+    LAST_SURVIVORS.with(|c| c.set(survivors.len().min(SPARE_CAP)));
     let promoted = survivors.len();
     let old_now = OLD_LOG.with(|c| {
         let mut o = c.borrow_mut();
@@ -2100,6 +2106,9 @@ struct CollectScratch {
 
 thread_local! {
     static COLLECT_SCRATCH: RefCell<CollectScratch> = RefCell::new(CollectScratch::default());
+    /// Survivor count of this thread's last collect — the initial capacity of
+    /// the next collect's carry vector.
+    static LAST_SURVIVORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Holds the thread's scratch for the duration of one collect and returns

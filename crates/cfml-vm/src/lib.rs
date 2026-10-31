@@ -5361,8 +5361,28 @@ const PERM_EXTRA: u32 = u32::MAX;
 const PERM_POSITIONAL: u32 = u32::MAX - 1;
 const NAMED_PERM_CACHE_CAP: usize = 65_536;
 
+/// The `f(argumentCollection=someStruct)` twin of [`NamedPerm`]: the
+/// collection's keys in iteration order and the parameter slot of each. On
+/// Preside every other named call is `argumentCollection=arguments`
+/// (~5,000 per admin render), and each one re-walked the struct, parsed
+/// every key as a number, hashed every parameter name and built three
+/// scratch vectors. A hit compares the struct's keys to the cached ones in
+/// order (hash, then pointer — `arguments` scopes carry interned keys) and
+/// binds straight from the map. Only the pure shape is cached: a single
+/// `argumentCollection` argument whose value is a struct with no numeric
+/// keys; anything else takes the general path.
+struct CollPerm {
+    gid: i64,
+    n_params: usize,
+    n_extras: usize,
+    keys: Box<[cfml_common::key::Key]>,
+    slots: Box<[u32]>,
+}
+
 thread_local! {
     static NAMED_PERM_CACHE: std::cell::RefCell<HashMap<usize, NamedPerm>> =
+        std::cell::RefCell::new(HashMap::new());
+    static NAMED_COLL_CACHE: std::cell::RefCell<HashMap<usize, CollPerm>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
@@ -9390,6 +9410,7 @@ impl CfmlVirtualMachine {
     #[cfg(feature = "scope-pool")]
     #[inline]
     fn take_locals_map(&mut self, cap: usize) -> ValueMap {
+        use cfml_common::perf_counters as pc;
         match self.locals_pool.pop() {
             Some(mut m) => {
                 // §2.1: a pooled map is cleared, not shrunk — `reserve` on one
@@ -9397,10 +9418,20 @@ impl CfmlVirtualMachine {
                 if m.capacity() < cap {
                     let need = cap.saturating_sub(m.len());
                     m.reserve(need);
+                    if pc::enabled() {
+                        pc::bump(&pc::LOCALS_POOL_GROW);
+                    }
+                } else if pc::enabled() {
+                    pc::bump(&pc::LOCALS_POOL_HIT);
                 }
                 m
             }
-            None => ValueMap::with_capacity_and_hasher(cap, Default::default()),
+            None => {
+                if pc::enabled() {
+                    pc::bump(&pc::LOCALS_POOL_MISS);
+                }
+                ValueMap::with_capacity_and_hasher(cap, Default::default())
+            }
         }
     }
 
@@ -9649,9 +9680,15 @@ impl CfmlVirtualMachine {
     #[cfg(feature = "scope-pool")]
     #[inline]
     fn recycle_locals_map(&mut self, mut m: ValueMap) {
+        use cfml_common::perf_counters as pc;
         if self.locals_pool.len() < 128 {
             m.clear();
             self.locals_pool.push(m);
+            if pc::enabled() {
+                pc::bump(&pc::LOCALS_POOL_RECYCLED);
+            }
+        } else if pc::enabled() {
+            pc::bump(&pc::LOCALS_POOL_DROPPED);
         }
     }
 
@@ -27759,6 +27796,56 @@ impl CfmlVirtualMachine {
                 return bound;
             }
         }
+        let collection_only = has_collection && arg_names.len() == 1 && gid >= 0;
+        if collection_only {
+            if let Some(CfmlValue::Struct(coll)) = arg_values.first() {
+                let fast = NAMED_COLL_CACHE.with(|c| {
+                    let c = c.borrow();
+                    let p = c.get(&site)?;
+                    if p.gid != gid || p.n_params != func.params.len() {
+                        return None;
+                    }
+                    coll.with_map(|m| {
+                        if m.len() != p.keys.len() {
+                            return None;
+                        }
+                        for (i, (k, _)) in m.iter().enumerate() {
+                            if k != &p.keys[i] {
+                                return None;
+                            }
+                        }
+                        for (i, &slot) in p.slots.iter().enumerate() {
+                            if slot < PERM_POSITIONAL
+                                && !func.params[slot as usize].name.eq_ignore_ascii_case(p.keys[i].as_str())
+                            {
+                                return None;
+                            }
+                        }
+                        let mut positional: Vec<CfmlValue> = Vec::with_capacity(func.params.len() + p.n_extras);
+                        positional.resize(func.params.len(), CfmlValue::Null);
+                        let mut extras: Vec<(usize, String)> = Vec::with_capacity(p.n_extras);
+                        for (i, (_, v)) in m.iter().enumerate() {
+                            match p.slots[i] {
+                                PERM_EXTRA => {
+                                    let idx = positional.len();
+                                    positional.push(v.clone());
+                                    extras.push((idx, p.keys[i].as_str().to_string()));
+                                }
+                                slot => positional[slot as usize] = v.clone(),
+                            }
+                        }
+                        Some((positional, extras))
+                    })
+                });
+                if cfml_common::perf_counters::enabled() {
+                    use cfml_common::perf_counters as pc;
+                    pc::bump(if fast.is_some() { &pc::NAMED_ARGS_COLL_HIT } else { &pc::NAMED_ARGS_COLL_MISS });
+                }
+                if let Some(bound) = fast {
+                    return bound;
+                }
+            }
+        }
         // Per-call cost used to be one lowercase `String` per collection key,
         // one `String` clone per expanded name, a `HashSet<String>` of the
         // explicit names, and a quadratic case-insensitive string scan to map
@@ -27804,6 +27891,8 @@ impl CfmlVirtualMachine {
         let mut expanded: Vec<(Name<'_>, CfmlValue)> = Vec::with_capacity(arg_names.len());
         let mut numeric_positional: Vec<(usize, CfmlValue)> = Vec::new();
         let mut perm: Vec<u32> = if cacheable { Vec::with_capacity(arg_names.len()) } else { Vec::new() };
+        let mut coll_rec: Vec<(Key, u32)> = Vec::new();
+        let mut coll_cacheable = collection_only;
         for (i, name) in arg_names.iter().enumerate() {
             let value = arg_values.get_mut(i).map(std::mem::take).unwrap_or(CfmlValue::Null);
             if name.eq_ignore_ascii_case("argumentcollection") {
@@ -27813,6 +27902,7 @@ impl CfmlVirtualMachine {
                         for (k, v) in m.iter() {
                             if let Ok(pos) = k.as_str().parse::<usize>() {
                                 if pos >= 1 {
+                                    coll_cacheable = false;
                                     numeric_positional.push((pos - 1, v.clone()));
                                     continue;
                                 }
@@ -27826,6 +27916,7 @@ impl CfmlVirtualMachine {
                     continue;
                 }
                 if let CfmlValue::Array(items) = &value {
+                    coll_cacheable = false;
                     for (idx, v) in items.iter().enumerate() {
                         numeric_positional.push((idx, v));
                     }
@@ -27884,6 +27975,11 @@ impl CfmlVirtualMachine {
                     if cacheable {
                         perm.push(param_index as u32);
                     }
+                    if coll_cacheable {
+                        if let Name::Owned(k) = &name {
+                            coll_rec.push((k.clone(), param_index as u32));
+                        }
+                    }
                 }
                 None => {
                     let idx = positional.len();
@@ -27892,8 +27988,33 @@ impl CfmlVirtualMachine {
                     if cacheable {
                         perm.push(PERM_EXTRA);
                     }
+                    if coll_cacheable {
+                        if let Name::Owned(k) = &name {
+                            coll_rec.push((k.clone(), PERM_EXTRA));
+                        }
+                    }
                 }
             }
+        }
+        if coll_cacheable && !coll_rec.is_empty() {
+            NAMED_COLL_CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() >= NAMED_PERM_CACHE_CAP {
+                    c.clear();
+                }
+                let n_extras = coll_rec.iter().filter(|(_, s)| *s == PERM_EXTRA).count();
+                let (keys, slots): (Vec<Key>, Vec<u32>) = coll_rec.into_iter().unzip();
+                c.insert(
+                    site,
+                    CollPerm {
+                        gid,
+                        n_params: func.params.len(),
+                        n_extras,
+                        keys: keys.into_boxed_slice(),
+                        slots: slots.into_boxed_slice(),
+                    },
+                );
+            });
         }
         if cacheable && perm.len() == arg_names.len() {
             NAMED_PERM_CACHE.with(|c| {

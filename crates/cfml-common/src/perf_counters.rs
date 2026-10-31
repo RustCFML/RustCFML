@@ -296,6 +296,18 @@ pub static NAMED_ARGS_HIT: AtomicU64 = AtomicU64::new(0);
 pub static NAMED_ARGS_MISS: AtomicU64 = AtomicU64::new(0);
 pub static NAMED_ARGS_COLLECTION: AtomicU64 = AtomicU64::new(0);
 pub static NAMED_ARGS_NO_GID: AtomicU64 = AtomicU64::new(0);
+/// `argumentCollection=struct` calls answered from the collection cache / not.
+pub static NAMED_ARGS_COLL_HIT: AtomicU64 = AtomicU64::new(0);
+pub static NAMED_ARGS_COLL_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-frame container pools (`locals_pool` etc.): a frame took a pooled
+/// map, took one but had to grow it, or allocated a fresh one; and at exit
+/// a map was recycled or dropped because the pool was full.
+pub static LOCALS_POOL_HIT: AtomicU64 = AtomicU64::new(0);
+pub static LOCALS_POOL_GROW: AtomicU64 = AtomicU64::new(0);
+pub static LOCALS_POOL_MISS: AtomicU64 = AtomicU64::new(0);
+pub static LOCALS_POOL_RECYCLED: AtomicU64 = AtomicU64::new(0);
+pub static LOCALS_POOL_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn add(c: &AtomicU64, n: u64) {
@@ -418,7 +430,15 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
          cache hits:                  {:>12}\n\
          cache misses (slow path):    {:>12}\n\
          argumentCollection calls:    {:>12}\n\
-         no compiled id:              {:>12}",
+         no compiled id:              {:>12}\n\
+         collection cache hits:       {:>12}\n\
+         collection cache misses:     {:>12}\n\
+         --- frame locals-map pool ---\n\
+         pool hit:                    {:>12}\n\
+         pool hit but grown:          {:>12}\n\
+         pool miss (fresh map):       {:>12}\n\
+         recycled at exit:            {:>12}\n\
+         dropped at exit (pool full): {:>12}",
         g(&STRUCT_NEW),
         g(&STRUCT_NEW_UNTRACKED),
         g(&FRAMES_ARGS_EAGER),
@@ -495,6 +515,13 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         g(&NAMED_ARGS_MISS),
         g(&NAMED_ARGS_COLLECTION),
         g(&NAMED_ARGS_NO_GID),
+        g(&NAMED_ARGS_COLL_HIT),
+        g(&NAMED_ARGS_COLL_MISS),
+        g(&LOCALS_POOL_HIT),
+        g(&LOCALS_POOL_GROW),
+        g(&LOCALS_POOL_MISS),
+        g(&LOCALS_POOL_RECYCLED),
+        g(&LOCALS_POOL_DROPPED),
     )
 }
 
