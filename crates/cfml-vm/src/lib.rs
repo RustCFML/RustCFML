@@ -3327,6 +3327,12 @@ pub struct CfmlVirtualMachine {
     /// (matching Lucee's root page context registry). Lets children join siblings
     /// or parent-spawned threads. Capped with FIFO eviction (default 10000).
     pub request_thread_registry: Arc<RwLock<RequestThreadRegistry>>,
+    /// Insertion order queue for the spawner's local cfthread scope (FIFO eviction).
+    /// Matches the order threads were registered in the local scope for S6 capping.
+    pub cfthread_order: VecDeque<String>,
+    /// Maximum entries in the spawner's local cfthread scope (S6: Lucee PageContextImpl L4245-4250).
+    /// Default 10000, configurable via RUSTCFML_TASKS_LIMIT env var for tests.
+    pub cfthread_limit: usize,
     /// Set on a spawned child VM: when flipped true (by thread terminate), the
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
@@ -5511,6 +5517,11 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(10000))),
+            cfthread_order: VecDeque::new(),
+            cfthread_limit: std::env::var("RUSTCFML_TASKS_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10000),
             cancel_flag: None,
             thread_interrupted: false,
             thread_context_class_loader: None,
@@ -7107,10 +7118,50 @@ impl CfmlVirtualMachine {
             CfmlValue::DateTime(cfml_common::datetime::CfmlDate::now()),
         );
         meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
-        let cf = self.get_or_create_cfthread_scope();
-        if let Some(ts) = cf.as_cfml_struct() {
-            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+        
+        let key = thread_name.to_lowercase();
+        
+        // S6: Cap the spawner's local cfthread scope with FIFO eviction (Lucee PageContextImpl L4245-4250)
+        // Do this in stages to avoid borrowing conflicts
+        
+        // Stage 1: Check if we need to evict
+        let limit = self.cfthread_limit;
+        let mut current_size = 0;
+        let mut contains_key = false;
+        {
+            let cf = self.get_or_create_cfthread_scope();
+            if let Some(ts) = cf.as_cfml_struct() {
+                current_size = ts.len();
+                contains_key = ts.contains_key(&key);
+            }
         }
+        
+        // Stage 2: Evict if needed (no borrow of globals here)
+        if !contains_key && current_size >= limit {
+            let oldest_key = self.cfthread_order.front().cloned();
+            if let Some(oldest) = oldest_key {
+                self.cfthread_order.pop_front();
+                // Remove from globals
+                let cf2 = self.get_or_create_cfthread_scope();
+                if let Some(ts) = cf2.as_cfml_struct() {
+                    ts.remove(&oldest);
+                }
+            }
+        }
+        
+        // Stage 3: Update order queue (no borrow of globals here)
+        self.cfthread_order.retain(|k| k != &key);
+        
+        // Stage 4: Insert the new entry
+        {
+            let cf3 = self.get_or_create_cfthread_scope();
+            if let Some(ts) = cf3.as_cfml_struct() {
+                ts.insert(key.clone(), CfmlValue::strukt(meta));
+            }
+        }
+        
+        // Stage 5: Add to order queue
+        self.cfthread_order.push_back(key);
     }
 
     /// Get the metadata struct for a thread from the cfthread scope.
@@ -7140,7 +7191,9 @@ impl CfmlVirtualMachine {
             running.as_ref().and_then(|m| m.get(k).cloned()).unwrap_or(default)
         };
         meta.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
-        meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
+        // Nit: ELAPSEDTIME 0 for TERMINATED (Lucee ThreadsImpl.java L151)
+        let elapsed_time = if r.status == "TERMINATED" { 0 } else { r.elapsed };
+        meta.insert("elapsedtime".to_string(), CfmlValue::Int(elapsed_time));
         meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
         meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
         meta.insert("output".to_string(), CfmlValue::string(r.output.clone()));
@@ -24431,9 +24484,9 @@ impl CfmlVirtualMachine {
                             timeout_ms
                         };
                         
-                        // S4: Self-join guard - don't hang
-                        // (Lucee hangs too, but we must not hold locks)
-                        // For now, just skip self-join
+                        // S4: Self-join guard - Lucee hangs on self-join, but we return immediately
+                        // without holding any locks. Cannot detect at call-site (no thread name stored
+                        // on VM), so join_thread will detect and return Ok immediately.
                         
                         if let Err(e) = self.join_thread(&name, remaining) {
                             // S3: Throw on unknown names (Lucee parity)
