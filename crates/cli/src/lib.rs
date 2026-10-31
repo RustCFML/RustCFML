@@ -1956,6 +1956,17 @@ fn compile_and_run(
     // mid-transaction, where the next request picks it up dirty (GH #308).
     vm.rollback_open_transaction();
 
+    // Clear the request thread registry at request end (item #5). Child VMs
+    // spawned by executors or long-lived threads share the root's registry Arc,
+    // so this only clears when the ROOT request finishes (not child threads).
+    // Serves both CLI (one-shot) and serve mode (per-request cleanup).
+    if let Ok(mut reg) = vm.request_thread_registry.write() {
+        reg.clear();
+    }
+    // Also clear the local live_threads map so threads from this request don't
+    // leak into the next (serve mode reuses the VM across requests).
+    vm.live_threads.clear();
+
     // Take the response out of the VM via `mem::take` (leaving every field a
     // valid default) so the VM can then be DROPPED — releasing all of this
     // request's transient roots (page `variables`, request/thread scopes, call

@@ -7119,7 +7119,20 @@ impl CfmlVirtualMachine {
             if let Ok(reg) = self.request_thread_registry.read() {
                 match reg.get_completion_handle(name) {
                     Some(h) => h,
-                    None => return Err(format!("There is no thread running with the name [{}]", name)),
+                    None => {
+                        let live_names: Vec<String> = self.live_threads.keys().cloned().collect();
+                        let reg_names = reg.all_names();
+                        let ctx = format!(
+                            "There is no thread running with the name [{}] (join from thread: {}, registry has {} entries, live_threads has {} entries, name in live_threads: {}, first 10 registry names: {:?})",
+                            name,
+                            self.cfml_thread_name.as_deref().unwrap_or("<root>"),
+                            reg.len(),
+                            live_names.len(),
+                            live_names.contains(&name.to_string()),
+                            reg_names.iter().take(10).collect::<Vec<_>>()
+                        );
+                        return Err(ctx);
+                    }
                 }
             } else {
                 return Err(format!("There is no thread running with the name [{}]", name));
@@ -24551,8 +24564,12 @@ impl CfmlVirtualMachine {
                             // excluding self and ancestors
                             let self_name = self.cfml_thread_name.as_deref();
                             
-                            // Start with local threads
-                            let mut all_names: Vec<String> = self.live_threads.keys().cloned().collect();
+                            // Start with local threads that haven't been joined yet
+                            let mut all_names: Vec<String> = self.live_threads
+                                .iter()
+                                .filter(|(_, h)| h.result.is_none()) // Skip already-joined threads
+                                .map(|(k, _)| k.clone())
+                                .collect();
                             
                             // Add non-ancestor threads from registry
                             if let Ok(reg) = self.request_thread_registry.read() {
@@ -24633,7 +24650,13 @@ impl CfmlVirtualMachine {
                                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     Err(e) => {
-                                        return Err(CfmlError::new(e, CfmlErrorType::Application));
+                                        // Add context about terminate location for debugging
+                                        let ctx = format!(
+                                            "{} (terminate from thread: {})",
+                                            e,
+                                            self.cfml_thread_name.as_deref().unwrap_or("<root>")
+                                        );
+                                        return Err(CfmlError::new(ctx, CfmlErrorType::Application));
                                     }
                                 }
                             }
