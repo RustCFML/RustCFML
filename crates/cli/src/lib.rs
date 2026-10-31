@@ -1561,6 +1561,19 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             cfml_common::cycle_gc::body_started();
             let mut vm = CfmlVirtualMachine::new(seed.program.clone());
             register_vm_runtime(&mut vm);
+            // A thread body holds its pooled DB connections in the same
+            // thread-local map a request does, but this thread exits as soon as
+            // the body returns, so they used to be dropped by the thread-local
+            // destructor — with the pool-default COM_RESET_CONNECTION, which also
+            // deallocates every server-side prepared statement on that
+            // connection. A Preside site runs its heartbeats this way every few
+            // seconds, each on whichever pooled connection it drew, so a page
+            // request drawing that connection next re-prepared all of its
+            // statements: on the RI site's /admin/sitetree/, 10 COM_STMT_PREPARE
+            // round-trips on 7 renders in 10. Release through the dirty check
+            // instead, as the request path does: a clean connection keeps its
+            // statement cache, one that ran session-risky SQL still resets.
+            let _db_conn_guard = cfml_stdlib::builtins::RequestDbConnGuard::new();
             let (closure, attributes) = vm.apply_thread_seed(seed);
             let result = vm.run_thread_body(&closure, attributes, &ValueMap::default());
             if armed {
@@ -1630,14 +1643,7 @@ fn compile_and_run(
     // not corrupt it (Masa admin boot). Release up-front too, so a prior request
     // that died mid-flight on this thread can't leak its connection into this one.
     // The drop guard covers every early return and panic.
-    cfml_stdlib::builtins::release_request_db_conns();
-    struct DbConnRequestGuard;
-    impl Drop for DbConnRequestGuard {
-        fn drop(&mut self) {
-            cfml_stdlib::builtins::release_request_db_conns();
-        }
-    }
-    let _db_conn_guard = DbConnRequestGuard;
+    let _db_conn_guard = cfml_stdlib::builtins::RequestDbConnGuard::new();
 
     // onMissingTemplate path: there is no target page to compile, so use an
     // empty program. execute_with_lifecycle never runs it — it dispatches to

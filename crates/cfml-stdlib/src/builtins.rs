@@ -11964,6 +11964,34 @@ pub fn release_request_db_conns() {
     }
 }
 
+/// RAII form of [`release_request_db_conns`]: releases on construction (a prior
+/// run that died mid-flight on this thread can't leak its connection into this
+/// one) and again on drop, covering every early return and panic. One per CFML
+/// execution boundary — the serve request and the cfthread / scheduled-task
+/// body — so a held connection is always returned through the dirty check and
+/// never by the thread-local destructor, whose pool-default reset would also
+/// throw away the connection's prepared statements.
+pub struct RequestDbConnGuard(());
+
+impl RequestDbConnGuard {
+    pub fn new() -> Self {
+        release_request_db_conns();
+        RequestDbConnGuard(())
+    }
+}
+
+impl Default for RequestDbConnGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RequestDbConnGuard {
+    fn drop(&mut self) {
+        release_request_db_conns();
+    }
+}
+
 #[cfg(feature = "postgres_db")]
 struct PostgresConnectionManager {
     url: String,
