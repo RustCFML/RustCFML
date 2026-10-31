@@ -48103,7 +48103,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_register_and_get() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
         let completion = make_completion();
@@ -48127,7 +48127,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_duplicate_name_throws() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
         let completion = make_completion();
@@ -48154,12 +48154,13 @@ mod request_thread_registry_tests {
         );
 
         assert!(result.is_err(), "duplicate name should throw");
-        assert!(result.unwrap_err().contains("unique"), "error should mention 'unique'");
+        let err = result.unwrap_err();
+        assert!(err.message.to_lowercase().contains("unique"), "error should mention 'unique'");
     }
 
     #[test]
     fn registry_cap_eviction_fifo() {
-        let reg = RequestThreadRegistry::new(3); // Small cap for testing
+        let mut reg = RequestThreadRegistry::new(3); // Small cap for testing
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -48188,7 +48189,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_clear() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -48210,7 +48211,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_get_non_ancestor_names_no_self() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -48244,7 +48245,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_get_non_ancestor_names_excludes_self() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -48277,7 +48278,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_get_non_ancestor_names_excludes_parent() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
 
@@ -48323,7 +48324,7 @@ mod request_thread_registry_tests {
 
     #[test]
     fn registry_wait_for_completion_already_complete() {
-        let reg = RequestThreadRegistry::new(10);
+        let mut reg = RequestThreadRegistry::new(10);
         let cancel = Arc::new(AtomicBool::new(false));
         let interrupted = Arc::new(AtomicBool::new(false));
         let completion = make_completion();
