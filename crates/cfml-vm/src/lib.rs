@@ -5347,6 +5347,12 @@ struct NamedPerm {
     names_len: usize,
     gid: i64,
     n_params: usize,
+    /// How many entries of `perm` are [`PERM_EXTRA`]: sizes the argument and
+    /// extras vectors exactly. Preside calls with names that match no
+    /// parameter all the time (ColdBox's `event`/`rc`/`prc` into handlers
+    /// declaring fewer), and the extras list grew by doubling on every such
+    /// call.
+    n_extras: usize,
     /// `perm[i]` is argument `i`'s parameter slot, [`PERM_EXTRA`] for a name
     /// that matches no parameter, [`PERM_POSITIONAL`] for an unnamed argument.
     perm: Box<[u32]>,
@@ -27704,8 +27710,9 @@ impl CfmlVirtualMachine {
                         return None;
                     }
                 }
-                let mut positional = vec![CfmlValue::Null; func.params.len()];
-                let mut extras: Vec<(usize, String)> = Vec::new();
+                let mut positional: Vec<CfmlValue> = Vec::with_capacity(func.params.len() + p.n_extras);
+                positional.resize(func.params.len(), CfmlValue::Null);
+                let mut extras: Vec<(usize, String)> = Vec::with_capacity(p.n_extras);
                 for (i, &slot) in p.perm.iter().enumerate() {
                     let value = arg_values.get_mut(i).map(std::mem::take).unwrap_or(CfmlValue::Null);
                     match slot {
@@ -27872,12 +27879,14 @@ impl CfmlVirtualMachine {
                 if c.len() >= NAMED_PERM_CACHE_CAP {
                     c.clear();
                 }
+                let n_extras = perm.iter().filter(|&&p| p == PERM_EXTRA).count();
                 c.insert(
                     site,
                     NamedPerm {
                         names_len: arg_names.len(),
                         gid,
                         n_params: func.params.len(),
+                        n_extras,
                         perm: perm.into_boxed_slice(),
                     },
                 );

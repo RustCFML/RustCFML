@@ -2087,6 +2087,49 @@ fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
     collect_from_log_carrying(log, None)
 }
 
+/// The per-collect working sets of `collect_from_log_carrying`, kept per
+/// thread between collects. Cleared (handles dropped) and bounded by
+/// `SPARE_CAP` on return, like the allocation log's spare buffer.
+#[derive(Default)]
+struct CollectScratch {
+    nodes: PtrMap<NodeHandle>,
+    in_set: PtrSet,
+    internal_in: PtrMap<usize>,
+    live: PtrSet,
+}
+
+thread_local! {
+    static COLLECT_SCRATCH: RefCell<CollectScratch> = RefCell::new(CollectScratch::default());
+}
+
+/// Holds the thread's scratch for the duration of one collect and returns
+/// it on drop — every exit path, including an early `return`. A re-entrant
+/// collect on the same thread simply finds the cell empty and starts fresh.
+struct ScratchGuard(CollectScratch);
+
+impl ScratchGuard {
+    fn take() -> Self {
+        ScratchGuard(COLLECT_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut())))
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        fn trim_map<V>(m: &mut PtrMap<V>) {
+            if m.capacity() > SPARE_CAP {
+                *m = PtrMap::default();
+            } else {
+                m.clear();
+            }
+        }
+        trim_map(&mut self.0.nodes);
+        trim_set(&mut self.0.in_set);
+        trim_map(&mut self.0.internal_in);
+        trim_set(&mut self.0.live);
+        COLLECT_SCRATCH.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
 fn collect_from_log_carrying(
     mut log: Vec<TrackedAlloc>,
     carry: Option<&mut Vec<(usize, TrackedAlloc)>>,
@@ -2098,7 +2141,13 @@ fn collect_from_log_carrying(
     }
 
     // 1. Upgrade survivors; one strong probe handle per distinct backing.
-    let mut nodes: PtrMap<NodeHandle> = PtrMap::with_capacity_and_hasher(log.len(), Default::default());
+    // Working sets come from this thread's scratch and go back cleared on
+    // every exit (`ScratchGuard`): a collect used to allocate all four afresh
+    // — ~3.4 MiB of a 46 MiB Preside render, the second-largest single source
+    // of allocator churn after the frames themselves.
+    let mut scratch = ScratchGuard::take();
+    let CollectScratch { nodes, in_set, internal_in, live } = &mut scratch.0;
+    nodes.reserve(log.len());
     for t in log.drain(..) {
         match t {
             TrackedAlloc::Struct(w) => {
@@ -2144,7 +2193,7 @@ fn collect_from_log_carrying(
         return 0;
     }
 
-    let in_set: PtrSet = nodes.keys().copied().collect();
+    in_set.extend(nodes.keys().copied());
 
     // 1b. The class blueprints held by the surviving instances, DE-DUPLICATED by
     //     Arc identity. A blueprint is a CARRIER, not a node: it participates in
@@ -2225,7 +2274,7 @@ fn collect_from_log_carrying(
 
     // 2. internal_in[n] = number of references to n from other survivors, plus
     //    the references held by the carrier blueprints (counted once each).
-    let mut internal_in: PtrMap<usize> = PtrMap::with_capacity_and_hasher(nodes.len(), Default::default());
+    internal_in.reserve(nodes.len());
     for h in nodes.values() {
         h.for_each_child_node(&in_set, &mut |child| {
             *internal_in.entry(child).or_insert(0) += 1;
@@ -2299,7 +2348,7 @@ fn collect_from_log_carrying(
         }
         {
             let mut would: HashMap<String, usize> = HashMap::new();
-            for (&p, h) in &nodes {
+            for (&p, h) in nodes.iter() {
                 if !seen.contains(&p) {
                     *would.entry(h.describe()).or_insert(0) += 1;
                 }
@@ -2321,7 +2370,7 @@ fn collect_from_log_carrying(
 
     // 3. Roots = survivors with an owner OUTSIDE the survivor set.
     //    external(n) = strong_count − 1 (probe handle) − internal_in(n).
-    let mut live: PtrSet = PtrSet::with_capacity_and_hasher(nodes.len(), Default::default());
+    live.reserve(nodes.len());
     let mut worklist: Vec<usize> = Vec::new();
     // RUSTCFML_GC_ROOTS=N reports the N largest PINNED ROOTS — survivors whose
     // external count is non-zero, i.e. the nodes something outside this
@@ -2362,7 +2411,7 @@ fn collect_from_log_carrying(
     } else {
         PtrMap::default()
     };
-    for (&p, h) in &nodes {
+    for (&p, h) in nodes.iter() {
         let internal = *internal_in.get(&p).unwrap_or(&0);
         let external = h.strong_count().saturating_sub(1).saturating_sub(internal);
         if root_debug > 0 && external > 0 {
@@ -2521,7 +2570,7 @@ fn collect_from_log_carrying(
             if let NodeHandle::Struct(a) = h {
                 let mt = a.try_read().and_then(|g| g.method_table.clone());
                 if let Some(mt) = mt {
-                    mark_table(mt, &mut live, &mut worklist);
+                    mark_table(mt, live, &mut worklist);
                 }
             }
             #[cfg(feature = "component-instance")]
@@ -2532,7 +2581,7 @@ fn collect_from_log_carrying(
                 if let Some((this_m, vars_m)) = maps {
                     for m in [this_m, vars_m] {
                         if let Some(mt) = m.method_table() {
-                            mark_table(mt, &mut live, &mut worklist);
+                            mark_table(mt, live, &mut worklist);
                         }
                     }
                 }
@@ -2665,7 +2714,7 @@ fn collect_from_log_carrying(
             .collect();
         let mut holders: PtrMap<Vec<String>> = PtrMap::default();
         if !targets.is_empty() {
-            for (&p, h) in &nodes {
+            for (&p, h) in nodes.iter() {
                 h.for_each_child_node(&in_set, &mut |child| {
                     if targets.contains(&child) {
                         holders.entry(child).or_default().push(
@@ -2731,7 +2780,7 @@ fn collect_from_log_carrying(
                 }
             }
             let mut unheld: HashMap<String, (usize, usize)> = HashMap::new();
-            for (&p, h) in &nodes {
+            for (&p, h) in nodes.iter() {
                 if probe_reachable.contains(&p) || tracked_holders.contains(&p) {
                     continue;
                 }
@@ -2796,7 +2845,7 @@ fn collect_from_log_carrying(
             // live. Listed COMPLETE, not top-N: the set is small and the whole
             // question is what is in it.
             let mut held: HashMap<String, (usize, usize)> = HashMap::new();
-            for (&p, h) in &nodes {
+            for (&p, h) in nodes.iter() {
                 if probe_reachable.contains(&p) || !tracked_holders.contains(&p) {
                     continue;
                 }
@@ -2916,7 +2965,7 @@ fn collect_from_log_carrying(
         );
     }
     let mut collected = 0usize;
-    for (&p, h) in &nodes {
+    for (&p, h) in nodes.iter() {
         if !live.contains(&p) {
             h.clear();
             collected += 1;
@@ -2927,7 +2976,7 @@ fn collect_from_log_carrying(
     // probe handles below frees it and a `Weak` to it would never upgrade again.
     if let Some(carry) = carry {
         carry.reserve(live.len());
-        for (&p, h) in &nodes {
+        for (&p, h) in nodes.iter() {
             if live.contains(&p) {
                 carry.push((p, h.downgrade()));
             }
