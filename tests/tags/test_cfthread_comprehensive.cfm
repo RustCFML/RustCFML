@@ -278,5 +278,32 @@ if (structKeyExists(unjoinedData, "unjoined_test")) {
     assert("unjoined thread has result", unjoinedData.unjoined_test.result, "completed_value");
 }
 
+// Test 12: Stress test - N threads spawning while cross-joining with overall timeout (item #5)
+request.stressCounter = 0;
+var stressStart = getTickCount();
+var stressThreadCount = 10;
+for (var i = 1; i <= stressThreadCount; i++) {
+    var threadName = "stress_" & i;
+    thread name=threadName idx=i {
+        request.stressCounter++;
+        sleep(50 + (attributes.idx * 10)); // Staggered sleep times
+        // Some threads spawn children
+        if (attributes.idx mod 3 == 0) {
+            var childName = "stress_child_" & attributes.idx;
+            thread name=childName {
+                sleep(30);
+                thread.child = true;
+            }
+            thread action="join" name=childName timeout="500";
+        }
+        thread.completed = true;
+    }
+}
+// Join all stress threads with timeout
+thread action="join" timeout="2000";
+var stressElapsed = getTickCount() - stressStart;
+assertTrue("stress test completed within time limit", stressElapsed < 2500);
+assertTrue("stress test completed at least 10 threads", request.stressCounter >= stressThreadCount);
+
 suiteEnd();
 </cfscript>
