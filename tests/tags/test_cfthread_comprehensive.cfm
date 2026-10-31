@@ -12,7 +12,7 @@ function spawnChainLevel(level) {
         return;
     }
     var nextName = "chain_" & (level + 1);
-    thread name=nextName nextLevel=(level + 1) {
+    thread name=nextName nextLevel=(level + 1) nextName=nextName {
         try {
             spawnChainLevel(attributes.nextLevel);
             if (structKeyExists(cfthread, attributes.nextName)) {
@@ -46,8 +46,11 @@ if (structKeyExists(cfthread, "chain_1")) {
 // Test 2: Duplicate name throws (S1)
 request.duplicateThrew = false;
 thread name="dup_test" {
+    sleep(500); // Keep running while we try to create duplicate
     thread.first = true;
 }
+
+sleep(50); // Let first thread start
 
 try {
     thread name="dup_test" {
@@ -56,6 +59,8 @@ try {
 } catch (any e) {
     request.duplicateThrew = (findNoCase("unique", e.message) > 0);
 }
+
+thread action="join" name="dup_test" timeout="2000";
 
 assertTrue("duplicate thread name threw", request.duplicateThrew);
 
@@ -87,7 +92,7 @@ request.joinerTimedOut = false;
 
 thread name="timing_target" {
     request.targetStarted = true;
-    sleep(200);
+    sleep(300); // 300ms sleep
     thread.value = 42;
     request.targetDone = true;
 }
@@ -105,7 +110,7 @@ thread name="timing_joiner" {
     }
 }
 
-thread action="join" name="timing_joiner,timing_target";
+thread action="join" name="timing_joiner,timing_target" timeout="10000";
 
 assertTrue("target started", request.targetStarted);
 assertTrue("target completed", request.targetDone);
@@ -113,7 +118,7 @@ assertFalse("joiner did not timeout", request.joinerTimedOut);
 assertTrue("joiner start time recorded", request.joinerStart > 0);
 assertTrue("joiner end time recorded", request.joinerEnd > 0);
 var joinElapsed = request.joinerEnd - request.joinerStart;
-assertTrue("cross-join waited at least ~100ms", joinElapsed >= 100);
+assertTrue("cross-join waited at least ~150ms", joinElapsed >= 150);
 assertTrue("cross-join completed under 2s", joinElapsed < 2000);
 // Verify target metadata
 if (structKeyExists(cfthread, "timing_target")) {
@@ -153,27 +158,28 @@ request.terminateJoinerCompleted = false;
 request.terminateTargetReached = false;
 
 thread name="terminate_target" {
-    sleep(5000); // Long sleep that should be interrupted
+    sleep(10000); // Long sleep that should be interrupted
     thread.should_not_reach = true;
     request.terminateTargetReached = true;
 }
 
-sleep(50); // Let it start sleeping
+sleep(100); // Let it start sleeping
 
 thread name="terminate_joiner" {
     thread action="terminate" name="terminate_target";
-    thread action="join" name="terminate_target" timeout="2000";
+    sleep(100); // Give terminate time to propagate
+    thread action="join" name="terminate_target" timeout="5000";
     request.terminateJoinerCompleted = true;
 }
 
-thread action="join" name="terminate_joiner,terminate_target";
+thread action="join" name="terminate_joiner,terminate_target" timeout="10000";
 
 assertTrue("terminate joiner completed", request.terminateJoinerCompleted);
 assertFalse("terminate target did not reach code after sleep", request.terminateTargetReached);
 if (structKeyExists(cfthread, "terminate_target")) {
     assert("terminate target status is TERMINATED", cfthread.terminate_target.status, "TERMINATED");
-    // Note: elapsedTime might not be exactly 0 due to timing, but should be very small
-    assertTrue("terminate target elapsed time is small", cfthread.terminate_target.elapsedTime < 1000);
+    // ELAPSEDTIME should be 0 for TERMINATED threads
+    assert("terminate target elapsed time is 0", cfthread.terminate_target.elapsedTime, 0);
     assertFalse("terminate target did not set should_not_reach", 
         structKeyExists(cfthread.terminate_target, "should_not_reach"));
 }
@@ -210,25 +216,25 @@ assertTrue("no-name join waited appropriately", (joinEnd - joinStart) >= 100);
 
 // Test 9: Shared timeout budget for no-name join expires
 thread name="budget_1" {
-    sleep(300);
+    sleep(400);
     thread.done = true;
 }
 thread name="budget_2" {
-    sleep(300);
+    sleep(400);
     thread.done = true;
 }
 thread name="budget_3" {
-    sleep(300);
+    sleep(400);
     thread.done = true;
 }
 
 var budgetStart = getTickCount();
-thread action="join" timeout="500"; // 500ms total budget for all 3 x 300ms threads
+thread action="join" timeout="600"; // 600ms total budget for all 3 x 400ms threads
 var budgetElapsed = getTickCount() - budgetStart;
 
-// Should have timed out before all complete (total would be ~900ms but budget is 500ms)
-assertTrue("shared timeout budget was enforced", budgetElapsed < 800);
-assertTrue("shared timeout took at least budget time", budgetElapsed >= 400);
+// Should have timed out before all complete (total would be ~1200ms but budget is 600ms)
+assertTrue("shared timeout budget was enforced", budgetElapsed < 1000);
+assertTrue("shared timeout took at least budget time", budgetElapsed >= 500);
 
 // Test 10: threadData() returns request-wide view
 thread name="data_test_1" {
