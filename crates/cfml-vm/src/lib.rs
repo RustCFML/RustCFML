@@ -4502,6 +4502,24 @@ impl RequestThreadRegistry {
         self.entries.is_empty()
     }
 
+    /// Update thread metadata from ThreadResult (for CompletionGuard live updates).
+    /// Updates status, output, error, and elapsedtime in the registry entry.
+    pub fn update_from_result(&mut self, name: &str, result: &ThreadResult) {
+        let key = name.to_lowercase();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if let CfmlValue::Struct(ref mut s) = entry.metadata {
+                s.insert("status".to_string(), CfmlValue::string(result.status.clone()));
+                s.insert("output".to_string(), CfmlValue::string(result.output.clone()));
+                s.insert("error".to_string(), CfmlValue::string(result.error.clone()));
+                s.insert("elapsedtime".to_string(), CfmlValue::Int(result.elapsed));
+                // Also store error_struct if present
+                if let Some(ref err_struct) = result.error_struct {
+                    s.insert("errordetail".to_string(), err_struct.clone());
+                }
+            }
+        }
+    }
+
     /// Look up a thread's interrupt flag by name.
     pub fn get_interrupted_flag(&self, name: &str) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         self.entries

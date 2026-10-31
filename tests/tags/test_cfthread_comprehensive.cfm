@@ -265,5 +265,18 @@ if (structKeyExists(threadDataAfter, "data_test_1")) {
     assert("data_test_1 status", threadDataAfter.data_test_1.status, "COMPLETED");
 }
 
+// Test 11: threadData() returns live status even for unjoined threads (item #4)
+thread name="unjoined_test" {
+    sleep(100);
+    thread.result = "completed_value";
+}
+sleep(200); // Wait for thread to finish, but don't join it
+var unjoinedData = threadData();
+assertTrue("threadData has unjoined_test", structKeyExists(unjoinedData, "unjoined_test"));
+if (structKeyExists(unjoinedData, "unjoined_test")) {
+    assert("unjoined thread status is COMPLETED", unjoinedData.unjoined_test.status, "COMPLETED");
+    assert("unjoined thread has result", unjoinedData.unjoined_test.result, "completed_value");
+}
+
 suiteEnd();
 </cfscript>

@@ -1530,14 +1530,21 @@ const CFTHREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Drop guard that signals thread completion on ALL exit paths (normal, error, panic).
 /// Fixes B1: ensures cross-thread joins complete when the thread ends, not when spawner joins.
+/// Also updates the shared registry entry with final status/output/error/elapsed (item #4).
 struct CompletionGuard {
     handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>,
     result: Option<cfml_vm::ThreadResult>,
+    registry: Option<Arc<std::sync::RwLock<cfml_vm::RequestThreadRegistry>>>,
+    thread_name: Option<String>,
 }
 
 impl CompletionGuard {
-    fn new(handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>) -> Self {
-        Self { handle, result: None }
+    fn new(
+        handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>,
+        registry: Option<Arc<std::sync::RwLock<cfml_vm::RequestThreadRegistry>>>,
+        thread_name: Option<String>,
+    ) -> Self {
+        Self { handle, result: None, registry, thread_name }
     }
 
     fn set_result(&mut self, result: cfml_vm::ThreadResult) {
@@ -1572,6 +1579,14 @@ impl Drop for CompletionGuard {
             *guard = self.result.clone();
             cvar.notify_all();
         }
+        
+        // Item #4: Update the shared registry entry with final status/output/error/elapsed
+        // so threadData() returns live data even for threads the spawner never joins.
+        if let (Some(registry), Some(name), Some(result)) = (&self.registry, &self.thread_name, &self.result) {
+            if let Ok(mut reg) = registry.write() {
+                reg.update_from_result(name, result);
+            }
+        }
     }
 }
 
@@ -1584,11 +1599,14 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = seed.cancel_flag.clone();
     let completion_handle = seed.completion_handle.clone();
+    let registry = seed.request_thread_registry.clone();
+    let thread_name = seed.cfml_thread_name.clone();
     let join = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
             // B1 fix: Drop guard ensures completion is signaled on ALL exit paths
-            let mut guard = CompletionGuard::new(completion_handle);
+            // Item #4: Also updates shared registry entry with final status/output/error/elapsed
+            let mut guard = CompletionGuard::new(completion_handle, Some(registry), thread_name);
             
             cfml_common::stack_guard::init(CFTHREAD_STACK_SIZE);
             // The allocation log is THREAD-LOCAL, armed per thread by `enable()`,
