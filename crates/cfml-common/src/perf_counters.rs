@@ -289,6 +289,14 @@ pub static SLOT_OPS_CLOSURE_PREFIX: AtomicU64 = AtomicU64::new(0);
 pub static FRAMES_SLOTTED: AtomicU64 = AtomicU64::new(0);
 pub static FRAMES_UNSLOTTED: AtomicU64 = AtomicU64::new(0);
 
+/// Named-argument binding (`f(a=1)`): per-call-site permutation cache hits,
+/// misses (slow path, then cached), calls with `argumentCollection` (never
+/// cached) and calls to functions with no compiled id (never cached).
+pub static NAMED_ARGS_HIT: AtomicU64 = AtomicU64::new(0);
+pub static NAMED_ARGS_MISS: AtomicU64 = AtomicU64::new(0);
+pub static NAMED_ARGS_COLLECTION: AtomicU64 = AtomicU64::new(0);
+pub static NAMED_ARGS_NO_GID: AtomicU64 = AtomicU64::new(0);
+
 #[inline]
 pub fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Relaxed);
@@ -405,7 +413,12 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
            .. params in unslotted fns:{:>12}\n\
          frame entries slotted:       {:>12}\n\
          frame entries unslotted:     {:>12}\n\
-           .. of those, has params:   {:>12}",
+           .. of those, has params:   {:>12}\n\
+         --- named-argument binding (per-call-site permutation cache) ---\n\
+         cache hits:                  {:>12}\n\
+         cache misses (slow path):    {:>12}\n\
+         argumentCollection calls:    {:>12}\n\
+         no compiled id:              {:>12}",
         g(&STRUCT_NEW),
         g(&STRUCT_NEW_UNTRACKED),
         g(&FRAMES_ARGS_EAGER),
@@ -478,6 +491,10 @@ fn report_totals(g: impl Fn(&AtomicU64) -> u64) -> String {
         g(&FRAMES_SLOTTED),
         g(&FRAMES_UNSLOTTED),
         g(&FRAMES_UNSLOTTED_WITH_PARAMS),
+        g(&NAMED_ARGS_HIT),
+        g(&NAMED_ARGS_MISS),
+        g(&NAMED_ARGS_COLLECTION),
+        g(&NAMED_ARGS_NO_GID),
     )
 }
 

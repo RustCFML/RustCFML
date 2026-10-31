@@ -16667,8 +16667,6 @@ impl CfmlVirtualMachine {
                                 .unwrap_or(0);
                             let inc_func = self.program.functions[main_idx].clone();
                             // Snapshot caller's keys before include so we can detect new variables
-                            let pre_include_keys: std::collections::HashSet<String> =
-                                locals.keys().cloned().map(|k| k.as_str().to_string()).collect();
                             // Isolate try-stack so throws inside the include
                             // don't consume outer handlers
                             let saved_try_stack = std::mem::take(&mut self.try_stack);
@@ -16745,21 +16743,31 @@ impl CfmlVirtualMachine {
                             // reverting caller state. Function values are NOT merged
                             // (they're already in user_functions); merging them would
                             // inject captured_scope that triggers spurious write-backs.
-                            if let Some(inc_locals) = self.captured_locals.take() {
-
-                                for (k, v) in inc_locals {
+                            // The include ran on its own map, seeded from this one
+                            // and handed back whole. A key it holds is NEW iff this
+                            // map still lacks it — no pre-include key set needed
+                            // (that was a `HashSet<String>` of every caller key,
+                            // one String per key, built for each of a Preside
+                            // admin page's ~11,000 includes). The emptied map is
+                            // recycled: template frames were the one frame kind
+                            // that never returned its map to the pool, so every
+                            // include drained a pooled map and the pool starved.
+                            if let Some(mut inc_locals) = self.captured_locals.take() {
+                                for (k, v) in inc_locals.drain(..) {
                                     if k == "arguments" || k.starts_with("__") {
                                         continue;
                                     }
                                     // Only merge NEW variables that are not functions and
                                     // don't shadow builtin function names (e.g. "val").
-                                    if !pre_include_keys.contains(k.as_str())
+                                    if !locals.contains_key(&k)
                                         && !matches!(v, CfmlValue::Function(_))
                                         && !self.builtins.contains_key(k.as_str())
                                     {
                                         locals.insert(k, v);
                                     }
                                 }
+                                #[cfg(feature = "scope-pool")]
+                                self.recycle_locals_map(inc_locals);
                             }
                             // Functions defined in the included file are already
                             // resolvable after the swap is popped: each was
@@ -16875,8 +16883,6 @@ impl CfmlVirtualMachine {
                                 .position(|f| f.name == "__main__")
                                 .unwrap_or(0);
                             let inc_func = self.program.functions[main_idx].clone();
-                            let pre_include_keys: std::collections::HashSet<String> =
-                                locals.keys().cloned().map(|k| k.as_str().to_string()).collect();
                             let saved_try_stack = std::mem::take(&mut self.try_stack);
                             #[cfg(feature = "observability")]
                             let __tmpl_start = self
@@ -16938,19 +16944,23 @@ impl CfmlVirtualMachine {
                                 self.template_frame_end(&resolved, None, us);
                             }
                             // Merge new non-function variables from the include
-                            if let Some(inc_locals) = self.captured_locals.take() {
-
-                                for (k, v) in inc_locals {
+                            // Same merge as the static include above: new keys
+                            // only, decided against this map directly; the
+                            // include's map goes back to the pool.
+                            if let Some(mut inc_locals) = self.captured_locals.take() {
+                                for (k, v) in inc_locals.drain(..) {
                                     if k == "arguments" || k.starts_with("__") {
                                         continue;
                                     }
-                                    if !pre_include_keys.contains(k.as_str())
+                                    if !locals.contains_key(&k)
                                         && !matches!(v, CfmlValue::Function(_))
                                         && !self.builtins.contains_key(k.as_str())
                                     {
                                         locals.insert(k, v);
                                     }
                                 }
+                                #[cfg(feature = "scope-pool")]
+                                self.recycle_locals_map(inc_locals);
                             }
                             // No merge-append or index fixup needed: the dynamic
                             // include's functions are already registered by global_id
@@ -27696,6 +27706,14 @@ impl CfmlVirtualMachine {
         let gid = cfml_function_gid(func);
         let has_collection = arg_names.iter().any(|n| n.eq_ignore_ascii_case("argumentcollection"));
         let cacheable = gid >= 0 && !has_collection;
+        if cfml_common::perf_counters::enabled() {
+            use cfml_common::perf_counters as pc;
+            if has_collection {
+                pc::bump(&pc::NAMED_ARGS_COLLECTION);
+            } else if gid < 0 {
+                pc::bump(&pc::NAMED_ARGS_NO_GID);
+            }
+        }
         if cacheable {
             let fast = NAMED_PERM_CACHE.with(|c| {
                 let c = c.borrow();
@@ -27733,6 +27751,10 @@ impl CfmlVirtualMachine {
                 }
                 Some((positional, extras))
             });
+            if cfml_common::perf_counters::enabled() {
+                use cfml_common::perf_counters as pc;
+                pc::bump(if fast.is_some() { &pc::NAMED_ARGS_HIT } else { &pc::NAMED_ARGS_MISS });
+            }
             if let Some(bound) = fast {
                 return bound;
             }
