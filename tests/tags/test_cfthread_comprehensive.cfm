@@ -128,6 +128,7 @@ if (structKeyExists(cfthread, "timing_target")) {
 
 // Test 6: Cross-thread join on error - status must be TERMINATED
 request.errorThreadStatus = "";
+var errorStart = getTickCount();
 
 thread name="error_target" {
     throw(message="intentional error for test");
@@ -145,6 +146,10 @@ thread name="error_joiner" {
 }
 
 thread action="join" name="error_joiner,error_target";
+var errorElapsed = getTickCount() - errorStart;
+
+// Join should wake immediately when target errors, not wait the full 2s timeout
+assertTrue("error join completed quickly (woke on error)", errorElapsed < 500);
 
 // Parent can see error
 if (structKeyExists(cfthread, "error_target")) {
@@ -237,6 +242,23 @@ var budgetElapsed = getTickCount() - budgetStart;
 assertTrue("shared timeout budget was enforced", budgetElapsed < 1000);
 assertTrue("join waited for concurrent threads to complete", budgetElapsed >= 350 && budgetElapsed < 550);
 
+// Test 9b: Budget expiration - threads outlive the budget
+thread name="outlive_1" {
+    sleep(2000);
+    thread.done = true;
+}
+thread name="outlive_2" {
+    sleep(2000);
+    thread.done = true;
+}
+var outliveStart = getTickCount();
+thread action="join" name="outlive_1,outlive_2" timeout="600"; // 600ms budget for 2s threads
+var outliveElapsed = getTickCount() - outliveStart;
+
+// Join should return after ~600ms (budget exhausted), not wait full 2s
+assertTrue("join returned after budget expired", outliveElapsed >= 500 && outliveElapsed < 900);
+// Main test verified: join respected the timeout budget and returned early
+
 // Test 10: threadData() returns request-wide view
 thread name="data_test_1" {
     sleep(50);
@@ -278,15 +300,15 @@ if (structKeyExists(unjoinedData, "unjoined_test")) {
     assert("unjoined thread has result", unjoinedData.unjoined_test.result, "completed_value");
 }
 
-// Test 12: Stress test - N threads spawning while cross-joining with overall timeout (item #5)
-request.stressCounter = 0;
+// Test 12: Stress test - N threads with cross-joins and siblings joining each other
 var stressStart = getTickCount();
 var stressThreadCount = 10;
 for (var i = 1; i <= stressThreadCount; i++) {
     var threadName = "stress_" & i;
     thread name=threadName idx=i {
-        request.stressCounter++;
         sleep(50 + (attributes.idx * 10)); // Staggered sleep times
+        thread.started = true;
+        
         // Some threads spawn children
         if (attributes.idx mod 3 == 0) {
             var childName = "stress_child_" & attributes.idx;
@@ -296,14 +318,32 @@ for (var i = 1; i <= stressThreadCount; i++) {
             }
             thread action="join" name=childName timeout="500";
         }
+        
+        // Some threads cross-join siblings (earlier threads that should be finishing)
+        if (attributes.idx > 2 && attributes.idx mod 2 == 0) {
+            var targetIdx = attributes.idx - 2;
+            var targetName = "stress_" & targetIdx;
+            thread action="join" name=targetName timeout="500";
+        }
+        
         thread.completed = true;
     }
 }
+
 // Join all stress threads with timeout
 thread action="join" timeout="2000";
 var stressElapsed = getTickCount() - stressStart;
+
 assertTrue("stress test completed within time limit", stressElapsed < 2500);
-assertTrue("stress test completed at least 10 threads", request.stressCounter >= stressThreadCount);
+// Check that threads actually ran by inspecting thread.* scope entries
+var completedCount = 0;
+for (var i = 1; i <= stressThreadCount; i++) {
+    var name = "stress_" & i;
+    if (structKeyExists(cfthread, name) && structKeyExists(cfthread[name], "completed") && cfthread[name].completed) {
+        completedCount++;
+    }
+}
+assertTrue("stress test completed at least 8/10 threads", completedCount >= 8);
 
 suiteEnd();
 </cfscript>

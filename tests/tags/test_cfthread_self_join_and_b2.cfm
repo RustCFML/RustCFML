@@ -22,6 +22,7 @@ assertTrue("self-join returned quickly", (request.selfJoinEnd - request.selfJoin
 // Test 2: No-name join from child excludes self and ancestors (no hang)
 request.childJoinCompleted = false;
 request.childJoinedCount = 0;
+var ancestorStartTime = getTickCount();
 
 thread name="ancestor_parent" {
     // Spawn two siblings
@@ -37,11 +38,11 @@ thread name="ancestor_parent" {
     // Spawn a child that does no-name join
     thread name="child_joiner" {
         // No-name join should exclude self (child_joiner) and ancestor (ancestor_parent)
-        // but should join siblings
+        // but should wait for siblings to complete if visible
         thread action="join" timeout="3000";
         request.childJoinCompleted = true;
         
-        // Check which siblings completed
+        // Try to count completed siblings (may not be visible in child's cfthread scope)
         if (structKeyExists(cfthread, "sibling_1") && cfthread.sibling_1.status == "COMPLETED") {
             request.childJoinedCount++;
         }
@@ -54,15 +55,18 @@ thread name="ancestor_parent" {
 }
 
 thread action="join" name="ancestor_parent" timeout="10000";
+var ancestorElapsed = getTickCount() - ancestorStartTime;
 
 assertTrue("child no-name join completed", request.childJoinCompleted);
-// Note: child_joiner may not see siblings in its own cfthread scope depending on where it runs
-// but the important thing is it didn't hang trying to join its ancestor
+// Child may or may not see siblings in its local cfthread scope (implementation detail)
+// but it should not have hung trying to join its ancestor - timing bound verifies this
+assertTrue("ancestor test completed quickly (no hang on ancestor join)", ancestorElapsed < 1000);
 
 // Test 3: B2 regression - cross-join where target spawns a thread (should not deadlock)
 request.b2TargetSpawned = false;
 request.b2TargetChildCompleted = false;
 request.b2JoinerCompleted = false;
+var b2StartTime = getTickCount();
 
 thread name="b2_target" {
     sleep(50);
@@ -88,10 +92,13 @@ thread name="b2_joiner" {
 }
 
 thread action="join" name="b2_joiner,b2_target" timeout="10000";
+var b2Elapsed = getTickCount() - b2StartTime;
 
 assertTrue("B2 target spawned child", request.b2TargetSpawned);
 assertTrue("B2 target child completed", request.b2TargetChildCompleted);
 assertTrue("B2 joiner completed without deadlock", request.b2JoinerCompleted);
+// Should complete in ~150ms (target 50ms + child 100ms), not hang for 5s
+assertTrue("B2 join completed quickly (no deadlock)", b2Elapsed < 1000);
 
 // Verify all threads completed
 if (structKeyExists(cfthread, "b2_target")) {
