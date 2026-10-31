@@ -7114,23 +7114,68 @@ impl CfmlVirtualMachine {
                 if handle.result.is_some() {
                     return Ok(()); // already joined and published
                 }
-                let recv = if timeout_ms > 0 {
+                let recv_result = if timeout_ms > 0 {
                     handle
                         .rx
                         .recv_timeout(std::time::Duration::from_millis(timeout_ms as u64))
-                        .ok()
                 } else {
-                    handle.rx.recv().ok()
+                    handle.rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
-                match recv {
-                    Some(res) => {
+                match recv_result {
+                    Ok(res) => {
                         if let Some(j) = handle.join.take() {
                             let _ = j.join();
                         }
                         handle.result = Some(res.clone());
                         Some(res)
                     }
-                    None => None, // timed out — thread keeps running
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, // timed out — thread keeps running
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) | Err(_) => {
+                        // Channel closed (thread panicked) — CompletionGuard wrote TERMINATED
+                        // to registry. Fall back to reading it from there.
+                        if let Some(j) = handle.join.take() {
+                            let _ = j.join(); // Reap the panicked thread
+                        }
+                        // Try to read TERMINATED result from registry
+                        if let Ok(reg) = self.request_thread_registry.read() {
+                            if let Some(meta) = reg.get_metadata(name) {
+                                if let CfmlValue::Struct(ref s) = meta {
+                                    // Build a ThreadResult from the metadata
+                                    let status = s.get("status").map(|v| v.as_string()).unwrap_or_else(|| "TERMINATED".to_string());
+                                    let output = s.get("output").map(|v| v.as_string()).unwrap_or_default();
+                                    let error_val = s.get("error");
+                                    let error = if let Some(CfmlValue::Struct(ref e)) = error_val {
+                                        e.get("message").map(|v| v.as_string()).unwrap_or_else(|| "Thread terminated".to_string())
+                                    } else {
+                                        "Thread terminated".to_string()
+                                    };
+                                    let elapsed: i64 = if let Some(CfmlValue::Int(n)) = s.get("elapsedtime") {
+                                        n
+                                    } else {
+                                        0
+                                    };
+                                    let res = ThreadResult {
+                                        status,
+                                        output,
+                                        error,
+                                        mem_allocated: 0,
+                                        error_struct: error_val.map(|v| v.clone()),
+                                        elapsed,
+                                        thread_vars: ValueMap::default(),
+                                        return_value: None,
+                                    };
+                                    handle.result = Some(res.clone());
+                                    Some(res)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None // can't read registry, treat as timeout
+                        }
+                    }
                 }
             };
             if let Some(res) = collected {
