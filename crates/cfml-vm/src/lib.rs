@@ -4476,6 +4476,18 @@ impl RequestThreadRegistry {
         result
     }
 
+    /// Get metadata for root request's direct children only (Lucee ThreadData.java L19-24).
+    /// Returns entries where parent is None (spawned directly by root request).
+    pub fn get_root_children_metadata(&self) -> ValueMap {
+        let mut result = ValueMap::default();
+        for (key, entry) in &self.entries {
+            if entry.parent.is_none() {
+                result.insert(key.clone(), entry.metadata.clone());
+            }
+        }
+        result
+    }
+
     /// Check if a thread name exists in the registry.
     pub fn contains(&self, name: &str) -> bool {
         self.entries.contains_key(&name.to_lowercase())
@@ -4503,18 +4515,22 @@ impl RequestThreadRegistry {
     }
 
     /// Update thread metadata from ThreadResult (for CompletionGuard live updates).
-    /// Updates status, output, error, and elapsedtime in the registry entry.
+    /// Updates status, output, error, elapsedtime, and copies thread.* scope values.
+    /// Matches Lucee ThreadsImpl.java L150-161, L265-267: error only when failed.
     pub fn update_from_result(&mut self, name: &str, result: &ThreadResult) {
         let key = name.to_lowercase();
         if let Some(entry) = self.entries.get_mut(&key) {
             if let CfmlValue::Struct(ref mut s) = entry.metadata {
                 s.insert("status".to_string(), CfmlValue::string(result.status.clone()));
                 s.insert("output".to_string(), CfmlValue::string(result.output.clone()));
-                s.insert("error".to_string(), CfmlValue::string(result.error.clone()));
+                // Lucee only includes "error" when the thread failed (not empty string)
+                if !result.error.is_empty() {
+                    s.insert("error".to_string(), CfmlValue::string(result.error.clone()));
+                }
                 s.insert("elapsedtime".to_string(), CfmlValue::Int(result.elapsed));
-                // Also store error_struct if present
-                if let Some(ref err_struct) = result.error_struct {
-                    s.insert("errordetail".to_string(), err_struct.clone());
+                // Copy all thread.* scope values into the metadata (scenario 11: result, etc.)
+                for (k, v) in &result.thread_vars {
+                    s.insert(k.clone(), v.clone());
                 }
             }
         }
@@ -24672,8 +24688,18 @@ impl CfmlVirtualMachine {
                 // S5: threadData() returns the request-wide cfthread registry view (Lucee parity)
                 "threaddata" => {
                     // Lucee ThreadData.java L19-24: return root page context's cfthread struct
+                    // Only returns the ROOT request's DIRECT children (not all threads).
                     if let Ok(reg) = self.request_thread_registry.read() {
-                        let metadata = reg.get_all_metadata();
+                        // If this VM is a child thread, walk up to find root's children
+                        // If this VM is root (no cfml_thread_name), return threads with no parent
+                        let metadata = if self.cfml_thread_name.is_none() {
+                            // Root request: return only threads with no parent (direct children)
+                            reg.get_root_children_metadata()
+                        } else {
+                            // Child thread: for now return empty (Lucee behavior unclear for this case)
+                            // The spawner should call this, not the child
+                            ValueMap::default()
+                        };
                         return Ok(CfmlValue::strukt(metadata));
                     }
                     // If registry is unavailable, return empty struct

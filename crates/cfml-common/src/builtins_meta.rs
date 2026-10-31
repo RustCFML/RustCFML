@@ -238,7 +238,7 @@ pub const VM_INTERCEPTED: &[&str] = &[
     "settimezone", "setvariable", "sleep", "spreadsheetwrite", "static", "string", "stringeach",
     "stringevery", "stringfilter", "stringmap", "stringreduce", "stringsome", "stringsort",
     "structeach", "structevery", "structfilter", "structget", "structmap", "structreduce",
-    "structsome", "this", "thread", "threadjoin", "threadterminate", "throw", "top", "trace",
+    "structsome", "this", "thread", "threaddata", "threadjoin", "threadterminate", "throw", "top", "trace",
     "true", "url", "utc2local", "var", "variables", "writedump", "writelog", "writeoutput",
     "wspresence", "wspublish", "wssubscribe", "wsunsubscribe", "yes",
 ];
