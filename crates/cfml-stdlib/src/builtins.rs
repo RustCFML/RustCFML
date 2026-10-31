@@ -1973,14 +1973,48 @@ fn fn_mid(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_left(args: Vec<CfmlValue>) -> CfmlResult {
     let string = arc_str_arg(&args, 0);
-    let count = get_int(&args, 1)?.max(0) as usize;
-    Ok(CfmlValue::string(string[..char_offset(&string, count)].to_string()))
+    let count = get_int(&args, 1)?;
+    
+    if count == 0 {
+        return Err(CfmlError::runtime("Parameter 2 of function left which is now 0 must be a positive integer".to_string()));
+    }
+    
+    let char_count = string.chars().count();
+    let take = if count < 0 {
+        let abs_count = count.unsigned_abs() as usize;
+        if abs_count >= char_count {
+            char_count
+        } else {
+            char_count - abs_count
+        }
+    } else {
+        count.min(char_count as i64) as usize
+    };
+    
+    Ok(CfmlValue::string(string[..char_offset(&string, take)].to_string()))
 }
 
 fn fn_right(args: Vec<CfmlValue>) -> CfmlResult {
     let string = arc_str_arg(&args, 0);
-    let count = get_int(&args, 1)?.max(0) as usize;
-    Ok(CfmlValue::string(string[char_offset_from_end(&string, count)..].to_string()))
+    let count = get_int(&args, 1)?;
+    
+    if count == 0 {
+        return Err(CfmlError::runtime("Parameter 2 of function right which is now 0 must be a positive integer".to_string()));
+    }
+    
+    let char_count = string.chars().count();
+    let take = if count < 0 {
+        let abs_count = count.unsigned_abs() as usize;
+        if abs_count >= char_count {
+            char_count
+        } else {
+            char_count - abs_count
+        }
+    } else {
+        count.min(char_count as i64) as usize
+    };
+    
+    Ok(CfmlValue::string(string[char_offset_from_end(&string, take)..].to_string()))
 }
 
 fn fn_reverse(args: Vec<CfmlValue>) -> CfmlResult {
