@@ -718,6 +718,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfthread_shared_component.cfm" />
 <cf_runtest file="tags/test_cfthread_terminate_loop_shapes.cfm" />
 <cf_runtest file="tags/test_cfthread_cross_join.cfm" />
+<cf_runtest file="tags/test_cfthread_registry_verification.cfm" />
 <cf_runtest file="functions/test_extends_missing_parent.cfm" />
 <cf_runtest file="tags/test_application_scope_concurrency.cfm" />
 <cf_runtest file="tags/test_cflock_timeout_semantics.cfm" />

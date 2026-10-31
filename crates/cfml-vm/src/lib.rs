@@ -6602,6 +6602,13 @@ impl CfmlVirtualMachine {
         for (k, v) in seed.variables_snapshot {
             self.globals.insert(k, v);
         }
+        // The parent's cfthread was stripped at seed-build (GH #505). Create a
+        // fresh empty cfthread scope for this child so it only sees threads IT
+        // spawns (Lucee cfthread semantics).
+        self.globals.insert(
+            "cfthread".to_string(),
+            CfmlValue::Struct(CfmlStruct::new(ValueMap::default())),
+        );
         // Carry the parent's pre-seeded `thread.*` values so run_thread_body
         // can seed the body's `thread` scope with them (issue #217).
         self.page_thread_scope = CfmlStruct::new(seed.page_thread_scope);
