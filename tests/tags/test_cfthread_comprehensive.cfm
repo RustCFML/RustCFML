@@ -25,7 +25,7 @@ if (structKeyExists(cfthread, "chain_20")) {
     if (structKeyExists(cfthread.chain_20, "error")) {
         request.chainError = cfthread.chain_20.error.message ?: "unknown error";
     }
-    assert("chain #505 no errors", request.chainError, "");
+    assert("chain ##505 no errors", request.chainError, "");
     assert("chain final status", cfthread.chain_20.status, "COMPLETED");
 }
 
