@@ -48084,3 +48084,287 @@ mod app_datasource_binding_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod request_thread_registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn make_completion() -> Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)> {
+        Arc::new((Mutex::new(None), std::sync::Condvar::new()))
+    }
+
+    fn make_metadata(name: &str, status: &str) -> CfmlValue {
+        let mut m = ValueMap::default();
+        m.insert("name".to_string(), CfmlValue::string(name.to_string()));
+        m.insert("status".to_string(), CfmlValue::string(status.to_string()));
+        CfmlValue::strukt(m)
+    }
+
+    #[test]
+    fn registry_register_and_get() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let completion = make_completion();
+        let metadata = make_metadata("thread1", "RUNNING");
+
+        let result = reg.register(
+            "thread1".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            completion.clone(),
+            metadata.clone(),
+            None,
+            true,
+        );
+
+        assert!(result.is_ok(), "register should succeed");
+        assert!(reg.contains("thread1"));
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn registry_duplicate_name_throws() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let completion = make_completion();
+        let metadata = make_metadata("dup", "RUNNING");
+
+        reg.register(
+            "dup".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            completion.clone(),
+            metadata.clone(),
+            None,
+            true,
+        ).unwrap();
+
+        let result = reg.register(
+            "dup".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            completion.clone(),
+            metadata.clone(),
+            None,
+            true,
+        );
+
+        assert!(result.is_err(), "duplicate name should throw");
+        assert!(result.unwrap_err().contains("unique"), "error should mention 'unique'");
+    }
+
+    #[test]
+    fn registry_cap_eviction_fifo() {
+        let reg = RequestThreadRegistry::new(3); // Small cap for testing
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+
+        // Register 5 threads with cap of 3
+        for i in 1..=5 {
+            let name = format!("thread{}", i);
+            reg.register(
+                name.clone(),
+                cancel.clone(),
+                interrupted.clone(),
+                make_completion(),
+                make_metadata(&name, "RUNNING"),
+                None,
+                true,
+            ).unwrap();
+        }
+
+        // Should have evicted oldest 2 (thread1, thread2)
+        assert_eq!(reg.len(), 3, "should be capped at 3");
+        assert!(!reg.contains("thread1"), "oldest should be evicted");
+        assert!(!reg.contains("thread2"), "second oldest should be evicted");
+        assert!(reg.contains("thread3"), "third should remain");
+        assert!(reg.contains("thread4"), "fourth should remain");
+        assert!(reg.contains("thread5"), "newest should remain");
+    }
+
+    #[test]
+    fn registry_clear() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+
+        reg.register(
+            "t1".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("t1", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        assert_eq!(reg.len(), 1);
+        reg.clear();
+        assert_eq!(reg.len(), 0);
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn registry_get_non_ancestor_names_no_self() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+
+        // Register threads with no parent relationships
+        reg.register(
+            "t1".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("t1", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        reg.register(
+            "t2".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("t2", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        // Get non-ancestors with no self_name (from root context)
+        let names = reg.get_non_ancestor_names(None);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"t1".to_string()));
+        assert!(names.contains(&"t2".to_string()));
+    }
+
+    #[test]
+    fn registry_get_non_ancestor_names_excludes_self() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+
+        reg.register(
+            "t1".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("t1", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        reg.register(
+            "t2".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("t2", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        // From t1's perspective, should exclude self
+        let names = reg.get_non_ancestor_names(Some("t1"));
+        assert_eq!(names.len(), 1);
+        assert!(!names.contains(&"t1".to_string()), "should exclude self");
+        assert!(names.contains(&"t2".to_string()));
+    }
+
+    #[test]
+    fn registry_get_non_ancestor_names_excludes_parent() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+
+        // Register parent
+        reg.register(
+            "parent".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("parent", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        // Register child with parent
+        reg.register(
+            "child".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("child", "RUNNING"),
+            Some("parent".to_string()),
+            true,
+        ).unwrap();
+
+        // Register sibling
+        reg.register(
+            "sibling".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            make_completion(),
+            make_metadata("sibling", "RUNNING"),
+            Some("parent".to_string()),
+            true,
+        ).unwrap();
+
+        // From child's perspective, should exclude self and parent, but include sibling
+        let names = reg.get_non_ancestor_names(Some("child"));
+        assert!(!names.contains(&"child".to_string()), "should exclude self");
+        assert!(!names.contains(&"parent".to_string()), "should exclude parent");
+        assert!(names.contains(&"sibling".to_string()), "should include sibling");
+    }
+
+    #[test]
+    fn registry_wait_for_completion_already_complete() {
+        let reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let completion = make_completion();
+
+        // Pre-fill result
+        {
+            let (lock, _) = &*completion;
+            let mut guard = lock.lock().unwrap();
+            *guard = Some(ThreadResult {
+                status: "COMPLETED".to_string(),
+                output: String::new(),
+                error: String::new(),
+                error_struct: None,
+                mem_allocated: 0,
+                elapsed: 10,
+                thread_vars: ValueMap::default(),
+                return_value: None,
+            });
+        }
+
+        reg.register(
+            "done".to_string(),
+            cancel.clone(),
+            interrupted.clone(),
+            completion.clone(),
+            make_metadata("done", "COMPLETED"),
+            None,
+            true,
+        ).unwrap();
+
+        // Should return immediately
+        let result = reg.wait_for_completion("done", 1000);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().status, "COMPLETED");
+    }
+
+    #[test]
+    fn registry_wait_for_completion_unknown_name() {
+        let reg = RequestThreadRegistry::new(10);
+        let result = reg.wait_for_completion("nonexistent", 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no thread running"));
+    }
+}

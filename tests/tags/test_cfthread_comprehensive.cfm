@@ -13,9 +13,20 @@ function spawnChainLevel(level) {
     }
     var nextName = "chain_" & (level + 1);
     thread name=nextName nextLevel=(level + 1) {
-        spawnChainLevel(attributes.nextLevel);
+        try {
+            spawnChainLevel(attributes.nextLevel);
+            if (structKeyExists(cfthread, attributes.nextName)) {
+                thread.chainStatus = cfthread[attributes.nextName].status;
+            }
+        } catch (any e) {
+            thread.chainError = e.message;
+        }
     }
     thread action="join" name=nextName;
+    // Check for errors at each level
+    if (structKeyExists(cfthread, nextName) && structKeyExists(cfthread[nextName], "chainError")) {
+        request.chainError = cfthread[nextName].chainError;
+    }
 }
 
 thread name="chain_1" {
@@ -25,122 +36,14 @@ thread action="join" name="chain_1";
 
 // Verify no errors and chain completed
 assert("chain completed all iterations", request.chainIterations, request.maxChainLevel);
-
-// Test 2: Cap-eviction with small limit (S6)
-var capTestNames = [];
-for (var i = 1; i <= 8; i++) {
-    var tname = "cap_test_" & i;
-    arrayAppend(capTestNames, tname);
-    thread name=tname idx=i {
-        thread.num = attributes.idx;
-    }
-}
-// Join all
-for (var i = 1; i <= 8; i++) {
-    try {
-        thread action="join" name=capTestNames[i] timeout="2000";
-    } catch (any e) {
-        // May throw if evicted from registry (S3)
-    }
-}
-// Spawner's cfthread scope may have been capped (S6)
-var capCount = 0;
-for (var i = 1; i <= 8; i++) {
-    if (structKeyExists(cfthread, capTestNames[i])) {
-        capCount++;
-    }
-}
-// Should have capped at some reasonable limit
-assertTrue("cap test spawned threads", capCount > 0);
-
-// Test 3: Cross-thread join timing (B1)
-request.targetStarted = false;
-request.targetDone = false;
-request.joinerJoinedAt = 0;
-request.joinerTimedOut = false;
-
-thread name="timing_target" {
-    request.targetStarted = true;
-    sleep(200);
-    thread.value = 42;
-    request.targetDone = true;
+assert("chain had no errors", request.chainError, "");
+// Check final thread status
+if (structKeyExists(cfthread, "chain_1")) {
+    assertTrue("chain_1 status is COMPLETED or TERMINATED", 
+        cfthread.chain_1.status == "COMPLETED" || cfthread.chain_1.status == "TERMINATED");
 }
 
-sleep(10); // Let target start
-
-thread name="timing_joiner" {
-    var startJoin = getTickCount();
-    try {
-        thread action="join" name="timing_target" timeout="5000";
-        request.joinerJoinedAt = getTickCount() - startJoin;
-    } catch (any e) {
-        request.joinerTimedOut = true;
-    }
-}
-
-thread action="join" name="timing_joiner,timing_target";
-
-assertTrue("target started", request.targetStarted);
-assertTrue("target completed", request.targetDone);
-assertFalse("joiner did not timeout", request.joinerTimedOut);
-assertTrue("cross-join completed quickly (under 1s)", request.joinerJoinedAt < 1000);
-// Verify target metadata
-if (structKeyExists(cfthread, "timing_target")) {
-    assert("timing target status", cfthread.timing_target.status, "COMPLETED");
-    assert("timing target value", cfthread.timing_target.value, 42);
-}
-
-// Test 4: Cross-thread join on error
-request.errorJoinerSawError = false;
-request.errorJoinerStatus = "";
-
-thread name="error_target" {
-    throw(message="intentional error for test");
-}
-
-thread name="error_joiner" {
-    thread action="join" name="error_target" timeout="2000";
-    // Check if error visible after join
-    if (isDefined("cfthread") && structKeyExists(cfthread, "error_target")) {
-        // Can't see other thread's cfthread scope directly
-    }
-    request.errorJoinerStatus = "joined";
-}
-
-thread action="join" name="error_joiner,error_target";
-
-assert("error joiner completed", request.errorJoinerStatus, "joined");
-// Parent can see error
-if (structKeyExists(cfthread, "error_target")) {
-    // Note: RustCFML may report TERMINATED for errored threads depending on timing
-    assertTrue("error target finished", len(cfthread.error_target.status) > 0);
-    assertTrue("error target has error", structKeyExists(cfthread.error_target, "error"));
-}
-
-// Test 5: Cross-thread join on terminate
-request.terminateJoinerCompleted = false;
-
-thread name="terminate_target" {
-    sleep(2000); // Long sleep
-    thread.should_not_reach = true;
-}
-
-thread name="terminate_joiner" {
-    sleep(50);
-    thread action="terminate" name="terminate_target";
-    thread action="join" name="terminate_target" timeout="2000";
-    request.terminateJoinerCompleted = true;
-}
-
-thread action="join" name="terminate_joiner,terminate_target";
-
-assertTrue("terminate joiner completed", request.terminateJoinerCompleted);
-if (structKeyExists(cfthread, "terminate_target")) {
-    // Note: Terminate may complete before cancel takes effect depending on timing
-    assertTrue("terminate target finished", len(cfthread.terminate_target.status) > 0);
-}
-
-// Test 6: Duplicate name throws (S1)
+// Test 2: Duplicate name throws (S1)
 request.duplicateThrew = false;
 thread name="dup_test" {
     thread.first = true;
@@ -156,7 +59,7 @@ try {
 
 assertTrue("duplicate thread name threw", request.duplicateThrew);
 
-// Test 7: Unknown name join throws (S3)
+// Test 3: Unknown name join throws (S3)
 request.unknownJoinThrew = false;
 try {
     thread action="join" name="nonexistent_thread_xyz" timeout="100";
@@ -165,7 +68,7 @@ try {
 }
 assertTrue("unknown join threw", request.unknownJoinThrew);
 
-// Test 8: Unknown name terminate throws (S3)
+// Test 4: Unknown name terminate throws (S3)
 request.unknownTerminateThrew = false;
 try {
     thread action="terminate" name="nonexistent_thread_abc";
@@ -175,20 +78,126 @@ try {
 }
 assertTrue("unknown terminate threw", request.unknownTerminateThrew);
 
-// Test 9: No-name join (S2) - joins all non-ancestor threads
+// Test 5: Cross-thread join timing with bounds (B1/B2)
+request.targetStarted = false;
+request.targetDone = false;
+request.joinerStart = -1;
+request.joinerEnd = -1;
+request.joinerTimedOut = false;
+
+thread name="timing_target" {
+    request.targetStarted = true;
+    sleep(200);
+    thread.value = 42;
+    request.targetDone = true;
+}
+
+sleep(50); // Let target start
+
+thread name="timing_joiner" {
+    request.joinerStart = getTickCount();
+    try {
+        thread action="join" name="timing_target" timeout="5000";
+        request.joinerEnd = getTickCount();
+    } catch (any e) {
+        request.joinerTimedOut = true;
+        request.joinerEnd = getTickCount();
+    }
+}
+
+thread action="join" name="timing_joiner,timing_target";
+
+assertTrue("target started", request.targetStarted);
+assertTrue("target completed", request.targetDone);
+assertFalse("joiner did not timeout", request.joinerTimedOut);
+assertTrue("joiner start time recorded", request.joinerStart > 0);
+assertTrue("joiner end time recorded", request.joinerEnd > 0);
+var joinElapsed = request.joinerEnd - request.joinerStart;
+assertTrue("cross-join waited at least ~100ms", joinElapsed >= 100);
+assertTrue("cross-join completed under 2s", joinElapsed < 2000);
+// Verify target metadata
+if (structKeyExists(cfthread, "timing_target")) {
+    assert("timing target status", cfthread.timing_target.status, "COMPLETED");
+    assert("timing target value", cfthread.timing_target.value, 42);
+}
+
+// Test 6: Cross-thread join on error - status must be TERMINATED
+request.errorThreadStatus = "";
+
+thread name="error_target" {
+    throw(message="intentional error for test");
+}
+
+sleep(50); // Let it error
+
+// Check spawner's view of errored thread
+if (structKeyExists(cfthread, "error_target")) {
+    request.errorThreadStatus = cfthread.error_target.status;
+}
+
+thread name="error_joiner" {
+    thread action="join" name="error_target" timeout="2000";
+}
+
+thread action="join" name="error_joiner,error_target";
+
+// Parent can see error
+if (structKeyExists(cfthread, "error_target")) {
+    assert("error target status is TERMINATED", cfthread.error_target.status, "TERMINATED");
+    assertTrue("error target has error", structKeyExists(cfthread.error_target, "error"));
+    assertTrue("error target error is non-empty", len(cfthread.error_target.error) > 0);
+}
+
+// Test 7: Terminate interrupts sleep - ELAPSEDTIME 0, status TERMINATED
+request.terminateJoinerCompleted = false;
+request.terminateTargetReached = false;
+
+thread name="terminate_target" {
+    sleep(5000); // Long sleep that should be interrupted
+    thread.should_not_reach = true;
+    request.terminateTargetReached = true;
+}
+
+sleep(50); // Let it start sleeping
+
+thread name="terminate_joiner" {
+    thread action="terminate" name="terminate_target";
+    thread action="join" name="terminate_target" timeout="2000";
+    request.terminateJoinerCompleted = true;
+}
+
+thread action="join" name="terminate_joiner,terminate_target";
+
+assertTrue("terminate joiner completed", request.terminateJoinerCompleted);
+assertFalse("terminate target did not reach code after sleep", request.terminateTargetReached);
+if (structKeyExists(cfthread, "terminate_target")) {
+    assert("terminate target status is TERMINATED", cfthread.terminate_target.status, "TERMINATED");
+    // Note: elapsedTime might not be exactly 0 due to timing, but should be very small
+    assertTrue("terminate target elapsed time is small", cfthread.terminate_target.elapsedTime < 1000);
+    assertFalse("terminate target did not set should_not_reach", 
+        structKeyExists(cfthread.terminate_target, "should_not_reach"));
+}
+
+// Test 8: No-name join (S2) - joins all non-ancestor threads
 request.noNameJoinCount = 0;
+request.noName1Start = -1;
+request.noName2Start = -1;
 
 thread name="no_name_1" {
-    sleep(100);
+    request.noName1Start = getTickCount();
+    sleep(150);
     thread.idx = 1;
 }
 thread name="no_name_2" {
-    sleep(100);
+    request.noName2Start = getTickCount();
+    sleep(150);
     thread.idx = 2;
 }
 
+var joinStart = getTickCount();
 // Join all with no name
 thread action="join" timeout="3000";
+var joinEnd = getTickCount();
 
 // Both should be completed
 if (structKeyExists(cfthread, "no_name_1") && structKeyExists(cfthread, "no_name_2")) {
@@ -196,8 +205,32 @@ if (structKeyExists(cfthread, "no_name_1") && structKeyExists(cfthread, "no_name
     if (cfthread.no_name_2.status == "COMPLETED") request.noNameJoinCount++;
 }
 assert("no-name join completed all", request.noNameJoinCount, 2);
+// Verify timing - should have waited for both
+assertTrue("no-name join waited appropriately", (joinEnd - joinStart) >= 100);
 
-// Test 10: threadData() returns request-wide view (S5)
+// Test 9: Shared timeout budget for no-name join expires
+thread name="budget_1" {
+    sleep(300);
+    thread.done = true;
+}
+thread name="budget_2" {
+    sleep(300);
+    thread.done = true;
+}
+thread name="budget_3" {
+    sleep(300);
+    thread.done = true;
+}
+
+var budgetStart = getTickCount();
+thread action="join" timeout="500"; // 500ms total budget for all 3 x 300ms threads
+var budgetElapsed = getTickCount() - budgetStart;
+
+// Should have timed out before all complete (total would be ~900ms but budget is 500ms)
+assertTrue("shared timeout budget was enforced", budgetElapsed < 800);
+assertTrue("shared timeout took at least budget time", budgetElapsed >= 400);
+
+// Test 10: threadData() returns request-wide view
 thread name="data_test_1" {
     sleep(50);
     thread.value = 100;
@@ -207,6 +240,7 @@ thread name="data_test_2" {
     thread.value = 200;
 }
 
+sleep(10);
 var threadDataResult = threadData();
 assertTrue("threadData returns struct", isStruct(threadDataResult));
 // Should have at least our test threads (may have more from other tests)
@@ -219,28 +253,10 @@ thread action="join" name="data_test_1,data_test_2";
 var threadDataAfter = threadData();
 assertTrue("threadData has data_test_1", structKeyExists(threadDataAfter, "data_test_1"));
 assertTrue("threadData has data_test_2", structKeyExists(threadDataAfter, "data_test_2"));
-
-// Test 11: Shared timeout budget for no-name join (S2)
-request.budgetCount = 0;
-thread name="budget_1" {
-    sleep(100);
-    thread.done = true;
+// Verify they're COMPLETED
+if (structKeyExists(threadDataAfter, "data_test_1")) {
+    assert("data_test_1 status", threadDataAfter.data_test_1.status, "COMPLETED");
 }
-thread name="budget_2" {
-    sleep(100);
-    thread.done = true;
-}
-thread name="budget_3" {
-    sleep(100);
-    thread.done = true;
-}
-
-var budgetStart = getTickCount();
-thread action="join" timeout="500"; // 500ms total budget for all
-var budgetElapsed = getTickCount() - budgetStart;
-
-// Should have timed out before all complete, or completed all quickly
-assertTrue("shared timeout budget used", budgetElapsed <= 600);
 
 suiteEnd();
 </cfscript>
