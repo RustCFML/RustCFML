@@ -1528,6 +1528,35 @@ fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
 /// ~8 MB stack. This is virtual address space, not committed memory.
 const CFTHREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Drop guard that signals thread completion on ALL exit paths (normal, error, panic).
+/// Fixes B1: ensures cross-thread joins complete when the thread ends, not when spawner joins.
+struct CompletionGuard {
+    handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>,
+    result: Option<cfml_vm::ThreadResult>,
+}
+
+impl CompletionGuard {
+    fn new(handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>) -> Self {
+        Self { handle, result: None }
+    }
+
+    fn set_result(&mut self, result: cfml_vm::ThreadResult) {
+        self.result = Some(result);
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            let (lock, cvar) = &**handle;
+            // Recover from poisoning - we still want to signal
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = self.result.clone();
+            cvar.notify_all();
+        }
+    }
+}
+
 /// Spawn a `cfthread` body on a real OS thread. Builds a fresh child VM from
 /// the seed (same runtime wiring as a request VM, via `register_vm_runtime`),
 /// runs the body, and reports the `ThreadResult` back over a channel. The
@@ -1536,9 +1565,13 @@ const CFTHREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = seed.cancel_flag.clone();
+    let completion_handle = seed.completion_handle.clone();
     let join = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
+            // B1 fix: Drop guard ensures completion is signaled on ALL exit paths
+            let mut guard = CompletionGuard::new(completion_handle);
+            
             cfml_common::stack_guard::init(CFTHREAD_STACK_SIZE);
             // The allocation log is THREAD-LOCAL, armed per thread by `enable()`,
             // and until now only the request path ever called it. So every
@@ -1563,6 +1596,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             register_vm_runtime(&mut vm);
             let (closure, attributes) = vm.apply_thread_seed(seed);
             let result = vm.run_thread_body(&closure, attributes, &ValueMap::default());
+            guard.set_result(result.clone()); // Store for drop guard
             if armed {
                 // Same contract as the request path: a nested cfthread still
                 // running can race the refcounts, so defer this log to it rather
@@ -1588,6 +1622,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             cfml_common::cycle_gc::body_finished();
             // Receiver may be gone if the parent never joined; ignore.
             let _ = tx.send(result);
+            // guard drops here, signaling completion
         })
         .expect("cfthread: failed to spawn OS thread");
     ThreadHandle {

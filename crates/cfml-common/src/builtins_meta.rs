@@ -171,7 +171,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "structisordered", "structkeyarray", "structkeyexists", "structkeylist", "structkeytranslate",
     "structmap", "structnew", "structreduce", "structsetmetadata", "structsome", "structsort",
     "structtoquerystring", "structtosorted", "structupdate", "structvaluearray",
-    "systemcacheclear", "systemoutput", "tan", "threadjoin", "threadterminate", "throw",
+    "systemcacheclear", "systemoutput", "tan", "threaddata", "threadjoin", "threadterminate", "throw",
     "timeformat", "tobase64", "tobinary", "toboolean", "tonumeric", "toscript", "tostring",
     "trace", "trim", "truefalseformat", "ucase", "ucfirst", "urldecode", "urlencode",
     "urlencodedformat", "val", "validatejson", "valuearray", "valuelist", "verifybcrypthash",
