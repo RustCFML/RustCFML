@@ -6311,6 +6311,15 @@ impl CfmlVirtualMachine {
                 // is.) A by-value copy either way, so the GH #234 fix above —
                 // sibling threads must not share one live scope — still holds.
                 let mut vars = self.globals.clone();
+                // Remove the parent's `cfthread` scope so the child gets its
+                // own independent scope instead of sharing the parent's Arc
+                // (GH #505). Without this, a self-rescheduling chain leaks
+                // ~1.3 KB per thread forever: each child inherits the parent's
+                // live cfthread struct, `store_cfthread_running` adds the
+                // child's entry to it, and the child then passes that same
+                // struct to its own child. The chain holds one growing struct
+                // for its entire lifetime.
+                vars.shift_remove("cfthread");
                 if let Some(cv) = component_vars {
                     for (k, v) in cv {
                         vars.insert(k, v);
