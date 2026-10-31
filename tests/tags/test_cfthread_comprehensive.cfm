@@ -1,7 +1,7 @@
 <cfscript>
-suiteBegin("cfthread: Comprehensive Lucee parity and #505 regression tests");
+suiteBegin("cfthread: Comprehensive Lucee parity and ##505 regression tests");
 
-// Test 1: #505 regression - nested self-spawning chain with error assertions
+// Test 1: ##505 regression - nested self-spawning chain with error assertions
 request.chainError = "";
 request.chainIterations = 0;
 
@@ -11,10 +11,10 @@ thread name="chain_1" level=1 maxLevel=20 {
         thread.done = true;
         return;
     }
-    thread name="chain_#(attributes.level + 1)#" level=(attributes.level + 1) maxLevel=attributes.maxLevel {
+    thread name="chain_##(attributes.level + 1)##" level=(attributes.level + 1) maxLevel=attributes.maxLevel {
         // Recursive spawn
     }
-    thread action="join" name="chain_#(attributes.level + 1)#";
+    thread action="join" name="chain_##(attributes.level + 1)##";
 }
 thread action="join" name="chain_1";
 
@@ -33,14 +33,14 @@ if (structKeyExists(cfthread, "chain_20")) {
 // Set limit via env var before running: export RUSTCFML_TASKS_LIMIT=5
 // For now, test that many threads don't crash
 for (var i = 1; i <= 8; i++) {
-    thread name="cap_test_#i#" idx=i {
+    thread name="cap_test_##i##" idx=i {
         thread.num = attributes.idx;
     }
 }
 // Join all
 for (var i = 1; i <= 8; i++) {
     try {
-        thread action="join" name="cap_test_#i#" timeout="2000";
+        thread action="join" name="cap_test_##i##" timeout="2000";
     } catch (any e) {
         // May throw if evicted from registry (S3)
     }
@@ -48,7 +48,7 @@ for (var i = 1; i <= 8; i++) {
 // Spawner's cfthread scope may have been capped (S6)
 var capCount = 0;
 for (var i = 1; i <= 8; i++) {
-    if (structKeyExists(cfthread, "cap_test_#i#")) {
+    if (structKeyExists(cfthread, "cap_test_##i##")) {
         capCount++;
     }
 }
