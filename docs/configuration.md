@@ -253,6 +253,10 @@ Map of name → driver config. The name becomes the value used in
     "username": "u",
     "password": "p",
     "connectionString": "",       // optional — overrides the synthesised URL
+    "connectionLimit": 100,       // pool size (MySQL): max open connections, Lucee default 100
+    "idleTimeout": 60,            // minutes (MySQL): an idle pooled connection is closed after this;
+                                  // 0 keeps connections open for the life of the process
+    "connectionTimeout": 5,       // seconds to wait for a free pooled connection (default 5)
     "default": false              // when true, used when cfquery omits datasource
   }
 }

@@ -671,10 +671,19 @@ impl DatasourceCfg {
             format!(":{}", self.port)
         };
         match driver.as_str() {
-            "mysql" | "mariadb" => Some(format!(
-                "mysql://{}{}{}/{}",
-                creds, self.host, port, self.database
-            )),
+            "mysql" | "mariadb" => {
+                // Lucee's pool keys travel on the URL; the stdlib strips them
+                // before the driver sees it. `idleTimeout` is minutes there.
+                let mut params: Vec<String> = Vec::new();
+                if self.connection_limit > 0 {
+                    params.push(format!("pool_max={}", self.connection_limit));
+                }
+                if self.idle_timeout > 0 {
+                    params.push(format!("idle_timeout={}", u64::from(self.idle_timeout) * 60));
+                }
+                let query = if params.is_empty() { String::new() } else { format!("?{}", params.join("&")) };
+                Some(format!("mysql://{}{}{}/{}{}", creds, self.host, port, self.database, query))
+            }
             "postgresql" | "postgres" => Some(format!(
                 "postgresql://{}{}{}/{}",
                 creds, self.host, port, self.database

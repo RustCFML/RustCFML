@@ -154,7 +154,7 @@ These deserialize without error but have no runtime effect:
 | `server.http2` | Not wired to the HTTP server. |
 | `runtime.trustedCache` | Reserved; bytecode-cache trust is driven by `--production`, not this key. |
 | `debugging.showExecutionTime` | No timing output. |
-| `datasources[].connectionLimit` / `idleTimeout` / `timezone` | Pool tuning / per-DS timezone not applied. (`connectionTimeout` **is** applied — it reaches the pool builder.) |
+| `datasources[].timezone` | Per-DS timezone not applied. (`connectionLimit`, `idleTimeout` and `connectionTimeout` **are** applied to the MySQL pool; the other drivers' r2d2 pools take `connectionTimeout` only.) |
 | `mailServers[].timeout` | Carried but not applied during send. |
 | `caches[].properties.maxObjects` / `defaultTimeout` / `evictionPolicy` | Region **defaults** not applied: a cache has no capacity bound and no eviction policy, and an entry stored with no explicit TTL never expires. A per-entry TTL — `cachePut( id, value, timespan )` — **is** honoured and does expire the entry, so this is narrower than it reads: it bites code that relies on the region's `defaultTimeout`/`maxObjects` instead of passing a TTL per put. |
 | `logging.format` | Only `"text"`; other values warn and fall back. |

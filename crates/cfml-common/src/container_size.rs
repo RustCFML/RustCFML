@@ -158,3 +158,16 @@ pub fn set_db_pool_count(f: fn() -> usize) {
 pub fn db_pool_count() -> usize {
     DB_POOL_COUNT.get().map_or(0, |f| f())
 }
+
+static DB_POOL_CONNECTIONS: OnceLock<fn() -> (usize, u32, u32)> = OnceLock::new();
+
+/// Install the pooled-connection census. Called by `cfml-stdlib`.
+pub fn set_db_pool_connections(f: fn() -> (usize, u32, u32)) {
+    let _ = DB_POOL_CONNECTIONS.set(f);
+}
+
+/// Pooled MySQL connections: (pools, connections, of which idle). Zeros in a
+/// build without the MySQL driver.
+pub fn db_pool_connections() -> (usize, u32, u32) {
+    DB_POOL_CONNECTIONS.get().map_or((0, 0, 0), |f| f())
+}

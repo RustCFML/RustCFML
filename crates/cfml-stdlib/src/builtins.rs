@@ -485,6 +485,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // `container_size`'s reporting-hooks section.
     cfml_common::container_size::set_regex_cache_census(regex_cache_census);
     cfml_common::container_size::set_db_pool_count(db_pool_count);
+    cfml_common::container_size::set_db_pool_connections(mysql_pool_connections);
     let mut f: HashMap<String, BuiltinFunction> = HashMap::new();
 
     // ---- Output functions ----
@@ -11171,7 +11172,7 @@ static DATASOURCE_TIMEOUTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::ne
 /// datasource fails a request in seconds instead of stalling it for half a
 /// minute — r2d2 retries a doomed connection with backoff until this elapses.
 /// Override per-datasource with the `connectionTimeout` config key.
-#[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 const DEFAULT_DB_CONNECTION_TIMEOUT_SECS: u64 = 5;
 
 /// Record a per-datasource connection-acquire timeout (seconds) for `url`.
@@ -11206,7 +11207,7 @@ fn fn_register_ds_timeout(args: Vec<CfmlValue>) -> CfmlResult {
 
 /// Resolve the connection-acquire timeout for a connection URL: the registered
 /// per-datasource override if present, else the networked-pool default.
-#[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
+#[cfg(any(feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn datasource_timeout(url: &str) -> std::time::Duration {
     let secs = DATASOURCE_TIMEOUTS
         .get()
@@ -11489,6 +11490,143 @@ fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, Cf
     Ok(pool)
 }
 
+/// Pool sizing for a MySQL datasource, read off the connection URL.
+///
+/// A `.cfconfig.json` datasource carries Lucee's `connectionLimit`
+/// (connections) and `idleTimeout` (minutes); `DatasourceCfg::connection_url`
+/// writes them onto the URL as `pool_max=` and `idle_timeout=` (seconds), so a
+/// raw connection string can set them the same way. Both are stripped here:
+/// `pool_max`/`pool_min` are `mysql`-crate parameters that size ITS pool, which
+/// is no longer used (see `MysqlConnectionManager`), and the crate rejects an
+/// `idle_timeout` key outright.
+#[cfg(feature = "mysql_db")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MysqlPoolSettings {
+    max: u32,
+    /// `None`: never reap an idle connection.
+    idle_timeout: Option<std::time::Duration>,
+}
+
+/// Lucee's defaults: `connectionLimit` 100, `idleTimeout` 60 minutes.
+#[cfg(feature = "mysql_db")]
+const MYSQL_POOL_MAX_DEFAULT: u32 = 100;
+#[cfg(feature = "mysql_db")]
+const MYSQL_IDLE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+#[cfg(feature = "mysql_db")]
+fn mysql_extract_pool_settings(url: &str) -> (String, MysqlPoolSettings) {
+    let mut settings = MysqlPoolSettings {
+        max: MYSQL_POOL_MAX_DEFAULT,
+        idle_timeout: Some(MYSQL_IDLE_TIMEOUT_DEFAULT),
+    };
+    let Some((base, query)) = url.split_once('?') else {
+        return (url.to_string(), settings);
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "pool_max" => {
+                if let Ok(n) = v.trim().parse::<u32>() {
+                    if n > 0 {
+                        settings.max = n;
+                    }
+                }
+            }
+            "idle_timeout" => match v.trim().parse::<u64>() {
+                Ok(0) => settings.idle_timeout = None,
+                Ok(secs) => settings.idle_timeout = Some(std::time::Duration::from_secs(secs)),
+                Err(_) => {}
+            },
+            "pool_min" => {}
+            _ => kept.push(pair),
+        }
+    }
+    let sanitized = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, kept.join("&"))
+    };
+    (sanitized, settings)
+}
+
+/// One pooled MySQL connection: the driver's `Conn` plus the state the return
+/// path needs. `needs_reset` is the fail-safe: armed on every checkout, and
+/// only the paths that KNOW the connection ran nothing session-risky
+/// (`release_request_db_conns`, a cleanly closed transaction) disarm it before
+/// the handle drops. Armed, the return path issues COM_RESET_CONNECTION, which
+/// wipes session state so it cannot leak into the next request (GitHub #275)
+/// — and the server-side prepared statements with it, which is why the clean
+/// paths bother to disarm it (one COM_STMT_PREPARE round-trip per statement
+/// otherwise).
+#[cfg(feature = "mysql_db")]
+pub struct MysqlConn {
+    conn: mysql::Conn,
+    needs_reset: bool,
+    broken: bool,
+}
+
+#[cfg(feature = "mysql_db")]
+impl std::ops::Deref for MysqlConn {
+    type Target = mysql::Conn;
+    fn deref(&self) -> &mysql::Conn {
+        &self.conn
+    }
+}
+
+#[cfg(feature = "mysql_db")]
+impl std::ops::DerefMut for MysqlConn {
+    fn deref_mut(&mut self) -> &mut mysql::Conn {
+        &mut self.conn
+    }
+}
+
+/// MySQL connections are pooled by r2d2, like every other driver here, rather
+/// than by the `mysql` crate's own pool. The crate's pool hands idle
+/// connections out FIFO and never closes one, so a pool grew to the peak
+/// concurrency the process ever saw (requests plus heartbeat threads) and
+/// stayed there for its lifetime — each connection holding the 8 MiB of packet
+/// buffers the driver preallocates. r2d2 reuses the most recently returned
+/// connection and reaps the rest after `idleTimeout`, honours
+/// `connectionLimit`, and reports exact connection counts for the memory
+/// panel.
+#[cfg(feature = "mysql_db")]
+struct MysqlConnectionManager {
+    opts: mysql::Opts,
+}
+
+#[cfg(feature = "mysql_db")]
+type MysqlPooledConn = r2d2::PooledConnection<MysqlConnectionManager>;
+
+#[cfg(feature = "mysql_db")]
+impl r2d2::ManageConnection for MysqlConnectionManager {
+    type Connection = MysqlConn;
+    type Error = mysql::Error;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        Ok(MysqlConn { conn: mysql::Conn::new(self.opts.clone())?, needs_reset: true, broken: false })
+    }
+
+    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        conn.conn.ping()
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        // r2d2 calls this as a handle is returned, outside the pool lock. It is
+        // where the driver pool's reset-on-return used to happen: an armed
+        // connection is reset here, and one whose reset fails (dead socket) is
+        // evicted rather than handed out again.
+        if conn.broken {
+            return true;
+        }
+        if conn.needs_reset && conn.conn.reset().is_err() {
+            return true;
+        }
+        conn.needs_reset = true;
+        false
+    }
+}
+
 /// Resolve a MySQL TLS configuration from the connection URL's query string,
 /// returning a sanitised URL (with the TLS-related keys removed, since the
 /// `mysql` crate's `Opts::from_url` errors on parameters it doesn't recognise)
@@ -11607,24 +11745,20 @@ fn mysql_extract_ssl(url: &str) -> (String, Option<mysql::SslOpts>) {
 }
 
 #[cfg(feature = "mysql_db")]
-fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
+fn get_mysql_pool(url: &str) -> Result<r2d2::Pool<MysqlConnectionManager>, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
     let key = format!("mysql:{}", url);
     if let Some(entry) = manager.get_mut(&key) {
-        if let Some(pool) = entry.pool.downcast_ref::<mysql::Pool>() {
+        if let Some(pool) = entry.pool.downcast_ref::<r2d2::Pool<MysqlConnectionManager>>() {
             entry.last_used = std::time::Instant::now();
             return Ok(pool.clone());
         }
     }
-    let (sanitized, ssl) = mysql_extract_ssl(url);
+    let (sanitized, pool_cfg) = mysql_extract_pool_settings(url);
+    let (sanitized, ssl) = mysql_extract_ssl(&sanitized);
     let opts = mysql::Opts::from_url(&sanitized)
         .map_err(|e| CfmlError::database(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
     // Connection-per-request model (matching Lucee/ACF, which pool by request):
-    //   * `reset_connection = true` stays the POOL default (the fail-safe): any
-    //     connection dropped outside the request-boundary path — error unwind,
-    //     transaction conns, the query-timeout watchdog conn — is reset
-    //     (COM_RESET_CONNECTION) on return, wiping session/user state so it can
-    //     NOT leak to the next request that reuses it.
     //   * A request HOLDS one connection per datasource for its whole duration (see
     //     REQUEST_MYSQL_CONNS / checkout_request_mysql_conn); it is only returned to
     //     the pool at the request boundary (`release_request_db_conns`). So within a
@@ -11634,28 +11768,13 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     //     @OLD_SQL_MODE to still be set), but a transient `SET foreign_key_checks=0`
     //     / `sql_mode` does NOT outlive the request (GitHub #275 — the
     //     reset-disabled pool leaked pool-wide and across requests).
-    //   * DIRTY-TRACKED reset at the boundary: COM_RESET_CONNECTION also
-    //     deallocates all server-side prepared statements, so resetting every
-    //     request forced every warm request to re-prepare every statement (one
-    //     COM_STMT_PREPARE round-trip per query — Lucee's JDBC pool never resets,
-    //     so it never pays this). `release_request_db_conns` therefore skips the
-    //     reset (per-conn one-shot `PooledConn::reset_connection(false)`) unless
-    //     the request ran session-state-risky SQL (`mysql_sql_is_session_risky`),
-    //     preserving the #275 guarantee: risky SQL still triggers a full reset.
-    //     `pool_min = 1` avoids the wasteful eager 10-connection burst.
-    let constraints =
-        mysql::PoolConstraints::new(1, 100).unwrap_or(mysql::PoolConstraints::DEFAULT);
-    let pool_opts = mysql::PoolOpts::default()
-        .with_reset_connection(true)
-        // Liveness is checked by `mysql_checkout` instead: the crate's built-in
-        // check PINGs on EVERY checkout, one extra round-trip (~300 us against a
-        // local Docker MySQL) on the first query of every request. Lucee does not
-        // validate on borrow by default; we ping only a connection that sat idle.
-        .with_check_health(false)
-        .with_constraints(constraints);
+    //   * Reset on return is the fail-safe, disarmed only by the paths that know
+    //     the connection is clean — see `MysqlConn::needs_reset`. A blanket
+    //     per-request reset forced every warm request to re-prepare every
+    //     statement (one COM_STMT_PREPARE round-trip per query — Lucee's JDBC
+    //     pool never resets, so it never pays this).
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
-        .pool_opts(pool_opts)
         // Per-connection prepared-statement LRU. The crate default (10) is far
         // below what one framework request uses (a Preside admin page runs
         // dozens of distinct statements), so every queryExecute thrashed the
@@ -11663,9 +11782,9 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         // MySQL wire writes were ~13% of warm-request CPU on a live Preside
         // profile. 256 comfortably covers a request's working set; JDBC pools
         // on Lucee ship a per-connection statement cache the same way.
-        // NOTE: this cache only survives across requests because
-        // `release_request_db_conns` skips COM_RESET_CONNECTION for clean
-        // connections (reset clears it, client- and server-side).
+        // NOTE: this cache only survives across requests because the clean
+        // release paths disarm the reset (reset clears it, client- and
+        // server-side) — see `MysqlConn::needs_reset`.
         .stmt_cache_size(256)
         // Socket-level bounds — see `db_net_secs` for why keepalive is the one
         // that matters and why read/write default to off. Without these, a
@@ -11684,13 +11803,54 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
         // reported 0 and Preside minted a brand-new session every time (spurious
         // INSERT + `psid` cookie churn). CLIENT_FOUND_ROWS restores parity.
         .additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_FOUND_ROWS);
-    let pool = mysql::Pool::new(builder)
-        .map_err(|e| CfmlError::database(format!("queryExecute: MySQL pool creation error: {}", e)))?;
+    let mgr = MysqlConnectionManager { opts: mysql::Opts::from(builder) };
+    let pool = r2d2::Pool::builder()
+        .max_size(pool_cfg.max)
+        // No warm minimum and no eager connect (`build_unchecked`): a datasource
+        // that is never queried never opens a socket, and an idle one shrinks
+        // to zero after `idleTimeout`, as Lucee's does. The next query pays a
+        // reconnect. `Some(0)`, not `None`: r2d2 reads `None` as "keep
+        // `max_size` idle", and its reaper then replaces every connection it
+        // closes.
+        .min_idle(Some(0))
+        .idle_timeout(pool_cfg.idle_timeout)
+        .max_lifetime(None)
+        .connection_timeout(datasource_timeout(url))
+        // Liveness is checked by `mysql_checkout` instead: r2d2's check would
+        // PING on EVERY checkout, one extra round-trip (~300 us against a local
+        // Docker MySQL) on the first query of every request. Lucee does not
+        // validate on borrow by default; we ping only a connection that sat idle.
+        .test_on_check_out(false)
+        .build_unchecked(mgr);
     manager.insert(
         key,
         PoolEntry { pool: Box::new(pool.clone()), last_used: std::time::Instant::now() },
     );
     Ok(pool)
+}
+
+/// Pooled MySQL connections across every datasource: (pools, connections,
+/// of which idle). Exact — r2d2 keeps the count — and read by the memory
+/// panel, which charges each connection the driver's 8 MiB of packet buffers.
+#[cfg(feature = "mysql_db")]
+pub fn mysql_pool_connections() -> (usize, u32, u32) {
+    let Ok(manager) = get_pool_manager().lock() else { return (0, 0, 0) };
+    let mut pools = 0usize;
+    let (mut conns, mut idle) = (0u32, 0u32);
+    for entry in manager.values() {
+        if let Some(pool) = entry.pool.downcast_ref::<r2d2::Pool<MysqlConnectionManager>>() {
+            let st = pool.state();
+            pools += 1;
+            conns += st.connections;
+            idle += st.idle_connections;
+        }
+    }
+    (pools, conns, idle)
+}
+
+#[cfg(not(feature = "mysql_db"))]
+pub fn mysql_pool_connections() -> (usize, u32, u32) {
+    (0, 0, 0)
 }
 
 #[cfg(feature = "mysql_db")]
@@ -11707,7 +11867,7 @@ thread_local! {
     /// prepared statement — a blanket per-request reset forced every warm request
     /// to re-prepare every statement (one COM_STMT_PREPARE round-trip per query),
     /// a structural per-query cost Lucee's never-reset JDBC pool does not pay.
-    static REQUEST_MYSQL_CONNS: std::cell::RefCell<HashMap<String, mysql::PooledConn>> =
+    static REQUEST_MYSQL_CONNS: std::cell::RefCell<HashMap<String, MysqlPooledConn>> =
         std::cell::RefCell::new(HashMap::new());
 
     /// Datasource URLs whose request-held connection ran session-state-risky SQL
@@ -11859,14 +12019,12 @@ mod mysql_session_risky_tests {
 #[cfg(feature = "mysql_db")]
 fn checkout_request_mysql_conn(
     url: &str,
-    pool: &mysql::Pool,
-) -> Result<(mysql::PooledConn, bool), CfmlError> {
+    pool: &r2d2::Pool<MysqlConnectionManager>,
+) -> Result<(MysqlPooledConn, bool), CfmlError> {
     if let Some(conn) = REQUEST_MYSQL_CONNS.with(|c| c.borrow_mut().remove(url)) {
         return Ok((conn, false));
     }
-    mysql_checkout(url, pool)
-        .map(|c| (c, true))
-        .map_err(|e| CfmlError::database(format!("queryExecute: MySQL connection error: {}", e)))
+    mysql_checkout(url, pool).map(|c| (c, true))
 }
 
 /// A pooled connection used within this window is handed out without a PING.
@@ -11891,7 +12049,7 @@ fn mysql_conn_stamps() -> &'static Mutex<HashMap<(String, u32), std::time::Insta
 fn stamp_mysql_conn(url: &str, conn_id: u32) {
     if let Ok(mut m) = mysql_conn_stamps().lock() {
         // Stamps of connections the pool has since closed are never taken; keep
-        // the map bounded (pools are capped at 100 connections each).
+        // the map bounded.
         if m.len() > 4096 {
             m.clear();
         }
@@ -11900,13 +12058,18 @@ fn stamp_mysql_conn(url: &str, conn_id: u32) {
 }
 
 /// Check a connection out of `pool`, PINGing it first unless it was returned
-/// within `MYSQL_ALIVE_BYPASS`. A connection that fails the PING is dropped (its
-/// reset fails, so the pool discards it) and the next one is tried.
+/// within `MYSQL_ALIVE_BYPASS`. A connection that fails the PING is marked
+/// broken (the pool evicts it on return) and the next one is tried.
 #[cfg(feature = "mysql_db")]
-fn mysql_checkout(url: &str, pool: &mysql::Pool) -> Result<mysql::PooledConn, mysql::Error> {
-    let mut last_err = None;
+fn mysql_checkout(
+    url: &str,
+    pool: &r2d2::Pool<MysqlConnectionManager>,
+) -> Result<MysqlPooledConn, CfmlError> {
+    let mut last_err = String::new();
     for _ in 0..16 {
-        let mut conn = pool.get_conn()?;
+        let mut conn = pool
+            .get()
+            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL connection error: {}", e)))?;
         let recent = mysql_conn_stamps()
             .lock()
             .ok()
@@ -11915,19 +12078,23 @@ fn mysql_checkout(url: &str, pool: &mysql::Pool) -> Result<mysql::PooledConn, my
         if recent {
             return Ok(conn);
         }
-        match conn.as_mut().ping() {
+        match conn.ping() {
             Ok(()) => return Ok(conn),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                conn.broken = true;
+                last_err = e.to_string();
+            }
         }
     }
-    Err(last_err.expect("loop ran"))
+    Err(CfmlError::database(format!("queryExecute: MySQL connection error: {}", last_err)))
 }
+
 
 /// Return a MySQL connection to the request-scoped cache (held until request end).
 /// Kept out of the pool for the request's duration so its session state survives
 /// across statements.
 #[cfg(feature = "mysql_db")]
-fn return_request_mysql_conn(url: &str, conn: mysql::PooledConn) {
+fn return_request_mysql_conn(url: &str, conn: MysqlPooledConn) {
     REQUEST_MYSQL_CONNS.with(|c| {
         c.borrow_mut().insert(url.to_string(), conn);
     });
@@ -11947,18 +12114,17 @@ pub fn release_request_db_conns() {
         REQUEST_MYSQL_CONNS.with(|c| {
             for (url, mut conn) in c.borrow_mut().drain() {
                 if !dirty.contains(&url) {
-                    // Clean connection: opt out of COM_RESET_CONNECTION for THIS
+                    // Clean connection: disarm COM_RESET_CONNECTION for THIS
                     // return only, so its server-side prepared statements survive
-                    // for the next request. One-shot by construction: the crate's
-                    // cleanup_for_pool re-arms reset_upon_return from the pool
-                    // default (true) after every check-in, so a connection dropped
-                    // on any other path — error unwind, transaction conn, watchdog
-                    // conn — still gets the full reset.
-                    conn.reset_connection(false);
+                    // for the next request. One-shot by construction: the return
+                    // path re-arms `needs_reset` after every check-in, so a
+                    // connection dropped on any other path — error unwind,
+                    // transaction conn, watchdog conn — still gets the full reset.
+                    conn.needs_reset = false;
                     stamp_mysql_conn(&url, conn.connection_id());
                 }
-                // Dirty (or unknown) connections drop with the pool default:
-                // COM_RESET_CONNECTION wipes session state (GitHub #275).
+                // Dirty (or unknown) connections drop armed: COM_RESET_CONNECTION
+                // wipes session state (GitHub #275).
             }
         });
     }
@@ -13072,7 +13238,7 @@ enum MysqlMutationError {
 /// name but the one that statement itself wrote.
 #[cfg(feature = "mysql_db")]
 fn mysql_run_mutation(
-    conn: &mut mysql::PooledConn,
+    conn: &mut MysqlPooledConn,
     sql: &str,
     params: &mysql::Params,
 ) -> Result<(), MysqlMutationError> {
@@ -14294,7 +14460,7 @@ fn execute_mysql(
         mark_request_mysql_dirty(url);
     }
     let result = execute_mysql_on_conn(&mut conn, url, sql, params_arg, return_type, timeout_secs);
-    if result.is_ok() || conn.as_mut().ping().is_ok() {
+    if result.is_ok() || conn.ping().is_ok() {
         return_request_mysql_conn(url, conn);
         return result;
     }
@@ -14330,7 +14496,7 @@ fn mysql_sql_is_plain_read(sql: &str) -> bool {
 
 #[cfg(feature = "mysql_db")]
 fn execute_mysql_on_conn(
-    conn: &mut mysql::PooledConn,
+    conn: &mut MysqlPooledConn,
     url: &str,
     sql: &str,
     params_arg: &CfmlValue,
@@ -15778,7 +15944,7 @@ fn mssql_column_to_cfml_typed(row: &tiberius::Row, col_idx: usize) -> CfmlValue 
 /// reset, which also rolls the transaction back (GH #275 / #308 safety).
 #[cfg(feature = "mysql_db")]
 struct MysqlTxnConn {
-    conn: mysql::PooledConn,
+    conn: MysqlPooledConn,
     open: bool,
     dirty: bool,
 }
@@ -15827,10 +15993,10 @@ impl MysqlTxnConn {
 impl Drop for MysqlTxnConn {
     fn drop(&mut self) {
         if !self.open && !self.dirty {
-            // Closed and clean: skip COM_RESET_CONNECTION for this return so
+            // Closed and clean: disarm COM_RESET_CONNECTION for this return so
             // the prepared-statement cache survives for the next transaction.
-            // One-shot — the crate re-arms the flag from the pool default.
-            self.conn.reset_connection(false);
+            // One-shot — the return path re-arms it.
+            self.conn.needs_reset = false;
         }
     }
 }
@@ -15921,8 +16087,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
         #[cfg(feature = "mysql_db")]
         DbDriver::Mysql(url) => {
             let pool = get_mysql_pool(&url)?;
-            let mut conn = mysql_checkout(&url, &pool)
-                .map_err(|e| CfmlError::database(format!("cftransaction: MySQL pool error: {}", e)))?;
+            let mut conn = mysql_checkout(&url, &pool)?;
             use mysql::prelude::Queryable;
             conn.query_drop("BEGIN")
                 .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?;
@@ -16239,7 +16404,7 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
 }
 
 #[cfg(feature = "mysql_db")]
-fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
+fn execute_mysql_with_conn(conn: &mut MysqlPooledConn, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     use mysql::*;
     use mysql::prelude::*;
 
@@ -21987,6 +22152,24 @@ mod db_tls_tests {
 
     #[cfg(feature = "mysql_db")]
     mod mysql {
+        #[test]
+        fn pool_settings_come_off_the_url_and_are_stripped() {
+            use super::super::{mysql_extract_pool_settings, MYSQL_IDLE_TIMEOUT_DEFAULT, MYSQL_POOL_MAX_DEFAULT};
+            use std::time::Duration;
+            // Defaults: Lucee's connectionLimit 100 / idleTimeout 60 min.
+            let (url, s) = mysql_extract_pool_settings("mysql://u:p@host/db");
+            assert_eq!(url, "mysql://u:p@host/db");
+            assert_eq!((s.max, s.idle_timeout), (MYSQL_POOL_MAX_DEFAULT, Some(MYSQL_IDLE_TIMEOUT_DEFAULT)));
+            // Both keys are consumed; unrelated ones pass through untouched.
+            let (url, s) = mysql_extract_pool_settings("mysql://h/db?pool_max=4&ssl_mode=required&idle_timeout=300&pool_min=2");
+            assert_eq!(url, "mysql://h/db?ssl_mode=required");
+            assert_eq!((s.max, s.idle_timeout), (4, Some(Duration::from_secs(300))));
+            // idle_timeout=0 means never reap; a zero/garbage pool_max keeps the default.
+            let (url, s) = mysql_extract_pool_settings("mysql://h/db?idle_timeout=0&pool_max=0");
+            assert_eq!(url, "mysql://h/db");
+            assert_eq!((s.max, s.idle_timeout), (MYSQL_POOL_MAX_DEFAULT, None));
+        }
+
         use crate::builtins::mysql_extract_ssl;
 
         #[test]

@@ -71,6 +71,25 @@ impl CfmlVirtualMachine {
         let snap = guard.as_ref().expect("just filled");
         let mut pots = snap.pots.clone();
         let pools = cfml_common::container_size::db_pool_count();
+        // The MySQL driver preallocates two 4 MiB packet buffers per connection
+        // (`mysql_common::MySyncFramed::new`), so a pooled connection costs
+        // 8 MiB of live heap before it has carried a byte. Exact count from
+        // r2d2; the buffers are mostly never written, so little of this is
+        // resident.
+        let (_, conns, idle) = cfml_common::container_size::db_pool_connections();
+        if conns > 0 {
+            pots.push(MemoryPot {
+                name: "Database driver buffers".to_string(),
+                bytes: u64::from(conns) * 8 * 1024 * 1024,
+                detail: format!(
+                    "{} pooled MySQL connection{} ({} idle) x 8 MiB packet buffers the \
+                     driver preallocates; mostly untouched, so largely not resident",
+                    conns,
+                    if conns == 1 { "" } else { "s" },
+                    idle
+                ),
+            });
+        }
         // "Other" is the rest of the live heap, recomputed against the current
         // total rather than the cached one.
         if let Some(live) = live_heap {
@@ -81,9 +100,8 @@ impl CfmlVirtualMachine {
                 detail: format!(
                     "the REMAINDER, not a measurement: in-flight requests, the \
                      per-request allocation logs (thread-local, not summable here), \
-                     the driver buffers behind {} database connection pool{} (not \
-                     sizeable through the driver crates), and whatever the pots above \
-                     under-count",
+                     compiled regex automata, the read buffers behind {} database \
+                     connection pool{}, and whatever the pots above under-count",
                     pools,
                     if pools == 1 { "" } else { "s" }
                 ),
