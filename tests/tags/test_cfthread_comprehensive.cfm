@@ -232,9 +232,10 @@ var budgetStart = getTickCount();
 thread action="join" timeout="600"; // 600ms total budget for all 3 x 400ms threads
 var budgetElapsed = getTickCount() - budgetStart;
 
-// Should have timed out before all complete (total would be ~1200ms but budget is 600ms)
+// The threads run concurrently (not sequentially), so they all finish around 400ms.
+// The join should wait for them and return around 400ms (well before the 600ms budget).
 assertTrue("shared timeout budget was enforced", budgetElapsed < 1000);
-assertTrue("shared timeout took at least budget time", budgetElapsed >= 500);
+assertTrue("join waited for concurrent threads to complete", budgetElapsed >= 350 && budgetElapsed < 550);
 
 // Test 10: threadData() returns request-wide view
 thread name="data_test_1" {
