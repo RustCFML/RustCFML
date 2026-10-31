@@ -4229,6 +4229,11 @@ pub struct RequestThreadEntry {
     pub name: String,
     /// Cooperative-cancel flag shared with the running body.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Java-style interrupt flag (cleared by Thread.interrupted()).
+    pub interrupted: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared completion handle: any thread can wait on this.
+    /// (Mutex<Option<ThreadResult>>, Condvar) - None while running, Some when done.
+    pub completion: Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>,
     /// Metadata struct for the `cfthread.NAME` entry (status, output, etc.).
     /// Updated when the thread completes.
     pub metadata: CfmlValue,
@@ -4265,6 +4270,8 @@ impl RequestThreadRegistry {
         &mut self,
         name: String,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        interrupted: Arc<std::sync::atomic::AtomicBool>,
+        completion: Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>,
         metadata: CfmlValue,
     ) {
         let key = name.to_lowercase();
@@ -4282,6 +4289,8 @@ impl RequestThreadRegistry {
         let entry = RequestThreadEntry {
             name: name.clone(),
             cancel,
+            interrupted,
+            completion,
             metadata,
             seq,
         };
@@ -4293,6 +4302,45 @@ impl RequestThreadRegistry {
         
         self.entries.insert(key.clone(), entry);
         self.order.push_back(key);
+    }
+
+    /// Signal completion for a thread (called when thread finishes).
+    /// Stores the result and wakes all waiting threads.
+    pub fn signal_completion(&self, name: &str, result: ThreadResult) {
+        let key = name.to_lowercase();
+        if let Some(entry) = self.entries.get(&key) {
+            let (lock, cvar) = &*entry.completion;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = Some(result);
+                cvar.notify_all();
+            }
+        }
+    }
+
+    /// Wait for a thread to complete with optional timeout (matching Lucee's join).
+    /// Returns the ThreadResult if the thread completed, None if timed out or not found.
+    pub fn wait_for_completion(&self, name: &str, timeout_ms: i64) -> Option<ThreadResult> {
+        let key = name.to_lowercase();
+        let entry = self.entries.get(&key)?;
+        
+        let (lock, cvar) = &*entry.completion;
+        let mut guard = lock.lock().ok()?;
+        
+        // Already completed?
+        if guard.is_some() {
+            return guard.clone();
+        }
+        
+        // Wait with timeout
+        if timeout_ms > 0 {
+            let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+            let result = cvar.wait_timeout(guard, timeout).ok()?;
+            result.0.clone()
+        } else {
+            // Wait indefinitely
+            guard = cvar.wait(guard).ok()?;
+            guard.clone()
+        }
     }
 
     /// Update the metadata for a thread (called when thread completes).
@@ -4308,6 +4356,13 @@ impl RequestThreadRegistry {
         self.entries
             .get(&name.to_lowercase())
             .map(|e| e.cancel.clone())
+    }
+
+    /// Look up a thread's interrupt flag by name.
+    pub fn get_interrupted_flag(&self, name: &str) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.entries
+            .get(&name.to_lowercase())
+            .map(|e| e.interrupted.clone())
     }
 
     /// Get thread metadata by name.
@@ -6851,41 +6906,52 @@ impl CfmlVirtualMachine {
     /// scope. A timeout leaves the thread RUNNING and returns without error.
     /// No-op for an unknown or already-joined name.
     pub fn join_thread(&mut self, name: &str, timeout_ms: i64) {
-        let collected: Option<ThreadResult> = {
-            let handle = match self.live_threads.get_mut(name) {
-                Some(h) => h,
-                None => return,
-            };
-            if handle.result.is_some() {
-                return; // already joined and published
-            }
-            let recv = if timeout_ms > 0 {
-                handle
-                    .rx
-                    .recv_timeout(std::time::Duration::from_millis(timeout_ms as u64))
-                    .ok()
-            } else {
-                handle.rx.recv().ok()
-            };
-            match recv {
-                Some(res) => {
-                    if let Some(j) = handle.join.take() {
-                        let _ = j.join();
-                    }
-                    handle.result = Some(res.clone());
-                    Some(res)
+        // Try local live_threads first (threads this context spawned)
+        if self.live_threads.contains_key(name) {
+            let collected: Option<ThreadResult> = {
+                let handle = match self.live_threads.get_mut(name) {
+                    Some(h) => h,
+                    None => return,
+                };
+                if handle.result.is_some() {
+                    return; // already joined and published
                 }
-                None => None, // timed out — thread keeps running
+                let recv = if timeout_ms > 0 {
+                    handle
+                        .rx
+                        .recv_timeout(std::time::Duration::from_millis(timeout_ms as u64))
+                        .ok()
+                } else {
+                    handle.rx.recv().ok()
+                };
+                match recv {
+                    Some(res) => {
+                        if let Some(j) = handle.join.take() {
+                            let _ = j.join();
+                        }
+                        handle.result = Some(res.clone());
+                        Some(res)
+                    }
+                    None => None, // timed out — thread keeps running
+                }
+            };
+            if let Some(res) = collected {
+                let orig = self
+                    .live_threads
+                    .get(name)
+                    .map(|h| h.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| name.to_string());
+                self.store_cfthread_result(&orig, res);
             }
-        };
-        if let Some(res) = collected {
-            let orig = self
-                .live_threads
-                .get(name)
-                .map(|h| h.name.clone())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| name.to_string());
-            self.store_cfthread_result(&orig, res);
+            return;
+        }
+
+        // Fall back to request-wide registry (for sibling/parent-spawned threads)
+        // This enables cross-thread join matching Lucee's root registry behavior
+        if let Ok(reg) = self.request_thread_registry.read() {
+            // Wait for completion - the result is already published by the spawning context
+            let _ = reg.wait_for_completion(name, timeout_ms);
         }
     }
 
@@ -6943,7 +7009,7 @@ impl CfmlVirtualMachine {
         meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
         meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
         meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
-        meta.insert("output".to_string(), CfmlValue::string(r.output));
+        meta.insert("output".to_string(), CfmlValue::string(r.output.clone()));
         meta.insert(
             "priority".to_string(),
             carried("priority", CfmlValue::string("NORMAL".to_string())),
@@ -6958,22 +7024,25 @@ impl CfmlVirtualMachine {
                 ),
             ),
         );
-        meta.insert("status".to_string(), CfmlValue::string(r.status));
-        if let Some(e) = r.error_struct {
+        meta.insert("status".to_string(), CfmlValue::string(r.status.clone()));
+        if let Some(e) = r.error_struct.clone() {
             meta.insert("error".to_string(), e);
         } else if !r.error.is_empty() {
             let mut e = ValueMap::default();
-            e.insert("message".to_string(), CfmlValue::string(r.error));
+            e.insert("message".to_string(), CfmlValue::string(r.error.clone()));
             meta.insert("error".to_string(), CfmlValue::strukt(e));
         }
-        for (k, v) in r.thread_vars {
-            meta.insert(k, v);
+        for (k, v) in &r.thread_vars {
+            meta.insert(k.clone(), v.clone());
         }
         let metadata_value = CfmlValue::strukt(meta.clone());
         if let Some(ts) = thread_struct.as_cfml_struct() {
             ts.insert(key.clone(), metadata_value.clone());
         }
-        // Also update the request-wide registry
+        // Signal completion in the request-wide registry and update metadata
+        if let Ok(reg) = self.request_thread_registry.read() {
+            reg.signal_completion(thread_name, r);
+        }
         if let Ok(mut reg) = self.request_thread_registry.write() {
             reg.update_metadata(thread_name, metadata_value);
         }
@@ -24122,6 +24191,10 @@ impl CfmlVirtualMachine {
                         handle.name = thread_name.clone();
                         let cancel_flag = handle.cancel.clone();
                         
+                        // Create shared completion handle for cross-thread join
+                        let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+                        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        
                         // Register in local cfthread scope
                         self.live_threads.insert(thread_name.to_lowercase(), handle);
                         
@@ -24132,7 +24205,13 @@ impl CfmlVirtualMachine {
                         // Also register in the request-wide registry for cross-thread access
                         if let Some(metadata) = self.get_cfthread_metadata(&thread_name) {
                             if let Ok(mut reg) = self.request_thread_registry.write() {
-                                reg.register(thread_name.clone(), cancel_flag, metadata);
+                                reg.register(
+                                    thread_name.clone(),
+                                    cancel_flag,
+                                    interrupted,
+                                    completion,
+                                    metadata
+                                );
                             }
                         }
                         
