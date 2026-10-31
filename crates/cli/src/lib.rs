@@ -1963,9 +1963,10 @@ fn compile_and_run(
     if let Ok(mut reg) = vm.request_thread_registry.write() {
         reg.clear();
     }
-    // Also clear the local live_threads map so threads from this request don't
-    // leak into the next (serve mode reuses the VM across requests).
+    // Also clear the local live_threads map and cfthread scope so threads from this
+    // request don't leak into the next (serve mode reuses the VM across requests).
     vm.live_threads.clear();
+    vm.globals.insert("cfthread".to_string(), CfmlValue::strukt(ValueMap::default()));
 
     // Take the response out of the VM via `mem::take` (leaving every field a
     // valid default) so the VM can then be DROPPED — releasing all of this

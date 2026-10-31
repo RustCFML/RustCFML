@@ -160,13 +160,7 @@ impl FutureNative {
             }
         }
         let r = self.result.as_ref().unwrap();
-        // For a TERMINATED (cancelled) thread, return Null instead of throwing
-        // the error (documented Lucee divergence: Lucee throws CancellationException,
-        // RustCFML returns Null as the future value). For other errors, throw.
         if !r.error.is_empty() {
-            if r.status == "TERMINATED" && r.error.contains("Thread terminated") {
-                return Ok(CfmlValue::Null);
-            }
             return Err(CfmlError::runtime(r.error.clone()));
         }
         // The closure's return value is the future value. Fall back to
