@@ -3337,6 +3337,10 @@ pub struct CfmlVirtualMachine {
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The CFML thread name of this VM's thread (if running as a named cfthread).
+    /// None for the root request or anonymous threads. Used for self-join detection
+    /// and ancestor exclusion in no-name joins (FIX #3).
+    pub cfml_thread_name: Option<String>,
     /// `Thread.currentThread().interrupt()` — the running thread's Java
     /// interrupt flag, cleared by static `Thread.interrupted()`. Only a flag:
     /// unlike `cancel_flag` it never stops the code (Java semantics). A VM runs
@@ -4361,9 +4365,8 @@ impl RequestThreadRegistry {
             format!("There is no thread running with the name [{}]", name)
         })?;
         
-        // B2: Clone the handle under lock, then drop the guard before waiting
+        // FIX #1: Clone the handle under lock (borrow ends when entry goes out of scope)
         let completion_handle = entry.completion.clone();
-        drop(entry); // Drop borrow of self.entries
         
         let (lock, cvar) = &*completion_handle;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -4427,14 +4430,22 @@ impl RequestThreadRegistry {
 
     /// Get all non-ancestor thread names for no-name join (Lucee getAllNoneAncestorThreads).
     /// Excludes self and ancestors.
+    /// FIX #3: Get all thread names except self and ancestors (for no-name join).
+    /// Cycle-safe: tracks visited nodes to prevent infinite loops.
     pub fn get_non_ancestor_names(&self, self_name: Option<&str>) -> Vec<String> {
         let mut ancestors = std::collections::HashSet::new();
         if let Some(sn) = self_name {
             let key = sn.to_lowercase();
             ancestors.insert(key.clone());
-            // Walk up parent chain
+            // Walk up parent chain with cycle detection
             let mut current = Some(key);
+            let mut visited = std::collections::HashSet::new();
             while let Some(c) = current {
+                if visited.contains(&c) {
+                    // Cycle detected, stop walking
+                    break;
+                }
+                visited.insert(c.clone());
                 if let Some(entry) = self.entries.get(&c) {
                     if let Some(ref p) = entry.parent {
                         ancestors.insert(p.clone());
@@ -4487,8 +4498,8 @@ impl RequestThreadRegistry {
     }
 
     /// Check if registry is empty (for testing).
-    pub fn is_empty(&self) -> usize {
-        self.entries.len()
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Look up a thread's interrupt flag by name.
@@ -5516,13 +5527,19 @@ impl CfmlVirtualMachine {
             disallowed_imports: Vec::new(),
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
-            request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(10000))),
+            request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(
+                std::env::var("RUSTCFML_TASKS_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10000)
+            ))),
             cfthread_order: VecDeque::new(),
             cfthread_limit: std::env::var("RUSTCFML_TASKS_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10000),
             cancel_flag: None,
+            cfml_thread_name: None,
             thread_interrupted: false,
             thread_context_class_loader: None,
             static_stores: FxHashMap::default(),
@@ -6695,6 +6712,7 @@ impl CfmlVirtualMachine {
             seed.request_scope
         };
         self.request_thread_registry = seed.request_thread_registry;
+        self.cfml_thread_name = seed.cfml_thread_name.clone();
         self.session_scope = seed.session_scope;
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
@@ -7045,6 +7063,13 @@ impl CfmlVirtualMachine {
     /// scope. A timeout leaves the thread RUNNING and returns without error.
     /// No-op for an unknown or already-joined name.
     pub fn join_thread(&mut self, name: &str, timeout_ms: i64) -> Result<(), String> {
+        // FIX #3: Self-join detection - return immediately (documented deviation from Lucee's hang)
+        if let Some(ref current) = self.cfml_thread_name {
+            if current.eq_ignore_ascii_case(name) {
+                return Ok(());
+            }
+        }
+        
         // Try local live_threads first (threads this context spawned)
         if self.live_threads.contains_key(name) {
             let collected: Option<ThreadResult> = {
@@ -7088,15 +7113,58 @@ impl CfmlVirtualMachine {
 
         // Fall back to request-wide registry (for sibling/parent-spawned threads)
         // This enables cross-thread join matching Lucee's root registry behavior
-        // B2 & B3 fixes are in wait_for_completion
-        if let Ok(reg) = self.request_thread_registry.read() {
-            // S3: Throw on unknown names
-            match reg.wait_for_completion(name, timeout_ms) {
-                Ok(_result) => Ok(()),
-                Err(e) => Err(e),
+        // FIX #1: Clone completion handle under lock, then drop guard before waiting
+        // to avoid deadlock when cross-joiner B spawns a thread (B blocks on write())
+        let completion_handle = {
+            if let Ok(reg) = self.request_thread_registry.read() {
+                match reg.get_completion_handle(name) {
+                    Some(h) => h,
+                    None => return Err(format!("There is no thread running with the name [{}]", name)),
+                }
+            } else {
+                return Err(format!("There is no thread running with the name [{}]", name));
+            }
+        }; // Read guard dropped here
+        
+        // Now wait without holding any lock
+        let (lock, cvar) = &*completion_handle;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        
+        // Already completed?
+        if guard.is_some() {
+            return Ok(());
+        }
+        
+        // Wait with timeout or indefinitely
+        if timeout_ms > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    // FIX #5: Timeout on cross-thread join returns silently (Lucee parity)
+                    return Ok(());
+                }
+                let remaining = deadline.duration_since(now);
+                let result = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                    let g = e.into_inner();
+                    (g.0, g.1)
+                });
+                guard = result.0;
+                if guard.is_some() {
+                    return Ok(());
+                }
+                if result.1.timed_out() {
+                    return Ok(());
+                }
             }
         } else {
-            Err(format!("There is no thread running with the name [{}]", name))
+            // Wait indefinitely
+            loop {
+                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                if guard.is_some() {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -20601,8 +20669,24 @@ impl CfmlVirtualMachine {
                         .unwrap_or(0)
                         .max(0);
                     // No deadline in play: one plain sleep, no slicing overhead.
+                    // FIX #7: But still check cancel flag for terminate interrupt
                     if self.request_timeout_ms <= 0 || self.request_start_ms == 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(total_ms as u64));
+                        const SLICE_MS: i64 = 25;
+                        let mut slept = 0i64;
+                        while slept < total_ms {
+                            // Check cancel flag (thread terminate)
+                            if let Some(ref cancel) = self.cancel_flag {
+                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return Err(CfmlError::new(
+                                        "Thread terminated".to_string(),
+                                        CfmlErrorType::Application,
+                                    ));
+                                }
+                            }
+                            let slice = SLICE_MS.min(total_ms - slept);
+                            std::thread::sleep(std::time::Duration::from_millis(slice as u64));
+                            slept += slice;
+                        }
                         return Ok(CfmlValue::Null);
                     }
                     const SLICE_MS: i64 = 25;
@@ -20610,6 +20694,15 @@ impl CfmlVirtualMachine {
                     while slept < total_ms {
                         self.check_request_timeout()?;
                         self.check_memory_abort()?;
+                        // FIX #7: Check cancel flag for terminate interrupt
+                        if let Some(ref cancel) = self.cancel_flag {
+                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                return Err(CfmlError::new(
+                                    "Thread terminated".to_string(),
+                                    CfmlErrorType::Application,
+                                ));
+                            }
+                        }
                         let slice = SLICE_MS.min(total_ms - slept);
                         std::thread::sleep(std::time::Duration::from_millis(slice as u64));
                         slept += slice;
@@ -24383,14 +24476,12 @@ impl CfmlVirtualMachine {
                         seed.completion_handle = Some(completion.clone());
                         seed.cfml_thread_name = Some(thread_name.clone());
                         
-                        // Pre-seed cfthread.NAME as RUNNING so reads before join
-                        // see a live status rather than a missing key.
-                        self.store_cfthread_running(&thread_name, &priority);
+                        // FIX #3: Capture spawner's current thread name BEFORE setting child's name
+                        // for correct parent tracking (not self-as-parent)
+                        let parent_name = self.cfml_thread_name.clone();
                         
-                        // Get the spawner's current thread name (if any) for parent tracking
-                        let parent_name = seed.cfml_thread_name.clone();
-                        
-                        // Register in request-wide registry BEFORE spawn (S1: duplicate check, nit: register-before-spawn)
+                        // FIX #6: Check and register BEFORE calling store_cfthread_running
+                        // to avoid clobbering the first thread's entry with a duplicate name
                         if let Some(metadata) = self.get_cfthread_metadata(&thread_name) {
                             if let Ok(mut reg) = self.request_thread_registry.write() {
                                 // S1: Lucee throws on duplicate daemon names
@@ -24407,6 +24498,10 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
+                        
+                        // Pre-seed cfthread.NAME as RUNNING so reads before join
+                        // see a live status rather than a missing key.
+                        self.store_cfthread_running(&thread_name, &priority);
                         
                         // NOW spawn the thread
                         let mut handle = spawn_fn(seed);
@@ -24440,15 +24535,16 @@ impl CfmlVirtualMachine {
                             .filter(|s| !s.is_empty())
                             .collect(),
                         _ => {
-                            // No name: join all non-ancestor threads
-                            let self_name: Option<String> = None; // TODO: Track current thread name for ancestor exclusion
+                            // FIX #3: No name: join all non-ancestor threads (Lucee getAllNoneAncestorThreads)
+                            // excluding self and ancestors
+                            let self_name = self.cfml_thread_name.as_deref();
                             
                             // Start with local threads
                             let mut all_names: Vec<String> = self.live_threads.keys().cloned().collect();
                             
                             // Add non-ancestor threads from registry
                             if let Ok(reg) = self.request_thread_registry.read() {
-                                let non_ancestors = reg.get_non_ancestor_names(self_name.as_deref());
+                                let non_ancestors = reg.get_non_ancestor_names(self_name);
                                 for name in non_ancestors {
                                     if !all_names.contains(&name) {
                                         all_names.push(name);
@@ -24466,6 +24562,9 @@ impl CfmlVirtualMachine {
                         .map(|v| v.as_string().parse::<i64>().unwrap_or(0))
                         .unwrap_or(0);
                     
+                    // FIX #2: Distinguish no-timeout from budget-exhausted
+                    // When remaining becomes 0, the budget is spent; stop joining
+                    // (Lucee ThreadTag L453-458)
                     let start = if timeout_ms > 0 {
                         Some(std::time::Instant::now())
                     } else {
@@ -24476,12 +24575,13 @@ impl CfmlVirtualMachine {
                         let remaining = if let Some(s) = start {
                             let elapsed = s.elapsed().as_millis() as i64;
                             if elapsed >= timeout_ms {
-                                0 // Timeout expired
+                                // Budget exhausted, stop joining remaining threads
+                                break;
                             } else {
                                 timeout_ms - elapsed
                             }
                         } else {
-                            timeout_ms
+                            0 // No timeout specified, wait indefinitely per thread
                         };
                         
                         // S4: Self-join guard - Lucee hangs on self-join, but we return immediately

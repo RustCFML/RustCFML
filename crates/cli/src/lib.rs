@@ -1551,6 +1551,24 @@ impl Drop for CompletionGuard {
             let (lock, cvar) = &**handle;
             // Recover from poisoning - we still want to signal
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            
+            // FIX #4: On panic (when result is None), store a TERMINATED result with an error
+            // instead of None, so waiters see a completed thread rather than hanging forever
+            if self.result.is_none() {
+                if std::thread::panicking() {
+                    self.result = Some(cfml_vm::ThreadResult {
+                        status: "TERMINATED".to_string(),
+                        output: String::new(),
+                        error: "Thread panicked".to_string(),
+                        error_struct: None,
+                        mem_allocated: 0,
+                        elapsed: 0,
+                        thread_vars: cfml_common::dynamic::ValueMap::default(),
+                        return_value: None,
+                    });
+                }
+            }
+            
             *guard = self.result.clone();
             cvar.notify_all();
         }
