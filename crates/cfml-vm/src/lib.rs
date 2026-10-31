@@ -24480,22 +24480,34 @@ impl CfmlVirtualMachine {
                         // for correct parent tracking (not self-as-parent)
                         let parent_name = self.cfml_thread_name.clone();
                         
-                        // FIX #6: Check and register BEFORE calling store_cfthread_running
-                        // to avoid clobbering the first thread's entry with a duplicate name
-                        if let Some(metadata) = self.get_cfthread_metadata(&thread_name) {
-                            if let Ok(mut reg) = self.request_thread_registry.write() {
-                                // S1: Lucee throws on duplicate daemon names
-                                if let Err(e) = reg.register(
-                                    thread_name.clone(),
-                                    cancel_flag.clone(),
-                                    interrupted,
-                                    completion.clone(),
-                                    metadata,
-                                    parent_name,
-                                    true, // is_daemon (named thread)
-                                ) {
-                                    return Err(e);
-                                }
+                        // FIX #6: Build metadata and register BEFORE calling store_cfthread_running
+                        // Create metadata inline since store_cfthread_running hasn't been called yet
+                        let mut metadata = ValueMap::default();
+                        metadata.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
+                        metadata.insert("elapsedtime".to_string(), CfmlValue::Int(0));
+                        metadata.insert("interrupted".to_string(), CfmlValue::Bool(false));
+                        metadata.insert("name".to_string(), CfmlValue::string(thread_name.clone()));
+                        metadata.insert("output".to_string(), CfmlValue::string(String::new()));
+                        metadata.insert("priority".to_string(), CfmlValue::string(priority.clone()));
+                        metadata.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
+                        metadata.insert(
+                            "starttime".to_string(),
+                            CfmlValue::DateTime(cfml_common::datetime::CfmlDate::now()),
+                        );
+                        metadata.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+                        
+                        if let Ok(mut reg) = self.request_thread_registry.write() {
+                            // S1: Lucee throws on duplicate daemon names
+                            if let Err(e) = reg.register(
+                                thread_name.clone(),
+                                cancel_flag.clone(),
+                                interrupted,
+                                completion.clone(),
+                                CfmlValue::strukt(metadata),
+                                parent_name,
+                                true, // is_daemon (named thread)
+                            ) {
+                                return Err(e);
                             }
                         }
                         
