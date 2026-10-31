@@ -21,7 +21,7 @@ is ~1%, and is kept only because the profile was trained under it.
 
 ## The committed profile
 
-`pgo/rustcfml.profdata` — ~16 MB, `llvm-profdata merge --sparse`, ~59k functions.
+`pgo/rustcfml.profdata` — ~20 MB, `llvm-profdata merge --sparse`, ~59k functions (retrained at v0.745.0).
 Trained on two workloads:
 
 1. `tests/runner.cfm` via the CLI — broad language coverage

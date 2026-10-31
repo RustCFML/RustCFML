@@ -15,6 +15,7 @@
 #     scripts/pgo-train.sh --site ... --port 8641 --renders 150
 #     scripts/pgo-train.sh --site ... --out /tmp/candidate.profdata   # don't overwrite the committed one
 #     scripts/pgo-train.sh --site ... --admin-user sysadmin --admin-pass password
+#     scripts/pgo-train.sh --site ... --cfconfig /path/to/cfconfig.json   # e.g. point the boot at a scratch DB
 #
 # Training set (docs/pgo.md): the CFML suite via the CLI, plus a live site boot
 # and warm renders. Suite-only training already captures ~84% of the win; the
@@ -35,7 +36,7 @@ cd "$(dirname "$0")/.."   # repo root
 REPO=$(pwd)
 
 SITE=""; PORT=8641; RENDERS=150; OUT="$REPO/pgo/rustcfml.profdata"
-ADMIN_USER=""; ADMIN_PASS=""
+ADMIN_USER=""; ADMIN_PASS=""; CFCONFIG=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --site)       SITE=${2:?};       shift 2 ;;
@@ -44,6 +45,7 @@ while [ $# -gt 0 ]; do
     --out)        OUT=${2:?};        shift 2 ;;
     --admin-user) ADMIN_USER=${2:?}; shift 2 ;;
     --admin-pass) ADMIN_PASS=${2:?}; shift 2 ;;
+    --cfconfig)   CFCONFIG=(--cfconfig "${2:?}"); shift 2 ;;
     -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -105,7 +107,7 @@ fi
 CLI_COUNT=$(total_count); echo "    profile count after CLI: $CLI_COUNT"
 
 step "3/5  train (b): live site boot + $RENDERS warm renders"
-"$BIN" --serve "$SITE" --port "$PORT" --production > "$WORK/train_serve.log" 2>&1 &
+"$BIN" --serve "$SITE" --port "$PORT" --production ${CFCONFIG[@]+"${CFCONFIG[@]}"} > "$WORK/train_serve.log" 2>&1 &
 SRV_PID=$!
 code=""
 for _ in $(seq 1 600); do
