@@ -9,7 +9,7 @@ use cfml_common::vfs::{RealFs, Vfs, VfsDirEntry};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 /// Fx-hashed maps for the engine's own path/id-keyed caches (GH #425): every
 /// construction probes a dozen of these with an ~80-byte source path, and
 /// SipHash cost ~40 ns per probe against Fx's ~8. Internal keys only — never
@@ -3323,6 +3323,10 @@ pub struct CfmlVirtualMachine {
     /// Live `cfthread` handles keyed by lowercased thread name, awaiting join.
     /// Empty and untouched for code that never spawns a thread.
     pub live_threads: HashMap<String, ThreadHandle>,
+    /// Request-wide thread registry shared by all threads in this request
+    /// (matching Lucee's root page context registry). Lets children join siblings
+    /// or parent-spawned threads. Capped with FIFO eviction (default 10000).
+    pub request_thread_registry: Arc<RwLock<RequestThreadRegistry>>,
     /// Set on a spawned child VM: when flipped true (by thread terminate), the
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
@@ -4157,6 +4161,8 @@ pub struct ThreadSeed {
     /// Shared live with the parent (CFML request scope is shared across threads)
     /// — unless `own_request_scope` is set.
     pub request_scope: CfmlStruct,
+    /// Request-wide thread registry shared across all threads in this request.
+    pub request_thread_registry: Arc<RwLock<RequestThreadRegistry>>,
     /// Give every run of this seed a FRESH, empty `request` scope instead of the
     /// parent's (set for java.util.concurrent executor tasks). A periodic
     /// schedule clones one seed per tick, so the fresh scope is made in
@@ -4213,6 +4219,116 @@ pub struct ThreadSeed {
     /// Live-seed census handle (see [`SeedCensus`]). `None` unless
     /// `RUSTCFML_GC_DEBUG` is set, so the normal path allocates nothing.
     pub census: Option<Arc<SeedCensus>>,
+}
+
+/// Per-request thread registry entry: metadata for a spawned thread that is
+/// shared request-wide (matching Lucee's root page context registry).
+#[derive(Clone)]
+pub struct RequestThreadEntry {
+    /// Original-case thread name.
+    pub name: String,
+    /// Cooperative-cancel flag shared with the running body.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Metadata struct for the `cfthread.NAME` entry (status, output, etc.).
+    /// Updated when the thread completes.
+    pub metadata: CfmlValue,
+    /// Insertion order sequence number, for FIFO eviction.
+    pub seq: u64,
+}
+
+/// Per-request, request-wide thread registry. Shared by all threads in a request
+/// (including nested threads), matching Lucee's root page context registry.
+/// Capped with oldest-eviction (default 10000, matching Lucee's `lucee.tasks.limit`).
+pub struct RequestThreadRegistry {
+    /// Thread entries keyed by lowercased thread name.
+    entries: HashMap<String, RequestThreadEntry>,
+    /// Insertion order queue (thread names) for FIFO eviction.
+    order: VecDeque<String>,
+    /// Next sequence number for insertion order tracking.
+    next_seq: u64,
+    /// Maximum number of entries (default 10000, matching Lucee).
+    limit: usize,
+}
+
+impl RequestThreadRegistry {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            next_seq: 0,
+            limit,
+        }
+    }
+
+    /// Register a thread in the request-wide registry. Evicts oldest if at capacity.
+    pub fn register(
+        &mut self,
+        name: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        metadata: CfmlValue,
+    ) {
+        let key = name.to_lowercase();
+        
+        // If we're at capacity and this is a new entry, evict oldest
+        if self.entries.len() >= self.limit && !self.entries.contains_key(&key) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        
+        let entry = RequestThreadEntry {
+            name: name.clone(),
+            cancel,
+            metadata,
+            seq,
+        };
+        
+        // Remove from old position in order queue if updating
+        if self.entries.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        }
+        
+        self.entries.insert(key.clone(), entry);
+        self.order.push_back(key);
+    }
+
+    /// Update the metadata for a thread (called when thread completes).
+    pub fn update_metadata(&mut self, name: &str, metadata: CfmlValue) {
+        let key = name.to_lowercase();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.metadata = metadata;
+        }
+    }
+
+    /// Look up a thread's cancel flag by name.
+    pub fn get_cancel_flag(&self, name: &str) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.entries
+            .get(&name.to_lowercase())
+            .map(|e| e.cancel.clone())
+    }
+
+    /// Get thread metadata by name.
+    pub fn get_metadata(&self, name: &str) -> Option<CfmlValue> {
+        self.entries
+            .get(&name.to_lowercase())
+            .map(|e| e.metadata.clone())
+    }
+
+    /// Get all thread names in the registry.
+    pub fn all_names(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
+    /// Get the entire request-wide cfthread struct for threadData().
+    pub fn get_all_metadata(&self) -> ValueMap {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.metadata.clone()))
+            .collect()
+    }
 }
 
 /// A spawned `cfthread`'s live handle, held by the parent until join. Lives on
@@ -5220,6 +5336,7 @@ impl CfmlVirtualMachine {
             disallowed_imports: Vec::new(),
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
+            request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(10000))),
             cancel_flag: None,
             thread_interrupted: false,
             thread_context_class_loader: None,
@@ -6332,6 +6449,7 @@ impl CfmlVirtualMachine {
             server_state: self.server_state.clone(),
             application_scope: self.application_scope.clone(),
             request_scope: self.request_scope.clone(),
+            request_thread_registry: self.request_thread_registry.clone(),
             own_request_scope: false,
             session_scope: self.session_scope.clone(),
             session_id: self.session_id.clone(),
@@ -6389,6 +6507,7 @@ impl CfmlVirtualMachine {
         } else {
             seed.request_scope
         };
+        self.request_thread_registry = seed.request_thread_registry;
         self.session_scope = seed.session_scope;
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
@@ -6794,6 +6913,14 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Get the metadata struct for a thread from the cfthread scope.
+    pub fn get_cfthread_metadata(&self, thread_name: &str) -> Option<CfmlValue> {
+        self.globals
+            .get("cfthread")
+            .and_then(|cf| cf.as_cfml_struct())
+            .and_then(|ts| ts.get(&thread_name.to_lowercase()).map(|v| v.clone()))
+    }
+
     /// Store a completed `ThreadResult` into the `cfthread` scope: the running
     /// entry's keys (see `store_cfthread_running`) with the outcome filled in,
     /// plus the body's `thread.*` values. `error` is there only when the body
@@ -6842,8 +6969,13 @@ impl CfmlVirtualMachine {
         for (k, v) in r.thread_vars {
             meta.insert(k, v);
         }
+        let metadata_value = CfmlValue::strukt(meta.clone());
         if let Some(ts) = thread_struct.as_cfml_struct() {
-            ts.insert(key, CfmlValue::strukt(meta));
+            ts.insert(key.clone(), metadata_value.clone());
+        }
+        // Also update the request-wide registry
+        if let Ok(mut reg) = self.request_thread_registry.write() {
+            reg.update_metadata(thread_name, metadata_value);
         }
     }
 
@@ -23988,10 +24120,22 @@ impl CfmlVirtualMachine {
                         let seed = self.build_thread_seed(callback, attributes);
                         let mut handle = spawn_fn(seed);
                         handle.name = thread_name.clone();
+                        let cancel_flag = handle.cancel.clone();
+                        
+                        // Register in local cfthread scope
                         self.live_threads.insert(thread_name.to_lowercase(), handle);
+                        
                         // Pre-seed cfthread.NAME as RUNNING so reads before join
                         // see a live status rather than a missing key.
                         self.store_cfthread_running(&thread_name, &priority);
+                        
+                        // Also register in the request-wide registry for cross-thread access
+                        if let Some(metadata) = self.get_cfthread_metadata(&thread_name) {
+                            if let Ok(mut reg) = self.request_thread_registry.write() {
+                                reg.register(thread_name.clone(), cancel_flag, metadata);
+                            }
+                        }
+                        
                         return Ok(CfmlValue::Null);
                     }
                     self.store_cfthread_running(&thread_name, &priority);
@@ -24036,10 +24180,22 @@ impl CfmlVirtualMachine {
                     // already-finished thread. (Rust threads can't be force-
                     // killed mid-instruction — documented Lucee divergence.)
                     if let Some(name) = args.get(0).map(|v| v.as_string()) {
-                        if let Some(handle) = self.live_threads.get(&name.to_lowercase()) {
+                        let key = name.to_lowercase();
+                        // Try local live_threads first
+                        let mut found = false;
+                        if let Some(handle) = self.live_threads.get(&key) {
                             handle
                                 .cancel
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            found = true;
+                        }
+                        // Fall back to request-wide registry (for sibling/parent threads)
+                        if !found {
+                            if let Ok(reg) = self.request_thread_registry.read() {
+                                if let Some(cancel) = reg.get_cancel_flag(&name) {
+                                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                         }
                     }
                     return Ok(CfmlValue::Null);
