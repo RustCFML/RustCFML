@@ -1260,6 +1260,16 @@ impl Parser {
                     if let LiteralValue::String(ref s) = lit.value { Some(s.to_lowercase()) } else { None }
                 } else { None })
                 .unwrap_or_else(|| "run".to_string());
+            
+            // For join action without an explicit name, use "" (join all) not "thread1"
+            let thread_name_for_join = if action == "join" && !attrs.iter().any(|(k, _)| k == "name") {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("".to_string()),
+                    location: stmt_loc.clone(),
+                })
+            } else {
+                thread_name.clone()
+            };
 
             match action.as_str() {
                 "run" => {
@@ -1336,7 +1346,7 @@ impl Parser {
                             name: "__cfthread_join".to_string(),
                             location: stmt_loc.clone(),
                         })),
-                        arguments: vec![thread_name, timeout],
+                        arguments: vec![thread_name_for_join, timeout],
                         location: stmt_loc.clone(),
                     }));
                     return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {

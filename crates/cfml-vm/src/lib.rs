@@ -7063,12 +7063,6 @@ impl CfmlVirtualMachine {
     /// scope. A timeout leaves the thread RUNNING and returns without error.
     /// No-op for an unknown or already-joined name.
     pub fn join_thread(&mut self, name: &str, timeout_ms: i64) -> Result<(), String> {
-        // DEBUG: Track "thread1" lookups
-        if name == "thread1" {
-            eprintln!("[DEBUG] Attempting to join 'thread1' from thread: {:?}, source: {:?}", 
-                self.cfml_thread_name, self.source_file);
-        }
-        
         // FIX #3: Self-join detection - return immediately (documented deviation from Lucee's hang)
         if let Some(ref current) = self.cfml_thread_name {
             if current.eq_ignore_ascii_case(name) {
@@ -7125,20 +7119,7 @@ impl CfmlVirtualMachine {
             if let Ok(reg) = self.request_thread_registry.read() {
                 match reg.get_completion_handle(name) {
                     Some(h) => h,
-                    None => {
-                        let live_names: Vec<String> = self.live_threads.keys().cloned().collect();
-                        let reg_names = reg.all_names();
-                        let ctx = format!(
-                            "There is no thread running with the name [{}] (join from thread: {}, registry has {} entries, live_threads has {} entries, name in live_threads: {}, first 10 registry names: {:?})",
-                            name,
-                            self.cfml_thread_name.as_deref().unwrap_or("<root>"),
-                            reg.len(),
-                            live_names.len(),
-                            live_names.contains(&name.to_string()),
-                            reg_names.iter().take(10).collect::<Vec<_>>()
-                        );
-                        return Err(ctx);
-                    }
+                    None => return Err(format!("There is no thread running with the name [{}]", name)),
                 }
             } else {
                 return Err(format!("There is no thread running with the name [{}]", name));
@@ -24582,19 +24563,15 @@ impl CfmlVirtualMachine {
                                 .map(|(k, _)| k.clone())
                                 .collect();
                             
-                            eprintln!("[DEBUG] no-name join: live_threads contributed {} names: {:?}", all_names.len(), all_names.iter().take(10).collect::<Vec<_>>());
-                            
                             // Add non-ancestor threads from registry
                             if let Ok(reg) = self.request_thread_registry.read() {
                                 let non_ancestors = reg.get_non_ancestor_names(self_name);
-                                eprintln!("[DEBUG] no-name join: registry contributed {} non-ancestor names", non_ancestors.len());
                                 for name in non_ancestors {
                                     if !all_names.contains(&name) {
                                         all_names.push(name);
                                     }
                                 }
                             }
-                            eprintln!("[DEBUG] no-name join: total {} names to join: {:?}", all_names.len(), all_names.iter().take(20).collect::<Vec<_>>());
                             all_names
                         }
                     };
@@ -24665,13 +24642,7 @@ impl CfmlVirtualMachine {
                                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     Err(e) => {
-                                        // Add context about terminate location for debugging
-                                        let ctx = format!(
-                                            "{} (terminate from thread: {})",
-                                            e,
-                                            self.cfml_thread_name.as_deref().unwrap_or("<root>")
-                                        );
-                                        return Err(CfmlError::new(ctx, CfmlErrorType::Application));
+                                        return Err(CfmlError::new(e, CfmlErrorType::Application));
                                     }
                                 }
                             }
