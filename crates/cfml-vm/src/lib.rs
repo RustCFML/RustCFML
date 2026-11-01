@@ -5347,6 +5347,12 @@ fn is_engine_frame_local(name: &str) -> bool {
 
 impl CfmlVirtualMachine {
     pub fn new(program: BytecodeProgram) -> Self {
+        // Read RUSTCFML_TASKS_LIMIT once per VM for both cfthread_limit and request_thread_registry
+        let tasks_limit = std::env::var("RUSTCFML_TASKS_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10000);
+        
         let mut vm = Self {
             _live: VmLiveGuard::new(),
             program,
@@ -5527,17 +5533,9 @@ impl CfmlVirtualMachine {
             disallowed_imports: Vec::new(),
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
-            request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(
-                std::env::var("RUSTCFML_TASKS_LIMIT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(10000)
-            ))),
+            request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(tasks_limit))),
             cfthread_order: VecDeque::new(),
-            cfthread_limit: std::env::var("RUSTCFML_TASKS_LIMIT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10000),
+            cfthread_limit: tasks_limit,
             cancel_flag: None,
             cfml_thread_name: None,
             thread_interrupted: false,
