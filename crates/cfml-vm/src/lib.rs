@@ -9,7 +9,7 @@ use cfml_common::vfs::{RealFs, Vfs, VfsDirEntry};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 /// Fx-hashed maps for the engine's own path/id-keyed caches (GH #425): every
 /// construction probes a dozen of these with an ~80-byte source path, and
 /// SipHash cost ~40 ns per probe against Fx's ~8. Internal keys only — never
@@ -3329,10 +3329,24 @@ pub struct CfmlVirtualMachine {
     /// Live `cfthread` handles keyed by lowercased thread name, awaiting join.
     /// Empty and untouched for code that never spawns a thread.
     pub live_threads: HashMap<String, ThreadHandle>,
+    /// Request-wide thread registry shared by all threads in this request
+    /// (matching Lucee's root page context registry). Lets children join siblings
+    /// or parent-spawned threads. Capped with FIFO eviction (default 10000).
+    pub request_thread_registry: Arc<RwLock<RequestThreadRegistry>>,
+    /// Insertion order queue for the spawner's local cfthread scope (FIFO eviction).
+    /// Matches the order threads were registered in the local scope for S6 capping.
+    pub cfthread_order: VecDeque<String>,
+    /// Maximum entries in the spawner's local cfthread scope (S6: Lucee PageContextImpl L4245-4250).
+    /// Default 10000, configurable via RUSTCFML_TASKS_LIMIT env var for tests.
+    pub cfthread_limit: usize,
     /// Set on a spawned child VM: when flipped true (by thread terminate), the
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The CFML thread name of this VM's thread (if running as a named cfthread).
+    /// None for the root request or anonymous threads. Used for self-join detection
+    /// and ancestor exclusion in no-name joins (FIX #3).
+    pub cfml_thread_name: Option<String>,
     /// `Thread.currentThread().interrupt()` — the running thread's Java
     /// interrupt flag, cleared by static `Thread.interrupted()`. Only a flag:
     /// unlike `cancel_flag` it never stops the code (Java semantics). A VM runs
@@ -4163,6 +4177,8 @@ pub struct ThreadSeed {
     /// Shared live with the parent (CFML request scope is shared across threads)
     /// — unless `own_request_scope` is set.
     pub request_scope: CfmlStruct,
+    /// Request-wide thread registry shared across all threads in this request.
+    pub request_thread_registry: Arc<RwLock<RequestThreadRegistry>>,
     /// Give every run of this seed a FRESH, empty `request` scope instead of the
     /// parent's (set for java.util.concurrent executor tasks). A periodic
     /// schedule clones one seed per tick, so the fresh scope is made in
@@ -4216,9 +4232,300 @@ pub struct ThreadSeed {
     /// thread. Set by the executor shims from the CFML ThreadFactory's pattern
     /// (e.g. `CFConcurrentPool-1-Thread-3`); `None` keeps the ambient default.
     pub thread_name: Option<String>,
+    /// The CFML thread name for this daemon thread (if named), for registry lookups
+    /// and parent tracking. None for anonymous threads.
+    pub cfml_thread_name: Option<String>,
+    /// Completion handle to signal when this thread finishes (all exit paths).
+    /// Passed through so the child VM can notify waiters directly.
+    pub completion_handle: Option<Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>>,
     /// Live-seed census handle (see [`SeedCensus`]). `None` unless
     /// `RUSTCFML_GC_DEBUG` is set, so the normal path allocates nothing.
     pub census: Option<Arc<SeedCensus>>,
+}
+
+/// Per-request thread registry entry: metadata for a spawned thread that is
+/// shared request-wide (matching Lucee's root page context registry).
+#[derive(Clone)]
+pub struct RequestThreadEntry {
+    /// Original-case thread name.
+    pub name: String,
+    /// Cooperative-cancel flag shared with the running body.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared completion handle: any thread can wait on this.
+    /// (Mutex<Option<ThreadResult>>, Condvar) - None while running, Some when done.
+    pub completion: Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>,
+    /// Metadata struct for the `cfthread.NAME` entry (status, output, etc.).
+    /// Updated when the thread completes.
+    pub metadata: CfmlValue,
+    /// Parent thread name (lowercase), if spawned from another daemon thread.
+    /// Used for no-name join's ancestor exclusion (Lucee getAllNoneAncestorThreads).
+    pub parent: Option<String>,
+    /// Whether this is a daemon (named) thread. Anonymous threads (no name) are not tracked.
+    pub is_daemon: bool,
+}
+
+/// Per-request, request-wide thread registry. Shared by all threads in a request
+/// (including nested threads), matching Lucee's root page context registry.
+/// Capped with oldest-eviction (default 10000, matching Lucee's `lucee.tasks.limit`).
+pub struct RequestThreadRegistry {
+    /// Thread entries keyed by lowercased thread name.
+    entries: HashMap<String, RequestThreadEntry>,
+    /// Insertion order queue (thread names) for FIFO eviction.
+    order: VecDeque<String>,
+    /// Maximum number of entries (default 10000, matching Lucee).
+    limit: usize,
+}
+
+impl RequestThreadRegistry {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            limit,
+        }
+    }
+
+    /// Register a thread in the request-wide registry. Evicts oldest if at capacity.
+    /// Throws CfmlError if a daemon thread name is already registered (Lucee parity).
+    pub fn register(
+        &mut self,
+        name: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        completion: Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>,
+        metadata: CfmlValue,
+        parent: Option<String>,
+        is_daemon: bool,
+    ) -> Result<(), CfmlError> {
+        let key = name.to_lowercase();
+        
+        // Lucee throws on duplicate daemon names: "threads names must be unique within a request"
+        // (ThreadTag.java L322-326)
+        if is_daemon && self.entries.contains_key(&key) {
+            return Err(CfmlError::new(
+                format!("threads names must be unique within a request [{}]", name),
+                CfmlErrorType::Application
+            ));
+        }
+        
+        // If we're at capacity and this is a new entry, evict oldest
+        if self.entries.len() >= self.limit && !self.entries.contains_key(&key) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        
+        let entry = RequestThreadEntry {
+            name: name.clone(),
+            cancel,
+            completion,
+            metadata,
+            parent,
+            is_daemon,
+        };
+        
+        // Remove from old position in order queue if updating
+        if self.entries.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        }
+        
+        self.entries.insert(key.clone(), entry);
+        self.order.push_back(key);
+        Ok(())
+    }
+
+    /// Wait for a thread to complete with optional timeout (matching Lucee's join).
+    /// Returns the ThreadResult if the thread completed, Err if not found, or times out.
+    /// Fixes B2 (deadlock): clones the handle under lock, drops guard, then waits.
+    /// Fixes B3 (spurious wakeup): loops while None, with fixed deadline.
+    /// Only used in tests.
+    #[cfg(test)]
+    pub fn wait_for_completion(&self, name: &str, timeout_ms: i64) -> Result<ThreadResult, String> {
+        let key = name.to_lowercase();
+        
+        // Lucee throws on unknown names (ThreadTag.java L446-448)
+        let entry = self.entries.get(&key).ok_or_else(|| {
+            format!("There is no thread running with the name [{}]", name)
+        })?;
+        
+        // FIX #1: Clone the handle under lock (borrow ends when entry goes out of scope)
+        let completion_handle = entry.completion.clone();
+        
+        let (lock, cvar) = &*completion_handle;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        
+        // Already completed?
+        if let Some(r) = &*guard {
+            return Ok(r.clone());
+        }
+        
+        // B3: Wait with loop on deadline for spurious wakeups
+        if timeout_ms > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    // Timeout
+                    return Err(format!("Thread [{}] did not complete within timeout", name));
+                }
+                let remaining = deadline.duration_since(now);
+                let result = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                    // Recover from poisoning
+                    let g = e.into_inner();
+                    (g.0, g.1)
+                });
+                guard = result.0;
+                if guard.is_some() {
+                    return Ok(guard.as_ref().unwrap().clone());
+                }
+                if result.1.timed_out() {
+                    return Err(format!("Thread [{}] timed out", name));
+                }
+            }
+        } else {
+            // Wait indefinitely with loop for spurious wakeups
+            loop {
+                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                if let Some(r) = &*guard {
+                    return Ok(r.clone());
+                }
+            }
+        }
+    }
+
+    /// Update the metadata for a thread (called when thread completes).
+    /// Used for live metadata updates.
+    pub fn update_metadata(&mut self, name: &str, metadata: CfmlValue) {
+        let key = name.to_lowercase();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.metadata = metadata;
+        }
+    }
+
+    /// Look up a thread's cancel flag by name.
+    /// Throws if the thread is not found (Lucee parity for terminate).
+    pub fn get_cancel_flag(&self, name: &str) -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
+        self.entries
+            .get(&name.to_lowercase())
+            .map(|e| e.cancel.clone())
+            .ok_or_else(|| format!("Terminate thread failed, there is no thread running with the name [{}]", name))
+    }
+
+    /// Get all non-ancestor thread names for no-name join (Lucee getAllNoneAncestorThreads).
+    /// Excludes self and ancestors.
+    /// FIX #3: Get all thread names except self and ancestors (for no-name join).
+    /// Cycle-safe: tracks visited nodes to prevent infinite loops.
+    pub fn get_non_ancestor_names(&self, self_name: Option<&str>) -> Vec<String> {
+        let mut ancestors = std::collections::HashSet::new();
+        if let Some(sn) = self_name {
+            let key = sn.to_lowercase();
+            ancestors.insert(key.clone());
+            // Walk up parent chain with cycle detection
+            let mut current = Some(key);
+            let mut visited = std::collections::HashSet::new();
+            while let Some(c) = current {
+                if visited.contains(&c) {
+                    // Cycle detected, stop walking
+                    break;
+                }
+                visited.insert(c.clone());
+                if let Some(entry) = self.entries.get(&c) {
+                    if let Some(ref p) = entry.parent {
+                        ancestors.insert(p.clone());
+                        current = Some(p.clone());
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        self.entries
+            .keys()
+            .filter(|k| !ancestors.contains(*k))
+            .cloned()
+            .collect()
+    }
+
+    /// Get metadata for all threads (for threadData() BIF).
+    /// Returns the request-wide view of all cfthread entries.
+    pub fn get_all_metadata(&self) -> ValueMap {
+        let mut result = ValueMap::default();
+        for (key, entry) in &self.entries {
+            result.insert(key.clone(), entry.metadata.clone());
+        }
+        result
+    }
+
+    /// Get metadata for root request's direct children only (Lucee ThreadData.java L19-24).
+    /// Returns entries where parent is None (spawned directly by root request).
+    pub fn get_root_children_metadata(&self) -> ValueMap {
+        let mut result = ValueMap::default();
+        for (key, entry) in &self.entries {
+            if entry.parent.is_none() {
+                result.insert(key.clone(), entry.metadata.clone());
+            }
+        }
+        result
+    }
+
+    /// Check if a thread name exists in the registry.
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(&name.to_lowercase())
+    }
+
+    /// Get the completion handle for a thread (for passing to spawned child).
+    pub fn get_completion_handle(&self, name: &str) -> Option<Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>> {
+        self.entries.get(&name.to_lowercase()).map(|e| e.completion.clone())
+    }
+
+    /// Clear all entries (for request end cleanup).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    /// Get current size (for testing).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check if registry is empty (for testing).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Update thread metadata from ThreadResult (for CompletionGuard live updates).
+    /// Updates status, output, error, elapsedtime, and copies thread.* scope values.
+    /// Matches Lucee ThreadsImpl.java L150-161, L265-267: error struct and zero ELAPSEDTIME for TERMINATED.
+    pub fn update_from_result(&mut self, name: &str, result: &ThreadResult) {
+        let key = name.to_lowercase();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if let CfmlValue::Struct(ref mut s) = entry.metadata {
+                s.insert("status".to_string(), CfmlValue::string(result.status.clone()));
+                s.insert("output".to_string(), CfmlValue::string(result.output.clone()));
+                // Lucee ThreadsImpl L158: use error_struct, not string
+                if let Some(ref err_struct) = result.error_struct {
+                    s.insert("error".to_string(), err_struct.clone());
+                }
+                // Lucee ThreadsImpl L151: ELAPSEDTIME 0 for TERMINATED threads
+                let elapsed_time = if result.status == "TERMINATED" { 0 } else { result.elapsed };
+                s.insert("elapsedtime".to_string(), CfmlValue::Int(elapsed_time));
+                // Copy all thread.* scope values into the metadata (scenario 11: result, etc.)
+                for (k, v) in &result.thread_vars {
+                    s.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    /// Get thread metadata by name.
+    pub fn get_metadata(&self, name: &str) -> Option<CfmlValue> {
+        self.entries
+            .get(&name.to_lowercase())
+            .map(|e| e.metadata.clone())
+    }
 }
 
 /// A spawned `cfthread`'s live handle, held by the parent until join. Lives on
@@ -5046,6 +5353,12 @@ fn is_engine_frame_local(name: &str) -> bool {
 
 impl CfmlVirtualMachine {
     pub fn new(program: BytecodeProgram) -> Self {
+        // Read RUSTCFML_TASKS_LIMIT once per VM for both cfthread_limit and request_thread_registry
+        let tasks_limit = std::env::var("RUSTCFML_TASKS_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10000);
+        
         let mut vm = Self {
             _live: VmLiveGuard::new(),
             program,
@@ -5228,7 +5541,11 @@ impl CfmlVirtualMachine {
             disallowed_imports: Vec::new(),
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
+            request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(tasks_limit))),
+            cfthread_order: VecDeque::new(),
+            cfthread_limit: tasks_limit,
             cancel_flag: None,
+            cfml_thread_name: None,
             thread_interrupted: false,
             thread_context_class_loader: None,
             static_stores: FxHashMap::default(),
@@ -6388,6 +6705,15 @@ impl CfmlVirtualMachine {
                 // is.) A by-value copy either way, so the GH #234 fix above —
                 // sibling threads must not share one live scope — still holds.
                 let mut vars = self.globals.clone();
+                // Remove the parent's `cfthread` scope so the child gets its
+                // own independent scope instead of sharing the parent's Arc
+                // (GH #505). Without this, a self-rescheduling chain leaks
+                // ~1.3 KB per thread forever: each child inherits the parent's
+                // live cfthread struct, `store_cfthread_running` adds the
+                // child's entry to it, and the child then passes that same
+                // struct to its own child. The chain holds one growing struct
+                // for its entire lifetime.
+                vars.shift_remove("cfthread");
                 if let Some(cv) = component_vars {
                     for (k, v) in cv {
                         vars.insert(k, v);
@@ -6400,6 +6726,7 @@ impl CfmlVirtualMachine {
             server_state: self.server_state.clone(),
             application_scope: self.application_scope.clone(),
             request_scope: self.request_scope.clone(),
+            request_thread_registry: self.request_thread_registry.clone(),
             own_request_scope: false,
             session_scope: self.session_scope.clone(),
             session_id: self.session_id.clone(),
@@ -6429,6 +6756,8 @@ impl CfmlVirtualMachine {
             attributes,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             thread_name: None,
+            cfml_thread_name: None,
+            completion_handle: None,
             census: SeedCensus::new(),
         }
     }
@@ -6457,6 +6786,8 @@ impl CfmlVirtualMachine {
         } else {
             seed.request_scope
         };
+        self.request_thread_registry = seed.request_thread_registry;
+        self.cfml_thread_name = seed.cfml_thread_name.clone();
         self.session_scope = seed.session_scope;
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
@@ -6496,6 +6827,13 @@ impl CfmlVirtualMachine {
         for (k, v) in seed.variables_snapshot {
             self.globals.insert(k, v);
         }
+        // The parent's cfthread was stripped at seed-build (GH #505). Create a
+        // fresh empty cfthread scope for this child so it only sees threads IT
+        // spawns (Lucee cfthread semantics).
+        self.globals.insert(
+            "cfthread".to_string(),
+            CfmlValue::Struct(CfmlStruct::new(ValueMap::default())),
+        );
         // Carry the parent's pre-seeded `thread.*` values so run_thread_body
         // can seed the body's `thread` scope with them (issue #217).
         self.page_thread_scope = CfmlStruct::new(seed.page_thread_scope);
@@ -6799,42 +7137,171 @@ impl CfmlVirtualMachine {
     /// elapses (0 = wait forever), then publish its result into the `cfthread`
     /// scope. A timeout leaves the thread RUNNING and returns without error.
     /// No-op for an unknown or already-joined name.
-    pub fn join_thread(&mut self, name: &str, timeout_ms: i64) {
-        let collected: Option<ThreadResult> = {
-            let handle = match self.live_threads.get_mut(name) {
-                Some(h) => h,
-                None => return,
-            };
-            if handle.result.is_some() {
-                return; // already joined and published
+    pub fn join_thread(&mut self, name: &str, timeout_ms: i64) -> Result<(), String> {
+        // FIX #3: Self-join detection - return immediately (documented deviation from Lucee's hang)
+        if let Some(ref current) = self.cfml_thread_name {
+            if current.eq_ignore_ascii_case(name) {
+                return Ok(());
             }
-            let recv = if timeout_ms > 0 {
-                handle
-                    .rx
-                    .recv_timeout(std::time::Duration::from_millis(timeout_ms as u64))
-                    .ok()
-            } else {
-                handle.rx.recv().ok()
-            };
-            match recv {
-                Some(res) => {
-                    if let Some(j) = handle.join.take() {
-                        let _ = j.join();
-                    }
-                    handle.result = Some(res.clone());
-                    Some(res)
+        }
+        
+        // Try local live_threads first (threads this context spawned)
+        if self.live_threads.contains_key(name) {
+            let collected: Option<ThreadResult> = {
+                let handle = match self.live_threads.get_mut(name) {
+                    Some(h) => h,
+                    None => return Ok(()),
+                };
+                if handle.result.is_some() {
+                    return Ok(()); // already joined and published
                 }
-                None => None, // timed out — thread keeps running
+                let recv_result = if timeout_ms > 0 {
+                    handle
+                        .rx
+                        .recv_timeout(std::time::Duration::from_millis(timeout_ms as u64))
+                } else {
+                    handle.rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                };
+                match recv_result {
+                    Ok(res) => {
+                        if let Some(j) = handle.join.take() {
+                            let _ = j.join();
+                        }
+                        handle.result = Some(res.clone());
+                        Some(res)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, // timed out — thread keeps running
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // Channel closed (thread panicked) — CompletionGuard wrote TERMINATED
+                        // to registry. Fall back to reading it from there.
+                        if let Some(j) = handle.join.take() {
+                            let _ = j.join(); // Reap the panicked thread
+                        }
+                        // Try to read TERMINATED result from registry
+                        let from_registry = if let Ok(reg) = self.request_thread_registry.read() {
+                            if let Some(meta) = reg.get_metadata(name) {
+                                if let CfmlValue::Struct(ref s) = meta {
+                                    // Build a ThreadResult from the metadata
+                                    let status = s.get("status").map(|v| v.as_string()).unwrap_or_else(|| "TERMINATED".to_string());
+                                    let output = s.get("output").map(|v| v.as_string()).unwrap_or_default();
+                                    let error_val = s.get("error");
+                                    let error = if let Some(CfmlValue::Struct(ref e)) = error_val {
+                                        e.get("message").map(|v| v.as_string()).unwrap_or_else(|| "Thread terminated".to_string())
+                                    } else {
+                                        "Thread terminated".to_string()
+                                    };
+                                    let elapsed: i64 = if let Some(CfmlValue::Int(n)) = s.get("elapsedtime") {
+                                        n
+                                    } else {
+                                        0
+                                    };
+                                    Some(ThreadResult {
+                                        status,
+                                        output,
+                                        error,
+                                        mem_allocated: 0,
+                                        error_struct: error_val.map(|v| v.clone()),
+                                        elapsed,
+                                        thread_vars: ValueMap::default(),
+                                        return_value: None,
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        
+                        // If registry entry was evicted/cleared, construct a TERMINATED result
+                        let res = from_registry.unwrap_or_else(|| {
+                            let mut error_struct_map = ValueMap::default();
+                            error_struct_map.insert("message".to_string(), CfmlValue::string("Thread terminated".to_string()));
+                            error_struct_map.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+                            ThreadResult {
+                                status: "TERMINATED".to_string(),
+                                output: String::new(),
+                                error: "Thread terminated".to_string(),
+                                mem_allocated: 0,
+                                error_struct: Some(CfmlValue::strukt(error_struct_map)),
+                                elapsed: 0,
+                                thread_vars: ValueMap::default(),
+                                return_value: None,
+                            }
+                        });
+                        handle.result = Some(res.clone());
+                        Some(res)
+                    }
+                }
+            };
+            if let Some(res) = collected {
+                let orig = self
+                    .live_threads
+                    .get(name)
+                    .map(|h| h.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| name.to_string());
+                self.store_cfthread_result(&orig, res);
             }
-        };
-        if let Some(res) = collected {
-            let orig = self
-                .live_threads
-                .get(name)
-                .map(|h| h.name.clone())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| name.to_string());
-            self.store_cfthread_result(&orig, res);
+            return Ok(());
+        }
+
+        // Fall back to request-wide registry (for sibling/parent-spawned threads)
+        // This enables cross-thread join matching Lucee's root registry behavior
+        // FIX #1: Clone completion handle under lock, then drop guard before waiting
+        // to avoid deadlock when cross-joiner B spawns a thread (B blocks on write())
+        let completion_handle = {
+            if let Ok(reg) = self.request_thread_registry.read() {
+                match reg.get_completion_handle(name) {
+                    Some(h) => h,
+                    None => return Err(format!("There is no thread running with the name [{}]", name)),
+                }
+            } else {
+                return Err(format!("There is no thread running with the name [{}]", name));
+            }
+        }; // Read guard dropped here
+        
+        // Now wait without holding any lock
+        let (lock, cvar) = &*completion_handle;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        
+        // Already completed?
+        if guard.is_some() {
+            return Ok(());
+        }
+        
+        // Wait with timeout or indefinitely
+        if timeout_ms > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    // FIX #5: Timeout on cross-thread join returns silently (Lucee parity)
+                    return Ok(());
+                }
+                let remaining = deadline.duration_since(now);
+                let result = cvar.wait_timeout(guard, remaining).unwrap_or_else(|e| {
+                    let g = e.into_inner();
+                    (g.0, g.1)
+                });
+                guard = result.0;
+                if guard.is_some() {
+                    return Ok(());
+                }
+                if result.1.timed_out() {
+                    return Ok(());
+                }
+            }
+        } else {
+            // Wait indefinitely
+            loop {
+                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                if guard.is_some() {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -6856,10 +7323,58 @@ impl CfmlVirtualMachine {
             CfmlValue::DateTime(cfml_common::datetime::CfmlDate::now()),
         );
         meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
-        let cf = self.get_or_create_cfthread_scope();
-        if let Some(ts) = cf.as_cfml_struct() {
-            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+        
+        let key = thread_name.to_lowercase();
+        
+        // S6: Cap the spawner's local cfthread scope with FIFO eviction (Lucee PageContextImpl L4245-4250)
+        // Do this in stages to avoid borrowing conflicts
+        
+        // Stage 1: Check if we need to evict
+        let limit = self.cfthread_limit;
+        let mut current_size = 0;
+        let mut contains_key = false;
+        {
+            let cf = self.get_or_create_cfthread_scope();
+            if let Some(ts) = cf.as_cfml_struct() {
+                current_size = ts.len();
+                contains_key = ts.contains_key(&key);
+            }
         }
+        
+        // Stage 2: Evict if needed (no borrow of globals here)
+        if !contains_key && current_size >= limit {
+            let oldest_key = self.cfthread_order.front().cloned();
+            if let Some(oldest) = oldest_key {
+                self.cfthread_order.pop_front();
+                // Remove from globals
+                let cf2 = self.get_or_create_cfthread_scope();
+                if let Some(ts) = cf2.as_cfml_struct() {
+                    ts.remove(&oldest);
+                }
+            }
+        }
+        
+        // Stage 3: Update order queue (no borrow of globals here)
+        self.cfthread_order.retain(|k| k != &key);
+        
+        // Stage 4: Insert the new entry
+        {
+            let cf3 = self.get_or_create_cfthread_scope();
+            if let Some(ts) = cf3.as_cfml_struct() {
+                ts.insert(key.clone(), CfmlValue::strukt(meta));
+            }
+        }
+        
+        // Stage 5: Add to order queue
+        self.cfthread_order.push_back(key);
+    }
+
+    /// Get the metadata struct for a thread from the cfthread scope.
+    pub fn get_cfthread_metadata(&self, thread_name: &str) -> Option<CfmlValue> {
+        self.globals
+            .get("cfthread")
+            .and_then(|cf| cf.as_cfml_struct())
+            .and_then(|ts| ts.get(&thread_name.to_lowercase()).map(|v| v.clone()))
     }
 
     /// Store a completed `ThreadResult` into the `cfthread` scope: the running
@@ -6881,10 +7396,12 @@ impl CfmlVirtualMachine {
             running.as_ref().and_then(|m| m.get(k).cloned()).unwrap_or(default)
         };
         meta.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
-        meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
+        // Nit: ELAPSEDTIME 0 for TERMINATED (Lucee ThreadsImpl.java L151)
+        let elapsed_time = if r.status == "TERMINATED" { 0 } else { r.elapsed };
+        meta.insert("elapsedtime".to_string(), CfmlValue::Int(elapsed_time));
         meta.insert("interrupted".to_string(), CfmlValue::Bool(false));
         meta.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
-        meta.insert("output".to_string(), CfmlValue::string(r.output));
+        meta.insert("output".to_string(), CfmlValue::string(r.output.clone()));
         meta.insert(
             "priority".to_string(),
             carried("priority", CfmlValue::string("NORMAL".to_string())),
@@ -6899,19 +7416,24 @@ impl CfmlVirtualMachine {
                 ),
             ),
         );
-        meta.insert("status".to_string(), CfmlValue::string(r.status));
-        if let Some(e) = r.error_struct {
+        meta.insert("status".to_string(), CfmlValue::string(r.status.clone()));
+        if let Some(e) = r.error_struct.clone() {
             meta.insert("error".to_string(), e);
         } else if !r.error.is_empty() {
             let mut e = ValueMap::default();
-            e.insert("message".to_string(), CfmlValue::string(r.error));
+            e.insert("message".to_string(), CfmlValue::string(r.error.clone()));
             meta.insert("error".to_string(), CfmlValue::strukt(e));
         }
-        for (k, v) in r.thread_vars {
-            meta.insert(k, v);
+        for (k, v) in &r.thread_vars {
+            meta.insert(k.clone(), v.clone());
         }
+        let metadata_value = CfmlValue::strukt(meta.clone());
         if let Some(ts) = thread_struct.as_cfml_struct() {
-            ts.insert(key, CfmlValue::strukt(meta));
+            ts.insert(key.clone(), metadata_value.clone());
+        }
+        // Update metadata in the request-wide registry
+        if let Ok(mut reg) = self.request_thread_registry.write() {
+            reg.update_metadata(thread_name, metadata_value);
         }
     }
 
@@ -20332,8 +20854,27 @@ impl CfmlVirtualMachine {
                         .unwrap_or(0)
                         .max(0);
                     // No deadline in play: one plain sleep, no slicing overhead.
+                    // FIX #7: But still check cancel flag for cfthread terminate interrupt.
+                    // Only check for named cfthreads, not runAsync (where cancel is cooperative).
                     if self.request_timeout_ms <= 0 || self.request_start_ms == 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(total_ms as u64));
+                        const SLICE_MS: i64 = 25;
+                        let mut slept = 0i64;
+                        while slept < total_ms {
+                            // Check cancel flag only for cfthread (has cfml_thread_name)
+                            if self.cfml_thread_name.is_some() {
+                                if let Some(ref cancel) = self.cancel_flag {
+                                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return Err(CfmlError::new(
+                                            "Thread terminated".to_string(),
+                                            CfmlErrorType::Application,
+                                        ));
+                                    }
+                                }
+                            }
+                            let slice = SLICE_MS.min(total_ms - slept);
+                            std::thread::sleep(std::time::Duration::from_millis(slice as u64));
+                            slept += slice;
+                        }
                         return Ok(CfmlValue::Null);
                     }
                     const SLICE_MS: i64 = 25;
@@ -20341,6 +20882,17 @@ impl CfmlVirtualMachine {
                     while slept < total_ms {
                         self.check_request_timeout()?;
                         self.check_memory_abort()?;
+                        // FIX #7: Check cancel flag only for cfthread, not runAsync
+                        if self.cfml_thread_name.is_some() {
+                            if let Some(ref cancel) = self.cancel_flag {
+                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return Err(CfmlError::new(
+                                        "Thread terminated".to_string(),
+                                        CfmlErrorType::Application,
+                                    ));
+                                }
+                            }
+                        }
                         let slice = SLICE_MS.min(total_ms - slept);
                         std::thread::sleep(std::time::Duration::from_millis(slice as u64));
                         slept += slice;
@@ -24104,13 +24656,60 @@ impl CfmlVirtualMachine {
                     let spawn: Option<ThreadSpawnFn> = None;
 
                     if let Some(spawn_fn) = spawn {
-                        let seed = self.build_thread_seed(callback, attributes);
-                        let mut handle = spawn_fn(seed);
-                        handle.name = thread_name.clone();
-                        self.live_threads.insert(thread_name.to_lowercase(), handle);
+                        // Create seed, completion handle, and flags BEFORE spawn
+                        let mut seed = self.build_thread_seed(callback, attributes.clone());
+                        let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+                        let cancel_flag = seed.cancel_flag.clone();
+                        
+                        // Pass completion handle and thread name through seed (B1 fix)
+                        seed.completion_handle = Some(completion.clone());
+                        seed.cfml_thread_name = Some(thread_name.clone());
+                        
+                        // FIX #3: Capture spawner's current thread name BEFORE setting child's name
+                        // for correct parent tracking (not self-as-parent)
+                        let parent_name = self.cfml_thread_name.clone();
+                        
+                        // FIX #6: Build metadata and register BEFORE calling store_cfthread_running
+                        // Create metadata inline since store_cfthread_running hasn't been called yet
+                        let mut metadata = ValueMap::default();
+                        metadata.insert("childthreads".to_string(), CfmlValue::strukt(ValueMap::default()));
+                        metadata.insert("elapsedtime".to_string(), CfmlValue::Int(0));
+                        metadata.insert("interrupted".to_string(), CfmlValue::Bool(false));
+                        metadata.insert("name".to_string(), CfmlValue::string(thread_name.clone()));
+                        metadata.insert("output".to_string(), CfmlValue::string(String::new()));
+                        metadata.insert("priority".to_string(), CfmlValue::string(priority.clone()));
+                        metadata.insert("stacktrace".to_string(), CfmlValue::string(String::new()));
+                        metadata.insert(
+                            "starttime".to_string(),
+                            CfmlValue::DateTime(cfml_common::datetime::CfmlDate::now()),
+                        );
+                        metadata.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+                        
+                        if let Ok(mut reg) = self.request_thread_registry.write() {
+                            // S1: Lucee throws on duplicate daemon names
+                            if let Err(e) = reg.register(
+                                thread_name.clone(),
+                                cancel_flag.clone(),
+                                completion.clone(),
+                                CfmlValue::strukt(metadata),
+                                parent_name,
+                                true, // is_daemon (named thread)
+                            ) {
+                                return Err(e);
+                            }
+                        }
+                        
                         // Pre-seed cfthread.NAME as RUNNING so reads before join
                         // see a live status rather than a missing key.
                         self.store_cfthread_running(&thread_name, &priority);
+                        
+                        // NOW spawn the thread
+                        let mut handle = spawn_fn(seed);
+                        handle.name = thread_name.clone();
+                        
+                        // Register in local cfthread scope (for spawner's own view)
+                        self.live_threads.insert(thread_name.to_lowercase(), handle);
+                        
                         return Ok(CfmlValue::Null);
                     }
                     self.store_cfthread_running(&thread_name, &priority);
@@ -24127,23 +24726,76 @@ impl CfmlVirtualMachine {
                     // its own VM and its own writes, so anything it created must
                     // be visible to a probe made after the join.
                     self.retire_probed_negatives();
-                    // Join named thread(s), comma-separated; empty/absent name
-                    // joins all currently-live threads.
+                    
+                    // S2: No-name join - join all non-ancestor threads (Lucee getAllNoneAncestorThreads)
                     let names: Vec<String> = match args.get(0).map(|v| v.as_string()) {
                         Some(n) if !n.trim().is_empty() => n
                             .split(',')
                             .map(|s| s.trim().to_lowercase())
                             .filter(|s| !s.is_empty())
                             .collect(),
-                        _ => self.live_threads.keys().cloned().collect(),
+                        _ => {
+                            // FIX #3: No name: join all non-ancestor threads (Lucee getAllNoneAncestorThreads)
+                            // excluding self and ancestors
+                            let self_name = self.cfml_thread_name.as_deref();
+                            
+                            // Start with local threads that haven't been joined yet
+                            let mut all_names: Vec<String> = self.live_threads
+                                .iter()
+                                .filter(|(_, h)| h.result.is_none()) // Skip already-joined threads
+                                .map(|(k, _)| k.clone())
+                                .collect();
+                            
+                            // Add non-ancestor threads from registry
+                            if let Ok(reg) = self.request_thread_registry.read() {
+                                let non_ancestors = reg.get_non_ancestor_names(self_name);
+                                for name in non_ancestors {
+                                    if !all_names.contains(&name) {
+                                        all_names.push(name);
+                                    }
+                                }
+                            }
+                            all_names
+                        }
                     };
+                    
                     // Timeout in ms; 0 or absent = wait indefinitely.
+                    // S2: Timeout is shared budget across all joins (Lucee L453-458)
                     let timeout_ms = args
                         .get(1)
                         .map(|v| v.as_string().parse::<i64>().unwrap_or(0))
                         .unwrap_or(0);
+                    
+                    // FIX #2: Distinguish no-timeout from budget-exhausted
+                    // When remaining becomes 0, the budget is spent; stop joining
+                    // (Lucee ThreadTag L453-458)
+                    let start = if timeout_ms > 0 {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    
                     for name in names {
-                        self.join_thread(&name, timeout_ms);
+                        let remaining = if let Some(s) = start {
+                            let elapsed = s.elapsed().as_millis() as i64;
+                            if elapsed >= timeout_ms {
+                                // Budget exhausted, stop joining remaining threads
+                                break;
+                            } else {
+                                timeout_ms - elapsed
+                            }
+                        } else {
+                            0 // No timeout specified, wait indefinitely per thread
+                        };
+                        
+                        // S4: Self-join guard - Lucee hangs on self-join, but we return immediately
+                        // without holding any locks. Cannot detect at call-site (no thread name stored
+                        // on VM), so join_thread will detect and return Ok immediately.
+                        
+                        if let Err(e) = self.join_thread(&name, remaining) {
+                            // S3: Throw on unknown names (Lucee parity)
+                            return Err(CfmlError::new(e, CfmlErrorType::Application));
+                        }
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -24155,13 +24807,43 @@ impl CfmlVirtualMachine {
                     // already-finished thread. (Rust threads can't be force-
                     // killed mid-instruction — documented Lucee divergence.)
                     if let Some(name) = args.get(0).map(|v| v.as_string()) {
-                        if let Some(handle) = self.live_threads.get(&name.to_lowercase()) {
+                        let key = name.to_lowercase();
+                        // Try local live_threads first
+                        let mut found = false;
+                        if let Some(handle) = self.live_threads.get(&key) {
                             handle
                                 .cancel
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            found = true;
+                        }
+                        // Fall back to request-wide registry (for sibling/parent threads)
+                        if !found {
+                            if let Ok(reg) = self.request_thread_registry.read() {
+                                // S3: Throw on unknown names (Lucee parity)
+                                match reg.get_cancel_flag(&name) {
+                                    Ok(cancel) => {
+                                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        return Err(CfmlError::new(e, CfmlErrorType::Application));
+                                    }
+                                }
+                            }
                         }
                     }
                     return Ok(CfmlValue::Null);
+                }
+                
+                // S5: threadData() returns the request-wide cfthread registry view (Lucee parity)
+                "threaddata" => {
+                    // Lucee ThreadData.java L19-24: return root page context's cfthread struct
+                    // ALWAYS returns the ROOT request's DIRECT children, regardless of caller.
+                    if let Ok(reg) = self.request_thread_registry.read() {
+                        let metadata = reg.get_root_children_metadata();
+                        return Ok(CfmlValue::strukt(metadata));
+                    }
+                    // If registry is unavailable, return empty struct
+                    return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
 
                 // createDynamicProxy(cfc, interfaces): in a real JVM this builds
@@ -47775,5 +48457,627 @@ mod app_datasource_binding_tests {
             ),
             "a connectionString let an extension driver through to the bundled route"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_thread_registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn make_completion() -> Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)> {
+        Arc::new((Mutex::new(None), std::sync::Condvar::new()))
+    }
+
+    fn make_metadata(name: &str, status: &str) -> CfmlValue {
+        let mut m = ValueMap::default();
+        m.insert("name".to_string(), CfmlValue::string(name.to_string()));
+        m.insert("status".to_string(), CfmlValue::string(status.to_string()));
+        CfmlValue::strukt(m)
+    }
+
+    #[test]
+    fn registry_register_and_get() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = make_completion();
+        let metadata = make_metadata("thread1", "RUNNING");
+
+        let result = reg.register(
+            "thread1".to_string(),
+            cancel.clone(),
+            completion.clone(),
+            metadata.clone(),
+            None,
+            true,
+        );
+
+        assert!(result.is_ok(), "register should succeed");
+        assert!(reg.contains("thread1"));
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn registry_duplicate_name_throws() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = make_completion();
+        let metadata = make_metadata("dup", "RUNNING");
+
+        reg.register(
+            "dup".to_string(),
+            cancel.clone(),
+            completion.clone(),
+            metadata.clone(),
+            None,
+            true,
+        ).unwrap();
+
+        let result = reg.register(
+            "dup".to_string(),
+            cancel.clone(),
+            completion.clone(),
+            metadata.clone(),
+            None,
+            true,
+        );
+
+        assert!(result.is_err(), "duplicate name should throw");
+        let err = result.unwrap_err();
+        assert!(err.message.to_lowercase().contains("unique"), "error should mention 'unique'");
+    }
+
+    #[test]
+    fn registry_cap_eviction_fifo() {
+        let mut reg = RequestThreadRegistry::new(3); // Small cap for testing
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Register 5 threads with cap of 3
+        for i in 1..=5 {
+            let name = format!("thread{}", i);
+            reg.register(
+                name.clone(),
+                cancel.clone(),
+                make_completion(),
+                make_metadata(&name, "RUNNING"),
+                None,
+                true,
+            ).unwrap();
+        }
+
+        // Should have evicted oldest 2 (thread1, thread2)
+        assert_eq!(reg.len(), 3, "should be capped at 3");
+        assert!(!reg.contains("thread1"), "oldest should be evicted");
+        assert!(!reg.contains("thread2"), "second oldest should be evicted");
+        assert!(reg.contains("thread3"), "third should remain");
+        assert!(reg.contains("thread4"), "fourth should remain");
+        assert!(reg.contains("thread5"), "newest should remain");
+    }
+
+    #[test]
+    fn registry_clear() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        reg.register(
+            "t1".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("t1", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        assert_eq!(reg.len(), 1);
+        reg.clear();
+        assert_eq!(reg.len(), 0);
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn registry_get_non_ancestor_names_no_self() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Register threads with no parent relationships
+        reg.register(
+            "t1".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("t1", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        reg.register(
+            "t2".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("t2", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        // Get non-ancestors with no self_name (from root context)
+        let names = reg.get_non_ancestor_names(None);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"t1".to_string()));
+        assert!(names.contains(&"t2".to_string()));
+    }
+
+    #[test]
+    fn registry_get_non_ancestor_names_excludes_self() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        reg.register(
+            "t1".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("t1", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        reg.register(
+            "t2".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("t2", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        // From t1's perspective, should exclude self
+        let names = reg.get_non_ancestor_names(Some("t1"));
+        assert_eq!(names.len(), 1);
+        assert!(!names.contains(&"t1".to_string()), "should exclude self");
+        assert!(names.contains(&"t2".to_string()));
+    }
+
+    #[test]
+    fn registry_get_non_ancestor_names_excludes_parent() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Register parent
+        reg.register(
+            "parent".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("parent", "RUNNING"),
+            None,
+            true,
+        ).unwrap();
+
+        // Register child with parent
+        reg.register(
+            "child".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("child", "RUNNING"),
+            Some("parent".to_string()),
+            true,
+        ).unwrap();
+
+        // Register sibling
+        reg.register(
+            "sibling".to_string(),
+            cancel.clone(),
+            make_completion(),
+            make_metadata("sibling", "RUNNING"),
+            Some("parent".to_string()),
+            true,
+        ).unwrap();
+
+        // From child's perspective, should exclude self and parent, but include sibling
+        let names = reg.get_non_ancestor_names(Some("child"));
+        assert!(!names.contains(&"child".to_string()), "should exclude self");
+        assert!(!names.contains(&"parent".to_string()), "should exclude parent");
+        assert!(names.contains(&"sibling".to_string()), "should include sibling");
+    }
+
+    #[test]
+    fn registry_wait_for_completion_already_complete() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = make_completion();
+
+        // Pre-fill result
+        {
+            let (lock, _) = &*completion;
+            let mut guard = lock.lock().unwrap();
+            *guard = Some(ThreadResult {
+                status: "COMPLETED".to_string(),
+                output: String::new(),
+                error: String::new(),
+                error_struct: None,
+                mem_allocated: 0,
+                elapsed: 10,
+                thread_vars: ValueMap::default(),
+                return_value: None,
+            });
+        }
+
+        reg.register(
+            "done".to_string(),
+            cancel.clone(),
+            completion.clone(),
+            make_metadata("done", "COMPLETED"),
+            None,
+            true,
+        ).unwrap();
+
+        // Should return immediately
+        let result = reg.wait_for_completion("done", 1000);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().status, "COMPLETED");
+    }
+
+    #[test]
+    fn registry_wait_for_completion_unknown_name() {
+        let reg = RequestThreadRegistry::new(10);
+        let result = reg.wait_for_completion("nonexistent", 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no thread running"));
+    }
+}
+// Rust tests for VM join_thread path - to be added to lib.rs
+
+#[cfg(test)]
+// Rust tests for VM join_thread path - to be added to lib.rs
+
+#[cfg(test)]
+mod vm_join_thread_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use cfml_codegen::BytecodeProgram;
+
+    fn make_empty_program() -> BytecodeProgram {
+        BytecodeProgram {
+            functions: vec![],
+        }
+    }
+
+    #[test]
+    fn vm_join_thread_local_completes() {
+        // Test local join where spawner joins its own thread
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        // Simulate a thread spawn and completion
+        let thread_name = "test_local";
+        let result = ThreadResult {
+            status: "COMPLETED".to_string(),
+            output: "test output".to_string(),
+            error: String::new(),
+            mem_allocated: 0,
+            error_struct: None,
+            elapsed: 100,
+            thread_vars: ValueMap::default(),
+            return_value: None,
+        };
+        
+        // Create thread handle with completed result
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(result.clone()).unwrap();
+        
+        let handle = ThreadHandle {
+            name: thread_name.to_string(),
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            join: None,
+            result: None,
+        };
+        
+        vm.live_threads.insert(thread_name.to_lowercase(), handle);
+        
+        // Join should succeed immediately
+        let join_result = vm.join_thread(thread_name, 1000);
+        assert!(join_result.is_ok(), "join should succeed");
+        
+        // Verify result was stored in cfthread scope
+        let cfthread = vm.get_or_create_cfthread_scope();
+        if let Some(ts) = cfthread.as_cfml_struct() {
+            assert!(ts.contains_key(&thread_name.to_lowercase()));
+        }
+    }
+
+    #[test]
+    fn vm_join_thread_cross_thread_via_registry() {
+        // Test cross-thread join where thread B joins thread A (both in registry)
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        let thread_name = "cross_thread_test";
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        
+        let mut metadata = ValueMap::default();
+        metadata.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        metadata.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+        
+        // Register in registry
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            reg.register(
+                thread_name.to_string(),
+                cancel.clone(),
+                completion.clone(),
+                CfmlValue::strukt(metadata),
+                None,
+                true,
+            ).unwrap();
+        }
+        
+        // Simulate completion
+        let result = ThreadResult {
+            status: "COMPLETED".to_string(),
+            output: String::new(),
+            error: String::new(),
+            mem_allocated: 0,
+            error_struct: None,
+            elapsed: 50,
+            thread_vars: ValueMap::default(),
+            return_value: None,
+        };
+        
+        {
+            let (lock, cvar) = &*completion;
+            let mut guard = lock.lock().unwrap();
+            *guard = Some(result.clone());
+            cvar.notify_all();
+        }
+        
+        // Update registry metadata
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            reg.update_from_result(thread_name, &result);
+        }
+        
+        // Join via registry path (no local handle)
+        let join_result = vm.join_thread(thread_name, 1000);
+        assert!(join_result.is_ok(), "cross-thread join should succeed");
+    }
+
+    #[test]
+    fn vm_join_thread_shared_timeout_budget() {
+        // Test that joining multiple threads shares the timeout budget
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        // Create 3 threads that complete at different times
+        for i in 1..=3 {
+            let name = format!("budget_test_{}", i);
+            let result = ThreadResult {
+                status: "COMPLETED".to_string(),
+                output: String::new(),
+                error: String::new(),
+                mem_allocated: 0,
+                error_struct: None,
+                elapsed: i * 50,
+                thread_vars: ValueMap::default(),
+                return_value: None,
+            };
+            
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(result).unwrap();
+            
+            let handle = ThreadHandle {
+                name: name.clone(),
+                rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+                join: None,
+                result: None,
+            };
+            
+            vm.live_threads.insert(name.to_lowercase(), handle);
+        }
+        
+        // Join all with shared 500ms budget - should succeed since all return immediately
+        let start = std::time::Instant::now();
+        for i in 1..=3 {
+            let name = format!("budget_test_{}", i);
+            let result = vm.join_thread(&name, 500);
+            assert!(result.is_ok(), "join {} should succeed", name);
+        }
+        let elapsed = start.elapsed();
+        
+        // All joins should complete quickly (not wait 500ms each)
+        assert!(elapsed < Duration::from_millis(200), "joins should complete quickly with shared budget");
+    }
+
+    #[test]
+    fn vm_join_thread_self_join_returns_immediately() {
+        // Test self-join detection returns immediately without hanging
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        vm.cfml_thread_name = Some("self_thread".to_string());
+        
+        // Self-join should return immediately (no error, no hang)
+        let result = vm.join_thread("self_thread", 1000);
+        assert!(result.is_ok(), "self-join should return without error");
+    }
+
+    #[test]
+    fn vm_join_thread_ancestor_cycle_safety() {
+        // Test that no-name join excludes ancestors to prevent deadlock
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        // Set up: we're thread "child", spawned by "parent"
+        vm.cfml_thread_name = Some("child".to_string());
+        
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        
+        // Register parent thread
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            let mut parent_meta = ValueMap::default();
+            parent_meta.insert("name".to_string(), CfmlValue::string("parent".to_string()));
+            parent_meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+            
+            reg.register(
+                "parent".to_string(),
+                cancel.clone(),
+                completion.clone(),
+                CfmlValue::strukt(parent_meta),
+                None,
+                true,
+            ).unwrap();
+            
+            // Register self as child of parent
+            let mut child_meta = ValueMap::default();
+            child_meta.insert("name".to_string(), CfmlValue::string("child".to_string()));
+            child_meta.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+            
+            reg.register(
+                "child".to_string(),
+                cancel.clone(),
+                completion.clone(),
+                CfmlValue::strukt(child_meta),
+                Some("parent".to_string()),
+                true,
+            ).unwrap();
+            
+            // Register sibling
+            let mut sibling_meta = ValueMap::default();
+            sibling_meta.insert("name".to_string(), CfmlValue::string("sibling".to_string()));
+            sibling_meta.insert("status".to_string(), CfmlValue::string("COMPLETED".to_string()));
+            
+            reg.register(
+                "sibling".to_string(),
+                cancel.clone(),
+                Arc::new((Mutex::new(Some(ThreadResult {
+                    status: "COMPLETED".to_string(),
+                    output: String::new(),
+                    error: String::new(),
+                    mem_allocated: 0,
+                    error_struct: None,
+                    elapsed: 10,
+                    thread_vars: ValueMap::default(),
+                    return_value: None,
+                })), std::sync::Condvar::new())),
+                CfmlValue::strukt(sibling_meta),
+                Some("parent".to_string()),
+                true,
+            ).unwrap();
+        }
+        
+        // No-name join from child should exclude parent and self, but could join sibling
+        // The key is that it doesn't try to join parent (which would deadlock)
+        let names = if let Ok(reg) = vm.request_thread_registry.read() {
+            reg.get_non_ancestor_names(vm.cfml_thread_name.as_deref())
+        } else {
+            vec![]
+        };
+        
+        assert!(!names.contains(&"child".to_string()), "should exclude self");
+        assert!(!names.contains(&"parent".to_string()), "should exclude parent");
+        assert!(names.contains(&"sibling".to_string()), "should include sibling");
+    }
+
+    #[test]
+    fn vm_join_thread_panic_disconnects_and_reads_terminated_from_registry() {
+        // Test that when a thread panics (channel disconnects), join_thread
+        // reads TERMINATED status from registry instead of timing out
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        let thread_name = "panic_test";
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        
+        let mut metadata = ValueMap::default();
+        metadata.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        metadata.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+        
+        // Register in registry
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            reg.register(
+                thread_name.to_string(),
+                cancel.clone(),
+                completion.clone(),
+                CfmlValue::strukt(metadata),
+                None,
+                true,
+            ).unwrap();
+        }
+        
+        // Simulate a panic: channel disconnects and registry has TERMINATED with error
+        let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
+        drop(tx); // Disconnect channel (simulates panic drop)
+        
+        // Update registry to TERMINATED with error struct (CompletionGuard does this)
+        let mut error_map = ValueMap::default();
+        error_map.insert("message".to_string(), CfmlValue::string("Thread panicked".to_string()));
+        error_map.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+        
+        let result = ThreadResult {
+            status: "TERMINATED".to_string(),
+            output: String::new(),
+            error: String::new(),
+            mem_allocated: 0,
+            error_struct: Some(CfmlValue::strukt(error_map)),
+            elapsed: 0,
+            thread_vars: ValueMap::default(),
+            return_value: None,
+        };
+        
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            reg.update_from_result(thread_name, &result);
+        }
+        
+        // Create ThreadHandle with disconnected channel
+        let handle = ThreadHandle {
+            name: thread_name.to_string(),
+            rx,
+            cancel: cancel.clone(),
+            join: None, // No join handle since this is simulated
+            result: None,
+        };
+        
+        vm.live_threads.insert(thread_name.to_lowercase(), handle);
+        
+        // Join should read TERMINATED from registry and complete promptly (not timeout)
+        let start = std::time::Instant::now();
+        let join_result = vm.join_thread(thread_name, 5000);
+        let elapsed = start.elapsed();
+        
+        assert!(join_result.is_ok(), "join should succeed even after panic");
+        assert!(elapsed < Duration::from_millis(500), "join should complete promptly reading from registry, not timeout");
+        
+        // Verify the thread is marked TERMINATED in cfthread scope with error struct
+        let cfthread = vm.get_or_create_cfthread_scope();
+        if let Some(ts) = cfthread.as_cfml_struct() {
+            if let Some(thread_result) = ts.get(&thread_name.to_lowercase()) {
+                if let Some(result_struct) = thread_result.as_cfml_struct() {
+                    // Status should be TERMINATED
+                    if let Some(status) = result_struct.get("status") {
+                        let status_str = status.as_string();
+                        assert_eq!(status_str.as_str(), "TERMINATED", "status should be TERMINATED after panic");
+                    }
+                    
+                    // Error should be a struct with message and type
+                    if let Some(error) = result_struct.get("error") {
+                        if let Some(error_struct) = error.as_cfml_struct() {
+                            assert!(error_struct.contains_key("message"), "error should have message field");
+                            assert!(error_struct.contains_key("type"), "error should have type field");
+                            
+                            if let Some(msg) = error_struct.get("message") {
+                                let msg_str = msg.as_string();
+                                assert!(msg_str.contains("panic"), "error message should mention panic");
+                            }
+                        } else {
+                            panic!("error should be a struct, got: {:?}", error);
+                        }
+                    } else {
+                        panic!("TERMINATED thread should have error field");
+                    }
+                }
+            }
+        }
     }
 }

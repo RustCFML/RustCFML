@@ -48,7 +48,7 @@ pub(crate) const DEFERRED_TO_VM: &[&str] = &[
     "cachegetproperties", "__cfcache", "__cfloop_file_lines", "__cfloop_file_open",
     "__cfloop_file_next", "__cfloop_file_close", "__cfexecute",
     "__cfthread_run", "__cfthread_join", "__cfthread_terminate", "threadjoin",
-    "threadterminate", "runasync", "_schedule", "createdynamicproxy",
+    "threadterminate", "threaddata", "runasync", "_schedule", "createdynamicproxy",
     "callstackget", "callstackdump", "isinthread", "getpagecontext",
     "getbasetaglist", "getbasetagdata", "evaluate", "precisionevaluate",
 ];

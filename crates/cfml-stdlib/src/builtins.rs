@@ -1120,6 +1120,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // Script BIFs threadJoin()/threadTerminate() route to the same handlers.
     f.insert("threadjoin".to_string(), fn_cfthread_stub);
     f.insert("threadterminate".to_string(), fn_cfthread_stub);
+    // threadData() returns the request-wide cfthread registry view (Lucee parity)
+    f.insert("threaddata".to_string(), fn_cfthread_stub);
 
     // ---- async kernel: runAsync + _schedule (VM-intercepted) ----
     f.insert("runAsync".to_string(), fn_async_stub);

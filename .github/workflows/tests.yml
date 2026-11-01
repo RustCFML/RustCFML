@@ -51,12 +51,29 @@ jobs:
       - name: CLI
         run: ./target/release/rustcfml tests/runner.cfm
 
+      # Cap eviction test with RUSTCFML_TASKS_LIMIT=3 (must run explicitly)
+      - name: CLI - cap eviction
+        run: RUSTCFML_TASKS_LIMIT=3 ./target/release/rustcfml tests/tags/test_cfthread_cap_eviction.cfm
+
       # Serve mode is a separate gate from the CLI, and production is a separate
       # gate from dev: the bytecode, freshness and component-path caches all
       # behave differently there. Each invocation makes TWO consecutive requests
       # to the SAME process — see the script for why.
       - name: Serve (dev)
         run: ./scripts/serve-gate.sh ./target/release/rustcfml 8610
+
+      # Cap eviction test in serve mode with RUSTCFML_TASKS_LIMIT=3
+      - name: Serve (dev) - cap eviction
+        run: |
+          RUSTCFML_TASKS_LIMIT=3 ./target/release/rustcfml --serve . --port 8612 > /tmp/cap_serve.log 2>&1 &
+          PID=$!
+          trap "kill $PID 2>/dev/null; wait $PID 2>/dev/null" EXIT
+          for i in $(seq 1 30); do
+            [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8612/crab.svg)" = "200" ] && break
+            sleep 1
+          done
+          curl -f -m 30 http://127.0.0.1:8612/tests/tags/test_cfthread_cap_eviction.cfm
+          kill $PID 2>/dev/null; wait $PID 2>/dev/null
 
       - name: Serve (production)
         run: ./scripts/serve-gate.sh ./target/release/rustcfml 8611 --production

@@ -1528,6 +1528,73 @@ fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
 /// ~8 MB stack. This is virtual address space, not committed memory.
 const CFTHREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Drop guard that signals thread completion on ALL exit paths (normal, error, panic).
+/// Fixes B1: ensures cross-thread joins complete when the thread ends, not when spawner joins.
+/// Also updates the shared registry entry with final status/output/error/elapsed (item #4).
+struct CompletionGuard {
+    handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>,
+    result: Option<cfml_vm::ThreadResult>,
+    registry: Option<Arc<std::sync::RwLock<cfml_vm::RequestThreadRegistry>>>,
+    thread_name: Option<String>,
+}
+
+impl CompletionGuard {
+    fn new(
+        handle: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>,
+        registry: Option<Arc<std::sync::RwLock<cfml_vm::RequestThreadRegistry>>>,
+        thread_name: Option<String>,
+    ) -> Self {
+        Self { handle, result: None, registry, thread_name }
+    }
+
+    fn set_result(&mut self, result: cfml_vm::ThreadResult) {
+        self.result = Some(result);
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            let (lock, cvar) = &**handle;
+            // Recover from poisoning - we still want to signal
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            
+            // FIX #4: On panic (when result is None), store a TERMINATED result with an error
+            // instead of None, so waiters see a completed thread rather than hanging forever
+            if self.result.is_none() {
+                if std::thread::panicking() {
+                    // Create a proper error struct (Lucee ThreadsImpl L158 parity)
+                    let mut error_struct_map = cfml_common::dynamic::ValueMap::default();
+                    error_struct_map.insert("message".to_string(), cfml_common::dynamic::CfmlValue::string("Thread panicked".to_string()));
+                    error_struct_map.insert("type".to_string(), cfml_common::dynamic::CfmlValue::string("Application".to_string()));
+                    
+                    self.result = Some(cfml_vm::ThreadResult {
+                        status: "TERMINATED".to_string(),
+                        output: String::new(),
+                        error: "Thread panicked".to_string(),
+                        error_struct: Some(cfml_common::dynamic::CfmlValue::strukt(error_struct_map)),
+                        mem_allocated: 0,
+                        elapsed: 0,
+                        thread_vars: cfml_common::dynamic::ValueMap::default(),
+                        return_value: None,
+                    });
+                }
+            }
+            
+            *guard = self.result.clone();
+            cvar.notify_all();
+        }
+        
+        // Item #4: Update the shared registry entry with final status/output/error/elapsed
+        // so threadData() returns live data even for threads the spawner never joins.
+        if let (Some(registry), Some(name), Some(result)) = (&self.registry, &self.thread_name, &self.result) {
+            if let Ok(mut reg) = registry.write() {
+                reg.update_from_result(name, result);
+            }
+        }
+    }
+}
+
 /// Spawn a `cfthread` body on a real OS thread. Builds a fresh child VM from
 /// the seed (same runtime wiring as a request VM, via `register_vm_runtime`),
 /// runs the body, and reports the `ThreadResult` back over a channel. The
@@ -1536,9 +1603,16 @@ const CFTHREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = seed.cancel_flag.clone();
+    let completion_handle = seed.completion_handle.clone();
+    let registry = seed.request_thread_registry.clone();
+    let thread_name = seed.cfml_thread_name.clone();
     let join = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
+            // B1 fix: Drop guard ensures completion is signaled on ALL exit paths
+            // Item #4: Also updates shared registry entry with final status/output/error/elapsed
+            let mut guard = CompletionGuard::new(completion_handle, Some(registry), thread_name);
+            
             cfml_common::stack_guard::init(CFTHREAD_STACK_SIZE);
             // The allocation log is THREAD-LOCAL, armed per thread by `enable()`,
             // and until now only the request path ever called it. So every
@@ -1576,6 +1650,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             let _db_conn_guard = cfml_stdlib::builtins::RequestDbConnGuard::new();
             let (closure, attributes) = vm.apply_thread_seed(seed);
             let result = vm.run_thread_body(&closure, attributes, &ValueMap::default());
+            guard.set_result(result.clone()); // Store for drop guard
             if armed {
                 // Same contract as the request path: a nested cfthread still
                 // running can race the refcounts, so defer this log to it rather
@@ -1601,6 +1676,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             cfml_common::cycle_gc::body_finished();
             // Receiver may be gone if the parent never joined; ignore.
             let _ = tx.send(result);
+            // guard drops here, signaling completion
         })
         .expect("cfthread: failed to spawn OS thread");
     ThreadHandle {
@@ -1908,6 +1984,20 @@ fn compile_and_run(
     // and drop the connection rather than handing it back to the pool
     // mid-transaction, where the next request picks it up dirty (GH #308).
     vm.rollback_open_transaction();
+
+    // Clear the request thread registry at request end (item #5). Child VMs
+    // spawned by executors or long-lived threads share the root's registry Arc,
+    // so this only clears when the ROOT request finishes (not child threads).
+    // Serves both CLI (one-shot) and serve mode (per-request cleanup).
+    if let Ok(mut reg) = vm.request_thread_registry.write() {
+        reg.clear();
+    }
+    // Also clear the cfthread scope so it doesn't leak into the next request.
+    // DO NOT clear vm.live_threads here: the cycle collector (below) needs to
+    // read it to check for still-running threads. The VM is dropped after this
+    // function anyway, so clearing is unnecessary (serve mode gets a FRESH VM
+    // for each request, not a reused one).
+    vm.globals.insert("cfthread".to_string(), CfmlValue::strukt(ValueMap::default()));
 
     // Take the response out of the VM via `mem::take` (leaving every field a
     // valid default) so the VM can then be DROPPED — releasing all of this
