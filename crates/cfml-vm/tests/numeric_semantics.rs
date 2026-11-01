@@ -639,7 +639,7 @@ fn boxed_concat_loop_in_main_matches_closed_form() {
         writeOutput(len(out));
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_program(src);
+    let (out, _fn_compiled, _osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR Boxed-concat loop must match interpreter");
 }
 
@@ -1167,7 +1167,7 @@ fn member_read_in_main_loop_matches_closed_form() {
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_program(src);
+    let (out, _fn_compiled, _osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR member-read loop must match interpreter");
 }
 
@@ -1183,7 +1183,7 @@ fn member_read_with_sub_and_mul_matches_closed_form() {
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_program(src);
+    let (out, _fn_compiled, _osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR Sub/Mul Boxed member kernel must match interpreter");
 }
 
@@ -1199,7 +1199,7 @@ fn member_read_case_insensitive_matches_closed_form() {
         writeOutput(out);
     "#;
     let oracle = run_interpreter(src);
-    let (out, _fn_compiled, osr_compiled) = run_program(src);
+    let (out, _fn_compiled, _osr_compiled) = run_program(src);
     assert_eq!(out, oracle, "OSR member-read CI must match interpreter");
 }
 

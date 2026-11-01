@@ -1138,15 +1138,10 @@ pub enum BytecodeOp {
     /// iterated). Replaces the hoisted `len()` call (§107).
     IterLen,
     /// For-in entry, in place of `GetKeys`. A query stays a query — its rows
-    /// are read live by `ForInElement` — and its current row is pushed on the
+    /// are read live by `ForInStep` — and its current row is pushed on the
     /// VM's cursor stack for `ForInExit`. Anything else becomes what `GetKeys`
     /// gives.
     ForInPrepare,
-    /// For-in element fetch, in place of `GetIndex`: pops `[iterable, idx]`.
-    /// Over a query it moves the query's current row to `idx` and pushes a copy
-    /// of that row (Lucee: `q.col` / `q.currentRow` follow a `for (row in q)`
-    /// loop); for anything else it is exactly `GetIndex`.
-    ForInElement,
     /// For-in normal exit (the end, or a `break`): pops the iterable. Over a
     /// query, pops the loop's saved row off the VM's cursor stack and puts it
     /// back. A `return`/throw out of the body is unwound by the frame exit /
@@ -1543,7 +1538,7 @@ pub enum BytecodeOp {
     // One step of a for-in loop: stack [iterable, idx] -> [element] when
     // idx <= the iterable's LIVE length (as `IterLen` measures it), else pops
     // both and jumps to the target. Replaces `IterLen; Lte; JumpIfFalse;
-    // LoadLocal iter; LoadLocal idx; ForInElement` — six dispatches and a
+    // LoadLocal iter; LoadLocal idx; <element fetch>` — six dispatches and a
     // second clone of the iterator handle per item (for-in ran 2.5x Lucee).
     ForInStep(u32),
 
@@ -1754,19 +1749,18 @@ impl BytecodeOp {
             Self::IterLen => 127,
             Self::ArgConcatWriteThrough(..) => 128,
             Self::ForInPrepare => 129,
-            Self::ForInElement => 130,
-            Self::ForInExit => 131,
-            Self::TakeLocal(..) => 132,
-            Self::TakeSlot(..) => 133,
-            Self::WriteText(..) => 134,
-            Self::ForInStep(..) => 135,
-            Self::ApplyParamDefault(..) => 136,
-            Self::TakeProperty(..) => 137,
+            Self::ForInExit => 130,
+            Self::TakeLocal(..) => 131,
+            Self::TakeSlot(..) => 132,
+            Self::WriteText(..) => 133,
+            Self::ForInStep(..) => 134,
+            Self::ApplyParamDefault(..) => 135,
+            Self::TakeProperty(..) => 136,
         }
     }
 
     /// Variant names, indexed by [`Self::census_index`].
-    pub const CENSUS_NAMES: [&'static str; 138] = [
+    pub const CENSUS_NAMES: [&'static str; 137] = [
         "Null",
         "True",
         "False",
@@ -1897,7 +1891,6 @@ impl BytecodeOp {
         "IterLen",
         "ArgConcatWriteThrough",
         "ForInPrepare",
-        "ForInElement",
         "ForInExit",
         "TakeLocal",
         "TakeSlot",

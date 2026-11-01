@@ -864,7 +864,6 @@ mod tests {
     // that touches the global tracer, so there is no cross-test race).
     #[test]
     fn observer_builds_span_tree() {
-        use opentelemetry::trace::TraceContextExt;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
 
         let exporter = InMemorySpanExporter::default();

@@ -21,7 +21,9 @@ use std::sync::Arc;
 use regex::Regex;
 use once_cell::sync::Lazy;
 use serde_json;
-use chrono::{NaiveDateTime, NaiveTime, Datelike, Timelike};
+use chrono::{NaiveDateTime, Datelike, Timelike};
+#[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
+use chrono::NaiveTime;
 #[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
 use chrono::NaiveDate;
 #[cfg(feature = "postgres_db")]
@@ -2696,6 +2698,7 @@ fn url_encode_impl(s: &str, encoding: UrlEncoding) -> String {
 /// extra fields or decoded to something else on the receiving end.
 /// A request body's bytes: a binary value is sent as-is (Lucee parity, e.g. a
 /// presigned S3/R2 PUT of `fileReadBinary(path)`), anything else as its string.
+#[cfg(feature = "http")]
 fn cfhttp_body_bytes(v: &CfmlValue) -> Vec<u8> {
     match v {
         CfmlValue::Binary(b) => b.to_vec(),
@@ -2703,6 +2706,7 @@ fn cfhttp_body_bytes(v: &CfmlValue) -> Vec<u8> {
     }
 }
 
+#[cfg(feature = "http")]
 fn cfhttp_encoded_pair(param: &cfml_common::dynamic::CfmlStruct, name: &str, value: &str) -> String {
     let encode = param
         .data_get("encoded")
@@ -13969,6 +13973,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
 /// Cap a query result to `max_rows` (Lucee `maxrows`), applied after execution
 /// so it is driver-independent. Handles the query and array return shapes; the
 /// struct (keyColumn) shape is left as-is (row order there is not meaningful).
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn apply_query_maxrows(result: CfmlValue, max_rows: Option<usize>) -> CfmlValue {
     let Some(n) = max_rows else { return result; };
     match result {
@@ -20361,6 +20366,19 @@ fn fn_smtp_connection_test(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// A build without the `smtp` feature cannot send mail; say so rather than
+/// pretending the message went.
+#[cfg(not(feature = "smtp"))]
+fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
+    match args.first() {
+        Some(CfmlValue::Struct(_)) => Err(CfmlError::runtime(
+            "cfmail requires the 'smtp' feature to be enabled in this build".to_string(),
+        )),
+        _ => Err(CfmlError::runtime("__cfmail requires a struct argument".into())),
+    }
+}
+
+#[cfg(feature = "smtp")]
 fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     let opts = match args.into_iter().next() {
         Some(CfmlValue::Struct(s)) => s,
@@ -20376,41 +20394,32 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     let subject = get_opt("subject").unwrap_or_default();
     let mail_type = get_opt("type").unwrap_or_else(|| "text".into());
     let body_text = get_opt("body").unwrap_or_default();
-    #[cfg(feature = "smtp")]
     let cc = get_opt("cc");
-    #[cfg(feature = "smtp")]
     let bcc = get_opt("bcc");
     // `replyTo` / `failTo` were parsed by nothing at all — a message that asked
     // for them simply went out without them. Preside's SMTP service provider
     // sets both (GH #356).
-    #[cfg(feature = "smtp")]
     let reply_to = get_opt("replyto");
-    #[cfg(feature = "smtp")]
     let fail_to = get_opt("failto");
-    #[cfg(feature = "smtp")]
     let cfg_default = default_mail_server();
-    #[cfg(feature = "smtp")]
     let server = get_opt("server").or_else(|| {
         cfg_default
             .as_ref()
             .map(|d| d.server.clone())
             .filter(|s| !s.is_empty())
     });
-    #[cfg(feature = "smtp")]
     let port_str = get_opt("port").or_else(|| {
         cfg_default
             .as_ref()
             .filter(|d| d.port != 0)
             .map(|d| d.port.to_string())
     });
-    #[cfg(feature = "smtp")]
     let username = get_opt("username").or_else(|| {
         cfg_default
             .as_ref()
             .map(|d| d.username.clone())
             .filter(|s| !s.is_empty())
     });
-    #[cfg(feature = "smtp")]
     let password = get_opt("password").or_else(|| {
         cfg_default
             .as_ref()
@@ -20421,13 +20430,10 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     // Both were parsed and then dropped on the floor: the transport was always
     // built with `builder_dangerous`, so a server configured with `"tls": true`
     // still sent AUTH credentials over an unencrypted connection.
-    #[cfg(feature = "smtp")]
     let as_bool = |s: &str| s.eq_ignore_ascii_case("true") || s == "1" || s.eq_ignore_ascii_case("yes");
-    #[cfg(feature = "smtp")]
     let use_ssl = get_opt("usessl")
         .map(|v| as_bool(&v))
         .unwrap_or_else(|| cfg_default.as_ref().map(|d| d.ssl).unwrap_or(false));
-    #[cfg(feature = "smtp")]
     let use_tls = get_opt("usetls")
         .map(|v| as_bool(&v))
         .unwrap_or_else(|| cfg_default.as_ref().map(|d| d.tls).unwrap_or(false));
@@ -20441,7 +20447,6 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     // Lucee/ACF require a server to be configured. Fail loudly rather than
     // silently dropping mail — silent success would mislead developers into
     // thinking mail was sent.
-    #[cfg(feature = "smtp")]
     {
         if server.is_none() {
             return Err(CfmlError::runtime(
@@ -20449,18 +20454,10 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
             ));
         }
     }
-    #[cfg(not(feature = "smtp"))]
-    {
-        return Err(CfmlError::runtime(
-            "cfmail requires the 'smtp' feature to be enabled in this build".to_string()
-        ));
-    }
-
     // Collect multipart bodies declared via cfmailpart (text + html
     // alternatives). Each part carries a `type` ("text"/"html") and a captured
     // `body`; a part may also wrap its attributes in an `attributeCollection`
     // struct (the form Wheels' Global.cfc $mail() emits), so look there too.
-    #[cfg(feature = "smtp")]
     let mail_parts: Vec<(String, String)> = if let Some(CfmlValue::Array(parts)) = opts.data_get("parts")
     {
         parts.iter().filter_map(|p| {
@@ -20511,7 +20508,6 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     }
 
     // If server is provided, attempt real SMTP delivery
-    #[cfg(feature = "smtp")]
     if let Some(ref smtp_server) = server {
         use lettre::{SmtpTransport, Transport};
         use lettre::transport::smtp::authentication::Credentials;

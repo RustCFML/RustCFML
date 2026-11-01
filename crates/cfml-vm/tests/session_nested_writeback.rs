@@ -33,7 +33,6 @@ use cfml_common::vfs::{EmbeddedFs, Vfs};
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
 use cfml_vm::{CfmlVirtualMachine, MemoryStore, ServerState, SessionData, SessionStore};
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

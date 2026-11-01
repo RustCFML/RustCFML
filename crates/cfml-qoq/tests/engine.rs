@@ -3,7 +3,6 @@
 
 use cfml_common::dynamic::{CfmlQuery, CfmlValue, ValueMap};
 use cfml_qoq::{execute, parse, QoQFunctionRegistry, QoQParams};
-use indexmap::IndexMap;
 
 fn i(n: i64) -> CfmlValue {
     CfmlValue::Int(n)

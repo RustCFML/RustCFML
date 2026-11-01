@@ -393,6 +393,7 @@ fn ec_verify(spki: &[u8], hashed: &[u8], sig_der: &[u8]) -> Result<bool, CfmlErr
 }
 
 /// Minimal DER tag-length-value.
+#[cfg(not(target_arch = "wasm32"))]
 fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let len = content.len();
@@ -424,6 +425,7 @@ fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 ///     algorithm         SEQUENCE { id-ecPublicKey OID, namedCurve OID },
 ///     privateKey        OCTET STRING wrapping
 ///        ECPrivateKey ::= SEQUENCE { version INTEGER (1), privateKey OCTET STRING } }
+#[cfg(not(target_arch = "wasm32"))]
 fn jdk_ec_pkcs8(curve: EcCurve, scalar: &[u8]) -> Vec<u8> {
     // OID 1.2.840.10045.2.1 — id-ecPublicKey.
     const EC_PUBLIC_KEY_OID: &[u8] = &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];

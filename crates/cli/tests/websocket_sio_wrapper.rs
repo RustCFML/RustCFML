@@ -107,7 +107,7 @@ enum Packet {
     Connect,
     Disconnect,
     Event(String, Value),
-    Ack(u64, Value),
+    Ack,
     Other,
 }
 
@@ -146,13 +146,9 @@ fn parse_sio(sio: &str) -> Packet {
             rest = &rest[comma + 1..];
         }
     }
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let ack_id: Option<u64> = if digits.is_empty() {
-        None
-    } else {
-        rest = &rest[digits.len()..];
-        digits.parse().ok()
-    };
+    // Skip an ack id; no test inspects it.
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    rest = &rest[digits..];
     match ty {
         '0' => Packet::Connect,
         '1' => Packet::Disconnect,
@@ -162,32 +158,9 @@ fn parse_sio(sio: &str) -> Packet {
             let data = arr.get(1).cloned().unwrap_or(Value::Null);
             Packet::Event(ev, data)
         }
-        '3' => {
-            let arr: Value = serde_json::from_str(rest).unwrap_or(Value::Null);
-            let data = arr.get(0).cloned().unwrap_or(Value::Null);
-            Packet::Ack(ack_id.unwrap_or(0), data)
-        }
+        '3' => Packet::Ack,
         _ => Packet::Other,
     }
-}
-
-async fn sio_connect(port: u16, ns: &str, query: &str) -> Ws {
-    let q = if query.is_empty() { String::new() } else { format!("&{query}") };
-    let url = format!("ws://127.0.0.1:{port}/socket.io/?EIO=4&transport=websocket{q}");
-    let (mut ws, _) = connect_async(&url).await.expect("ws connect");
-    match ws.next().await {
-        Some(Ok(Message::Text(t))) => assert!(t.starts_with('0'), "expected EIO open, got {t}"),
-        other => panic!("expected EIO open frame, got {other:?}"),
-    }
-    ws.send(Message::Text(format!("40{ns},").into())).await.expect("send connect");
-    loop {
-        match next_packet(&mut ws).await {
-            Packet::Connect => break,
-            Packet::Disconnect => panic!("namespace connect rejected"),
-            _ => continue,
-        }
-    }
-    ws
 }
 
 async fn sio_emit(ws: &mut Ws, ns: &str, event: &str, data: Value, ack_id: Option<u64>) {

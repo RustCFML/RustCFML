@@ -1320,7 +1320,7 @@ mod tests {
         let (a, a_dyn) = sink();
         let (b, b_dyn) = sink();
         let id_a = reg.register("/chat", a_dyn, None, ValueMap::default());
-        let id_b = reg.register("/chat", b_dyn, None, ValueMap::default());
+        let _id_b = reg.register("/chat", b_dyn, None, ValueMap::default());
 
         // A tracks → A gets a presence_state, B gets a join diff.
         let mut meta_a = ValueMap::default();

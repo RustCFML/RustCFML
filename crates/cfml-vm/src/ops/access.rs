@@ -278,7 +278,7 @@ pub(crate) fn op_get_index(
     vm: &mut CfmlVirtualMachine,
     stack: &mut Vec<CfmlValue>,
     ip: &mut usize,
-    locals: &ValueMap,
+    #[cfg_attr(not(feature = "component-instance"), allow(unused_variables))] locals: &ValueMap,
     throw_on_miss: bool,
 ) -> Result<(), CfmlError> {
     let index = stack.pop().unwrap_or(CfmlValue::Null);
@@ -797,7 +797,7 @@ pub(crate) fn op_for_in_prepare(vm: &mut CfmlVirtualMachine, stack: &mut Vec<Cfm
     }
 }
 
-/// `ForInElement` — pops `[iterable, idx]`. Over a query: move its current row
+/// The element fetch of `ForInStep`: pops `[iterable, idx]`. Over a query: move its current row
 /// to `idx` and push a copy of that row. Otherwise `GetIndex`.
 pub(crate) fn op_for_in_element(
     vm: &mut CfmlVirtualMachine,
@@ -825,7 +825,7 @@ pub(crate) fn op_for_in_element(
 /// query's identity keeps the stack in step either way.
 /// `ForInStep(end)`: [iterable, idx] -> [element], or exit the loop. Returns
 /// true when it jumped (the caller `continue`s without advancing `ip`).
-/// Exactly `IterLen; Lte; JumpIfFalse(end); <iter>; <idx>; ForInElement`: the
+/// Exactly `IterLen; Lte; JumpIfFalse(end); <iter>; <idx>; <element fetch>`: the
 /// length is read live each step (a body that deletes ends the loop early, as
 /// on Lucee), and the element comes from `op_for_in_element` except for an
 /// array, read directly.

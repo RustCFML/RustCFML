@@ -28,7 +28,6 @@ cfml-vm = { path = "../cfml-vm", default-features = false }
 # via JS bindings (fetch, D1). getrandom's `js` backend (Web Crypto) works in the
 # Workers runtime, satisfying `security`→rand.
 cfml-stdlib = { path = "../cfml-stdlib", default-features = false, features = ["xml", "html", "yaml", "jsonschema", "zip_support", "security", "image_support", "markdown"] }
-cfml-config = { path = "../cfml-config" }
 indexmap = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

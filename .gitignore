@@ -96,3 +96,7 @@ sqlite::memory:
 # same commit and blanket-allowed these too). Keeping them under one ignored
 # directory means a future blanket add cannot repeat it.
 /planning/
+
+# Local links to a Taffy checkout (machine-specific; were committed as dangling symlinks)
+examples/taffytest/taffy
+examples/taffytest/api/taffy

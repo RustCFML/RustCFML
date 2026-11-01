@@ -7,7 +7,6 @@
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_vm::ServerState;
-use indexmap::IndexMap;
 
 fn vars(tag: &str) -> ValueMap {
     let mut m = ValueMap::default();

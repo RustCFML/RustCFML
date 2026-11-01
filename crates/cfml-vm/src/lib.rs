@@ -2387,6 +2387,7 @@ enum VarPathSeg {
     Index(i64),
 }
 
+#[cfg(feature = "component-instance")]
 #[derive(Clone, Copy)]
 enum DispatchCaller<'a> {
     /// The calling frame's locals. A frame carrying a `this` is executing inside
@@ -4485,16 +4486,6 @@ impl RequestThreadRegistry {
             .filter(|k| !ancestors.contains(*k))
             .cloned()
             .collect()
-    }
-
-    /// Get metadata for all threads (for threadData() BIF).
-    /// Returns the request-wide view of all cfthread entries.
-    pub fn get_all_metadata(&self) -> ValueMap {
-        let mut result = ValueMap::default();
-        for (key, entry) in &self.entries {
-            result.insert(key.clone(), entry.metadata.clone());
-        }
-        result
     }
 
     /// Get metadata for root request's direct children only (Lucee ThreadData.java L19-24).
@@ -7570,14 +7561,6 @@ impl CfmlVirtualMachine {
         self.cfthread_order.push_back(key);
     }
 
-    /// Get the metadata struct for a thread from the cfthread scope.
-    pub fn get_cfthread_metadata(&self, thread_name: &str) -> Option<CfmlValue> {
-        self.globals
-            .get("cfthread")
-            .and_then(|cf| cf.as_cfml_struct())
-            .and_then(|ts| ts.get(&thread_name.to_lowercase()).map(|v| v.clone()))
-    }
-
     /// Store a completed `ThreadResult` into the `cfthread` scope: the running
     /// entry's keys (see `store_cfthread_running`) with the outcome filled in,
     /// plus the body's `thread.*` values. `error` is there only when the body
@@ -10251,6 +10234,7 @@ impl CfmlVirtualMachine {
     /// A plain class method dispatched with its ready-made scope map: the
     /// getter's value, already checked against the declared return type.
     #[inline(never)]
+    #[cfg(feature = "component-instance")]
     fn member_getter_value(&mut self, func_ref: &CfmlValue, method_locals: &ValueMap) -> Option<CfmlValue> {
         let CfmlValue::Function(f) = func_ref else { return None };
         let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body else { return None };
@@ -17307,7 +17291,6 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::IterLen => { ops::access::op_iter_len(&mut stack); }
                 BytecodeOp::ForInPrepare => { ops::access::op_for_in_prepare(self, &mut stack); }
-                BytecodeOp::ForInElement => { ops::access::op_for_in_element(self, &mut stack, &mut ip, &locals)?; }
                 BytecodeOp::ForInExit => { ops::access::op_for_in_exit(self, &mut stack); }
                 BytecodeOp::ForInStep(end) => {
                     if ops::access::op_for_in_step(self, &mut stack, &mut ip, &locals, *end)? {
@@ -29981,9 +29964,9 @@ impl CfmlVirtualMachine {
         every_ms: Option<i64>,
         spaced_ms: Option<i64>,
         parent_locals: &ValueMap,
-        hostname: Option<String>,
-        thread_name: Option<String>,
-        pool: Option<CfmlValue>,
+        #[cfg_attr(not(feature = "real-threads"), allow(unused_variables))] hostname: Option<String>,
+        #[cfg_attr(not(feature = "real-threads"), allow(unused_variables))] thread_name: Option<String>,
+        #[cfg_attr(not(feature = "real-threads"), allow(unused_variables))] pool: Option<CfmlValue>,
         own_request_scope: bool,
     ) -> CfmlResult {
         // DIAGNOSTIC kill-switch: RUSTCFML_NO_PERIODIC=1 makes every periodic
@@ -38618,14 +38601,18 @@ impl CfmlVirtualMachine {
     /// excludes them) and reported under the compiled file's own row.
     fn compile_file_metered(&mut self, path: &str) -> Result<BytecodeProgram, CfmlError> {
         #[cfg(feature = "observability")]
-        let metering = self.observer.is_some();
-        #[cfg(not(feature = "observability"))]
-        let metering = false;
-        if !metering {
-            let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-            let disk_cache = self.server_state.as_ref().and_then(|s| s.disk_cache_dir.as_deref());
-            return compile_file_cached_with_disk_cache(path, cache, self.vfs.as_ref(), disk_cache);
+        if self.observer.is_some() {
+            return self.compile_file_metered_observed(path);
         }
+        let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
+        let disk_cache = self.server_state.as_ref().and_then(|s| s.disk_cache_dir.as_deref());
+        compile_file_cached_with_disk_cache(path, cache, self.vfs.as_ref(), disk_cache)
+    }
+
+    /// [`Self::compile_file_metered`] with an observer attached: a compile
+    /// (not a cache hit) is timed and its allocation charged as a child row.
+    #[cfg(feature = "observability")]
+    fn compile_file_metered_observed(&mut self, path: &str) -> Result<BytecodeProgram, CfmlError> {
         let t0 = std::time::Instant::now();
         let a0 = if self.mem_meter.is_some() {
             cfml_common::mem_account::thread_totals().allocated
@@ -38638,7 +38625,6 @@ impl CfmlVirtualMachine {
             compile_file_cached_flagged(path, cache, self.vfs.as_ref(), disk_cache)
         };
         let (program, compiled) = result?;
-        #[cfg(feature = "observability")]
         if compiled {
             let us = t0.elapsed().as_micros() as i64;
             let bytes = if self.mem_meter.is_some() {
@@ -40165,6 +40151,7 @@ impl CfmlVirtualMachine {
             }
             self.source_file = old_source_file;
             // Capture component body variables
+            #[cfg_attr(not(feature = "scope-pool"), allow(unused_mut))]
             let mut component_variables = self.captured_locals.take().unwrap_or_default();
             // The CFC's functions were registered into `fn_registry` by global_id
             // when its sub-program was swapped in, and its methods were inserted
@@ -47898,7 +47885,6 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
         BytecodeOp::IterLen => (1, 1),
         BytecodeOp::ForInPrepare => (1, 1),     // iterable → iterable'
-        BytecodeOp::ForInElement => (1, 2),     // iterable + idx → element
         BytecodeOp::ForInExit => (0, 1),        // iterable → (nothing)
         BytecodeOp::ForInStep(_) => (1, 2),     // iterable + idx → element (or exit)
         BytecodeOp::ArgConcatWriteThrough(_) => (0, 1),

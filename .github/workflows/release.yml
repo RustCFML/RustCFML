@@ -67,6 +67,10 @@ jobs:
           - os: windows-latest
             name: windows-x86_64
             ext: ".exe"
+            # Vendored OpenSSL's static objects reference a PDB that is never
+            # shipped: ~900 LNK4099 "linking object as if no debug info" lines
+            # per build, all noise.
+            extra_rustflags: "-Clink-arg=/ignore:4099"
 
     runs-on: ${{ matrix.os }}
 
@@ -116,7 +120,7 @@ jobs:
       # Windows path that contains backslashes.
       - name: Build (PGO)
         env:
-          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata
+          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata ${{ matrix.extra_rustflags }}
         run: cargo build --profile release-pgo -p rustcfml-cli
 
       - name: Upload artifact

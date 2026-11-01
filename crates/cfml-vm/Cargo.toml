@@ -136,3 +136,7 @@ frame-census = []
 # Existence-probe outcome census — see cfml-common's `exists-census`. Probe
 # builds only.
 exists-census = ["cfml-common/exists-census"]
+
+# cargo-machete matches on crate names; `md-5` is imported as `md5`.
+[package.metadata.cargo-machete]
+ignored = ["md-5"]

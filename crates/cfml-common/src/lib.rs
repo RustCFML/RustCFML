@@ -16,7 +16,6 @@ pub mod container_size;
 pub mod dynamic;
 pub mod encodings;
 pub mod equality;
-pub mod introspection;
 pub mod key;
 pub mod locale;
 pub mod mem_account;

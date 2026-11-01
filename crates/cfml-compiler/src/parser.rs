@@ -7483,8 +7483,7 @@ impl Parser {
             // nor `function`/`new` (they introduce a value of their own).
             Token::Break | Token::Continue | Token::Else | Token::ElseIf | Token::For
             | Token::If | Token::In | Token::Interface | Token::Return | Token::Var
-            | Token::While | Token::Extends | Token::Implements | Token::Package
-            | Token::Remote | Token::Public
+            | Token::While
             | Token::ImpKeyword | Token::Contains | Token::EqKeyword | Token::NeqKeyword
             | Token::GtKeyword | Token::GteKeyword | Token::LtKeyword | Token::LteKeyword
             | Token::ModKeyword | Token::IsKeyword | Token::XorKeyword | Token::EqvKeyword
@@ -7501,11 +7500,6 @@ impl Parser {
                     Token::Return => "return",
                     Token::Var => "var",
                     Token::While => "while",
-                    Token::Extends => "extends",
-                    Token::Implements => "implements",
-                    Token::Package => "package",
-                    Token::Remote => "remote",
-                    Token::Public => "public",
                     Token::ImpKeyword => "imp",
                     Token::Contains => "contains",
                     Token::EqKeyword => "eq",

@@ -404,7 +404,6 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use cfml_common::dynamic::CfmlValue;
-    use indexmap::IndexMap;
 
     fn arr(vals: Vec<CfmlValue>) -> CfmlValue {
         CfmlValue::array(vals)

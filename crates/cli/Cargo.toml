@@ -189,3 +189,8 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "testing"] }
 libc = "0.2"
 # Native sampling profiler (obs-pprof feature). Unix-only: pprof-rs uses SIGPROF.
 pprof = { version = "0.15", optional = true, features = ["flamegraph", "protobuf-codec"] }
+
+# Not imported: `openssl` turns on vendored OpenSSL for memcache's TLS, and
+# `socketioxide-parser-common` is a version pin (see above).
+[package.metadata.cargo-machete]
+ignored = ["openssl", "socketioxide-parser-common"]

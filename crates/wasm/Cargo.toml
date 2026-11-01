@@ -46,3 +46,7 @@ getrandom = { version = "0.2", features = ["js"] }
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
 
+
+# Present only to switch on getrandom's `js` backend (see above).
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]

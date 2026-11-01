@@ -287,7 +287,6 @@ static LOADED_EXTENSIONS: OnceLock<Vec<extensions::Extension>> = OnceLock::new()
 struct ExtensionDatasource {
     driver: cfml_vm::foreign::ForeignDbDriver,
     data: *mut std::ffi::c_void,
-    name: String,
 }
 
 // The pointer is module-owned, immutable for the process, and the driver
@@ -302,11 +301,10 @@ unsafe impl Sync for ExtensionDatasource {}
 impl ExtensionDatasource {
     fn build(
         driver: cfml_vm::foreign::ForeignDbDriver,
-        name: &str,
         args: Vec<cfml_common::dynamic::CfmlValue>,
     ) -> Result<Self, cfml_common::vm::CfmlError> {
         let data = driver.construct(args)?;
-        Ok(Self { driver, data, name: name.to_string() })
+        Ok(Self { driver, data })
     }
 }
 
@@ -342,7 +340,6 @@ impl cfml_stdlib::DynamicDbDriver for ExtensionDatasource {
         Ok(Box::new(ExtensionTransaction {
             driver: self.driver,
             txn,
-            name: self.name.clone(),
         }))
     }
 }
@@ -352,7 +349,6 @@ impl cfml_stdlib::DynamicDbDriver for ExtensionDatasource {
 struct ExtensionTransaction {
     driver: cfml_vm::foreign::ForeignDbDriver,
     txn: *mut std::ffi::c_void,
-    name: String,
 }
 
 // Held by one request at a time and never shared across threads; `Send` is
@@ -506,7 +502,7 @@ fn bind_extension_datasource(
     let Some((_, driver)) = drivers.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)) else {
         return false;
     };
-    match ExtensionDatasource::build(*driver, name, vec![cfg]) {
+    match ExtensionDatasource::build(*driver, vec![cfg]) {
         Ok(d) => {
             cfml_stdlib::register_dynamic_datasource(name, std::sync::Arc::new(d));
             true
@@ -572,7 +568,6 @@ pub fn load_extensions(
             // with a configured instance when the config is read.
             match ExtensionDatasource::build(
                 *driver,
-                kind,
                 vec![cfml_common::dynamic::CfmlValue::strukt(Default::default())],
             ) {
                 Ok(d) => cfml_stdlib::register_dynamic_datasource(kind, std::sync::Arc::new(d)),
@@ -641,13 +636,6 @@ fn server_extensions_cfg(args: &Args) -> cfml_config::schema::ExtensionsCfg {
         }
     };
     cfg.map(|c| c.extensions.cfg()).unwrap_or_default()
-}
-
-/// The loaded extensions, for `rustcfml ext list` and `getFunctionList`
-/// attribution.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn loaded_extensions() -> &'static [extensions::Extension] {
-    LOADED_EXTENSIONS.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
 /// Convenience wrapper: install the registrar and then enter the standard

@@ -2991,7 +2991,9 @@ fn collect_from_log_carrying(
             }
         }
     }
-    drop(nodes);
+    // `nodes` is this thread's reused scratch map, so release the probe
+    // handles now rather than when the guard hands it back.
+    nodes.clear();
 
     if collected > 0 {
         COLLECTED_TOTAL.fetch_add(collected, Ordering::Relaxed);

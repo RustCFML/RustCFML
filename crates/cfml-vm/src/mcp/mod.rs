@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn entities_are_listed_in_a_stable_order() {
-        let mut view = view_with(
+        let view = view_with(
             "zeta",
             CfmlAccess::Public,
             vec![("tool", CfmlValue::string("zeta"))],

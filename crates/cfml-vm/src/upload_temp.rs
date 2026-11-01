@@ -56,6 +56,7 @@ pub fn take_background_body_spawned() -> bool {
     BACKGROUND_BODY_SPAWNED.with(|c| c.replace(false))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn register(path: &Path) {
     let mut g = OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner());
     g.get_or_insert_with(HashSet::new).insert(path.to_path_buf());
@@ -66,12 +67,6 @@ fn unregister(path: &Path) {
     if let Some(set) = g.as_mut() {
         set.remove(path);
     }
-}
-
-/// Number of upload temp files this process created and has not deleted.
-pub fn outstanding_upload_temp_files() -> usize {
-    let g = OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().map_or(0, |s| s.len())
 }
 
 fn delete(path: &Path) {

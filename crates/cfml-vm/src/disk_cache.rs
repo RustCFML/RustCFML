@@ -44,7 +44,9 @@ use std::sync::Arc;
 /// - 2: Switched to bincode 2.0.1 (v0.742.2)
 /// - 3: `BytecodeOp::TakeProperty` added after `TakeSlot`, shifting the
 ///   variant indices of every later op (serde encodes enums by index)
-pub const BYTECODE_FORMAT_VERSION: u32 = 3;
+/// - 4: `BytecodeOp::ForInElement` removed (never emitted since `ForInStep`),
+///   shifting every later op's index down by one
+pub const BYTECODE_FORMAT_VERSION: u32 = 4;
 
 /// Compute cache key for a source file, optionally including the source path.
 /// The path component ensures that the same file compiled via different paths

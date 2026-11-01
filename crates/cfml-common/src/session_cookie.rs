@@ -152,7 +152,6 @@ impl SessionCookiePolicy {
 mod tests {
     use super::*;
     use crate::dynamic::{CfmlValue, ValueMap};
-    use indexmap::IndexMap;
 
     fn cfg_with(inner: Vec<(&str, CfmlValue)>) -> ValueMap {
         let mut sc = ValueMap::default();

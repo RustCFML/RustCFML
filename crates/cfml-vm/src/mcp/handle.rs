@@ -668,8 +668,6 @@ mod tests {
         let (mut handle, _, _, _, sink) = sampling_setup();
         assert!(handle.call_method("elicit", vec![]).is_err(), "no message to show");
 
-        let mut options = ValueMap::default();
-        let _ = options;
         std::thread::spawn({
             let sink = sink.clone();
             move || {
