@@ -126,36 +126,43 @@ if (structKeyExists(cfthread, "timing_target")) {
     assert("timing target value", cfthread.timing_target.value, 42);
 }
 
-// Test 6: Cross-thread join on error - status must be TERMINATED
+// Test 6: Cross-thread join on error - joiner waits, then target errors and wakes joiner
 request.errorThreadStatus = "";
+request.joinerStarted = false;
 var errorStart = getTickCount();
 
 thread name="error_target" {
+    // Sleep so joiner starts waiting first
+    sleep(200);
     throw(message="intentional error for test");
 }
 
-sleep(50); // Let it error
-
-// Check spawner's view of errored thread
-if (structKeyExists(cfthread, "error_target")) {
-    request.errorThreadStatus = cfthread.error_target.status;
-}
+sleep(10); // Let target start
 
 thread name="error_joiner" {
+    request.joinerStarted = true;
+    // Joiner blocks here waiting for error_target
     thread action="join" name="error_target" timeout="2000";
 }
 
+sleep(50); // Ensure joiner is waiting before target errors
+assertTrue("joiner started waiting", request.joinerStarted);
+
+// Now target will error in ~150ms more, joiner should wake immediately
 thread action="join" name="error_joiner,error_target";
 var errorElapsed = getTickCount() - errorStart;
 
-// Join should wake immediately when target errors, not wait the full 2s timeout
-assertTrue("error join completed quickly (woke on error)", errorElapsed < 500);
+// Total time should be ~200ms (target sleep) + small overhead, not 2s timeout
+assertTrue("error join completed in bounds (woke on error)", errorElapsed >= 180 && errorElapsed < 500);
 
-// Parent can see error
+// Parent can see error as struct
 if (structKeyExists(cfthread, "error_target")) {
     assert("error target status is TERMINATED", cfthread.error_target.status, "TERMINATED");
     assertTrue("error target has error", structKeyExists(cfthread.error_target, "error"));
-    assertTrue("error target error is non-empty", len(cfthread.error_target.error) > 0);
+    assertTrue("error is struct", isStruct(cfthread.error_target.error));
+    assertTrue("error has message", structKeyExists(cfthread.error_target.error, "message"));
+    assertTrue("error has type", structKeyExists(cfthread.error_target.error, "type"));
+    assertTrue("error message non-empty", len(cfthread.error_target.error.message) > 0);
 }
 
 // Test 7: Terminate interrupts sleep - ELAPSEDTIME 0, status TERMINATED
