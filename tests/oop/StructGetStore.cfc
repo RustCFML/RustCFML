@@ -7,11 +7,11 @@
  */
 component {
     function get( required objectKey ){
-        var results = variables.pool.get( arguments.objectKey );
-        if ( !isNull( results ) ) {
-            return results;
+        // A missing key throws on a plain struct (Lucee 7.1.1), so test first.
+        if ( !structKeyExists( variables.pool, arguments.objectKey ) ) {
+            return "MISS";
         }
-        return "MISS";
+        return variables.pool.get( arguments.objectKey );
     }
     function setPool( p ){
         variables.pool = arguments.p;

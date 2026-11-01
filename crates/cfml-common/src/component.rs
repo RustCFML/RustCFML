@@ -994,6 +994,29 @@ pub fn same_component_instance(a: &CfmlValue, b: &CfmlValue) -> bool {
     }
 }
 
+/// The keys a CFC's `variables` scope enumerates, from its `all_keys()`: the
+/// user's variables and methods, then `this` — never the engine bookkeeping kept
+/// beside them (`__static`). Lucee 7.1 lists `THIS` last in `structKeyList`,
+/// `structKeyArray`, `structCount` and for-in alike. Other structs pass through.
+pub fn variables_scope_keys(s: &CfmlStruct, mut keys: Vec<String>) -> Vec<String> {
+    if !s.is_component_variables_scope() {
+        return keys;
+    }
+    keys.retain(|k| !is_reserved_component_key(k) && !k.eq_ignore_ascii_case("this"));
+    if s.this_alias_value().is_some() {
+        keys.push("this".to_string());
+    }
+    keys
+}
+
+/// Whether `k` is engine bookkeeping in `s` that iteration must skip: a reserved
+/// key in a CFC's `variables` scope (`__static`). The `__` test comes first so
+/// ordinary keys pay one comparison.
+#[inline]
+pub fn is_hidden_variables_scope_key(s: &CfmlStruct, k: &str) -> bool {
+    is_reserved_component_key(k) && s.is_component_variables_scope()
+}
+
 /// True iff `k` is an engine-reserved component-instance bookkeeping key that
 /// must stay OUT of user-visible introspection (`structKeyExists`/`structKeyList`/
 /// `structKeyArray`/`structCount`/`structEach`, `for … in`, `serializeJSON`,

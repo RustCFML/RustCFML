@@ -9,21 +9,21 @@ request.registryTest = "start";
 
 // Spawn threads that complete quickly so we can test eviction behavior
 // The registry should hold metadata even after threads complete
-for ( var i = 1; i <= 5; i++ ) {
-	var threadName = "regtest_" & i;
+for ( i = 1; i <= 5; i++ ) {
+	threadName = "regtest_" & i;
 	thread name=threadName xi=i {
 		thread.index = attributes.xi;
 	}
 }
 
 // Join all to ensure they've registered
-for ( var i = 1; i <= 5; i++ ) {
+for ( i = 1; i <= 5; i++ ) {
 	thread action="join" name="regtest_#i#";
 }
 
 // All 5 should be in the spawner's cfthread scope
-var registeredCount = 0;
-for ( var i = 1; i <= 5; i++ ) {
+registeredCount = 0;
+for ( i = 1; i <= 5; i++ ) {
 	if ( structKeyExists( cfthread, "regtest_#i#" ) ) {
 		registeredCount++;
 	}

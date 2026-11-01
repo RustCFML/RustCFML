@@ -117,7 +117,7 @@ assertTrue("target completed", request.targetDone);
 assertFalse("joiner did not timeout", request.joinerTimedOut);
 assertTrue("joiner start time recorded", request.joinerStart > 0);
 assertTrue("joiner end time recorded", request.joinerEnd > 0);
-var joinElapsed = request.joinerEnd - request.joinerStart;
+joinElapsed = request.joinerEnd - request.joinerStart;
 assertTrue("cross-join waited at least ~150ms", joinElapsed >= 150);
 assertTrue("cross-join completed under 2s", joinElapsed < 2000);
 // Verify target metadata
@@ -129,7 +129,7 @@ if (structKeyExists(cfthread, "timing_target")) {
 // Test 6: Cross-thread join on error - joiner waits, then target errors and wakes joiner
 request.errorThreadStatus = "";
 request.joinerStarted = false;
-var errorStart = getTickCount();
+errorStart = getTickCount();
 
 thread name="error_target" {
     // Sleep so joiner starts waiting first
@@ -150,7 +150,7 @@ assertTrue("joiner started waiting", request.joinerStarted);
 
 // Now target will error in ~150ms more, joiner should wake immediately
 thread action="join" name="error_joiner,error_target";
-var errorElapsed = getTickCount() - errorStart;
+errorElapsed = getTickCount() - errorStart;
 
 // Total time should be ~200ms (target sleep) + small overhead, not 2s timeout
 assertTrue("error join completed in bounds (woke on error)", errorElapsed >= 180 && errorElapsed < 500);
@@ -212,10 +212,10 @@ thread name="no_name_2" {
     thread.idx = 2;
 }
 
-var joinStart = getTickCount();
+joinStart = getTickCount();
 // Join all with no name
 thread action="join" timeout="3000";
-var joinEnd = getTickCount();
+joinEnd = getTickCount();
 
 // Both should be completed
 if (structKeyExists(cfthread, "no_name_1") && structKeyExists(cfthread, "no_name_2")) {
@@ -240,9 +240,9 @@ thread name="budget_3" {
     thread.done = true;
 }
 
-var budgetStart = getTickCount();
+budgetStart = getTickCount();
 thread action="join" timeout="600"; // 600ms total budget for all 3 x 400ms threads
-var budgetElapsed = getTickCount() - budgetStart;
+budgetElapsed = getTickCount() - budgetStart;
 
 // The threads run concurrently (not sequentially), so they all finish around 400ms.
 // The join should wait for them and return around 400ms (well before the 600ms budget).
@@ -258,9 +258,9 @@ thread name="outlive_2" {
     sleep(2000);
     thread.done = true;
 }
-var outliveStart = getTickCount();
+outliveStart = getTickCount();
 thread action="join" name="outlive_1,outlive_2" timeout="600"; // 600ms budget for 2s threads
-var outliveElapsed = getTickCount() - outliveStart;
+outliveElapsed = getTickCount() - outliveStart;
 
 // Join should return after ~600ms (budget exhausted), not wait full 2s
 assertTrue("join returned after budget expired", outliveElapsed >= 500 && outliveElapsed < 900);
@@ -277,16 +277,16 @@ thread name="data_test_2" {
 }
 
 sleep(10);
-var threadDataResult = threadData();
+threadDataResult = threadData();
 assertTrue("threadData returns struct", isStruct(threadDataResult));
 // Should have at least our test threads (may have more from other tests)
-var hasData1 = structKeyExists(threadDataResult, "data_test_1");
-var hasData2 = structKeyExists(threadDataResult, "data_test_2");
+hasData1 = structKeyExists(threadDataResult, "data_test_1");
+hasData2 = structKeyExists(threadDataResult, "data_test_2");
 
 thread action="join" name="data_test_1,data_test_2";
 
 // After join, check again
-var threadDataAfter = threadData();
+threadDataAfter = threadData();
 assertTrue("threadData has data_test_1", structKeyExists(threadDataAfter, "data_test_1"));
 assertTrue("threadData has data_test_2", structKeyExists(threadDataAfter, "data_test_2"));
 // Verify they're COMPLETED
@@ -300,7 +300,7 @@ thread name="unjoined_test" {
     thread.result = "completed_value";
 }
 sleep(200); // Wait for thread to finish, but don't join it
-var unjoinedData = threadData();
+unjoinedData = threadData();
 assertTrue("threadData has unjoined_test", structKeyExists(unjoinedData, "unjoined_test"));
 if (structKeyExists(unjoinedData, "unjoined_test")) {
     assert("unjoined thread status is COMPLETED", unjoinedData.unjoined_test.status, "COMPLETED");
@@ -321,10 +321,10 @@ if (structKeyExists(request.childThreadData, "child_caller")) {
 }
 
 // Test 12: Stress test - N threads with cross-joins and siblings joining each other
-var stressStart = getTickCount();
-var stressThreadCount = 10;
-for (var i = 1; i <= stressThreadCount; i++) {
-    var threadName = "stress_" & i;
+stressStart = getTickCount();
+stressThreadCount = 10;
+for (i = 1; i <= stressThreadCount; i++) {
+    threadName = "stress_" & i;
     thread name=threadName idx=i {
         sleep(50 + (attributes.idx * 10)); // Staggered sleep times
         thread.started = true;
@@ -352,13 +352,13 @@ for (var i = 1; i <= stressThreadCount; i++) {
 
 // Join all stress threads with timeout
 thread action="join" timeout="2000";
-var stressElapsed = getTickCount() - stressStart;
+stressElapsed = getTickCount() - stressStart;
 
 assertTrue("stress test completed within time limit", stressElapsed < 2500);
 // Check that threads actually ran by inspecting thread.* scope entries
-var completedCount = 0;
-for (var i = 1; i <= stressThreadCount; i++) {
-    var name = "stress_" & i;
+completedCount = 0;
+for (i = 1; i <= stressThreadCount; i++) {
+    name = "stress_" & i;
     if (structKeyExists(cfthread, name) && structKeyExists(cfthread[name], "completed") && cfthread[name].completed) {
         completedCount++;
     }

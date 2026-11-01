@@ -85,6 +85,8 @@ include "harness.cfm";
 <cf_runtest file="core/test_invoke_undeclared_keys.cfm" />
 <cf_runtest file="core/test_struct_method_sequential.cfm" />
 <cf_runtest file="core/test_include_scope_capture.cfm" />
+<!--- An include reads AND writes its caller's local, arguments and closures (Lucee: same PageContext). --->
+<cf_runtest file="core/test_include_runs_in_caller_scope.cfm" />
 <!--- savecontent's variable= must deliver the capture to SCOPE-QUALIFIED targets --->
 <!--- (variable="local.cap" / "variables.cap"), not just unqualified ones. RustCFML --->
 <!--- silently dropped the scoped capture — Wheels renders every view through --->
@@ -1169,6 +1171,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_cfinvoke_overlay_writeback.cfm" />
 <cf_runtest file="oop/test_mixin_private_scope_dispatch.cfm" />
 <cf_runtest file="oop/test_struct_get_vs_component_method.cfm" />
+<cf_runtest file="oop/test_variables_scope_keys.cfm" />
 <cf_runtest file="oop/test_fluent_return_this_chain.cfm" />
 <cf_runtest file="oop/test_super_ctor_this_writes.cfm" />
 <!--- Component-path resolution cache keying: caller DIR, case-insensitive --->

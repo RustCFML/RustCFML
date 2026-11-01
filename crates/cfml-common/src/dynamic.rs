@@ -1488,6 +1488,20 @@ impl CfmlStruct {
         self.0.write().this_alias = Some(Arc::downgrade(&target.0));
     }
 
+    /// Whether this is a CFC's `variables` scope: the one struct that carries
+    /// the live `this` alias. Enumerating it lists `this` and hides the engine
+    /// bookkeeping stored beside the user's variables (`__static`), as Lucee
+    /// does — see [`crate::component::variables_scope_keys`].
+    #[inline]
+    pub fn is_component_variables_scope(&self) -> bool {
+        let g = self.0.read();
+        #[cfg(feature = "component-instance")]
+        if g.this_instance_alias.is_some() {
+            return true;
+        }
+        g.this_alias.is_some()
+    }
+
     /// Upgrade the live `variables.this` alias to a strong handle, if set and
     /// still alive.
     #[inline]

@@ -17,12 +17,16 @@ thread name="self_join_test" {
 thread action="join" name="self_join_test" timeout="5000";
 
 assertTrue("self-join test completed", request.selfJoinCompleted);
-assertTrue("self-join returned quickly", (request.selfJoinEnd - request.selfJoinStart) < 100);
+// Deliberate divergence (docs/known-issues.md §118): Lucee waits out the
+// join timeout on a self-join; RustCFML returns at once.
+if ( isRustCFML() ) {
+	assertTrue("self-join returned quickly", (request.selfJoinEnd - request.selfJoinStart) < 100);
+}
 
 // Test 2: No-name join from child excludes self and ancestors (no hang)
 request.childJoinCompleted = false;
 request.childJoinedCount = 0;
-var ancestorStartTime = getTickCount();
+ancestorStartTime = getTickCount();
 
 thread name="ancestor_parent" {
     // Spawn two siblings
@@ -55,7 +59,7 @@ thread name="ancestor_parent" {
 }
 
 thread action="join" name="ancestor_parent" timeout="10000";
-var ancestorElapsed = getTickCount() - ancestorStartTime;
+ancestorElapsed = getTickCount() - ancestorStartTime;
 
 assertTrue("child no-name join completed", request.childJoinCompleted);
 // Child may or may not see siblings in its local cfthread scope (implementation detail)
@@ -66,7 +70,7 @@ assertTrue("ancestor test completed quickly (no hang on ancestor join)", ancesto
 request.b2TargetSpawned = false;
 request.b2TargetChildCompleted = false;
 request.b2JoinerCompleted = false;
-var b2StartTime = getTickCount();
+b2StartTime = getTickCount();
 
 thread name="b2_target" {
     sleep(50);
@@ -92,7 +96,7 @@ thread name="b2_joiner" {
 }
 
 thread action="join" name="b2_joiner,b2_target" timeout="10000";
-var b2Elapsed = getTickCount() - b2StartTime;
+b2Elapsed = getTickCount() - b2StartTime;
 
 assertTrue("B2 target spawned child", request.b2TargetSpawned);
 assertTrue("B2 target child completed", request.b2TargetChildCompleted);

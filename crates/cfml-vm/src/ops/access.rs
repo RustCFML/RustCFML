@@ -887,6 +887,12 @@ pub(crate) fn op_get_keys(
     // For for-in: convert struct to array of keys, leave arrays unchanged
     if let Some(val) = stack.pop() {
         match val {
+            CfmlValue::Struct(s) if s.is_component_variables_scope() => {
+                // A CFC's `variables` scope iterates `this` too, never
+                // `__static` (Lucee).
+                let keys = cfml_common::component::variables_scope_keys(&s, s.all_keys());
+                stack.push(CfmlValue::array(keys.into_iter().map(CfmlValue::string).collect()));
+            }
             CfmlValue::Struct(s) => {
                 // Hide the private arguments-scope markers
                 // from for-in iteration. Real numeric keys

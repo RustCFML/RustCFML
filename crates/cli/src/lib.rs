@@ -1925,11 +1925,12 @@ fn compile_and_run(
         let after = cfml_vm::fuse_counters::snapshot();
         let d: Vec<u64> = after.iter().zip(before.iter()).map(|(a, b)| a - b).collect();
         eprintln!(
-            "[fuse-counters] {} ms={} frames={} fused={} classic={} env_keys={} caller_keys={} key_bytes={} caller_scanned={} tier_frames(0/B/A)={}/{}/{} tier_keys(0/B/A)={}/{}/{} struct_keys={} param_keys={}",
+            "[fuse-counters] {} ms={} frames={} fused={} classic={} env_keys={} caller_keys={} key_bytes={} caller_scanned={} tier_frames(0/B/A)={}/{}/{} tier_keys(0/B/A)={}/{}/{} struct_keys={} param_keys={} tpl_fn_frames={} tpl_fn_keys={} tpl_page_frames={} tpl_page_keys={} tpl_merged={}",
             vm.base_template_path.as_deref().unwrap_or("?"),
             started.elapsed().as_millis(),
             d[0], d[1], d[2], d[3], d[4], d[5], d[6],
-            d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14]
+            d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14],
+            d[15], d[16], d[17], d[18], d[19]
         );
     }
 
@@ -2200,7 +2201,6 @@ fn compile_and_run(
     }
     #[cfg(not(all(feature = "obs-otel", not(target_arch = "wasm32"))))]
     let _ = (mem_meter, thread_mem);
-
     response
 }
 

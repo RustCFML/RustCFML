@@ -137,6 +137,13 @@ pub mod fuse_counters {
         [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     pub static TIER_KEYS: [AtomicU64; 3] =
         [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    // Template frames (include / view / custom-tag body), split by whether the
+    // includer was a function (the template shares its `local`) or a page.
+    pub static TPL_FN_FRAMES: AtomicU64 = AtomicU64::new(0);
+    pub static TPL_FN_KEYS: AtomicU64 = AtomicU64::new(0); // keys copied into them
+    pub static TPL_PAGE_FRAMES: AtomicU64 = AtomicU64::new(0);
+    pub static TPL_PAGE_KEYS: AtomicU64 = AtomicU64::new(0);
+    pub static TPL_MERGED: AtomicU64 = AtomicU64::new(0); // entries walked by the include merge-back
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -145,7 +152,7 @@ pub mod fuse_counters {
         })
     }
 
-    pub fn snapshot() -> [u64; 15] {
+    pub fn snapshot() -> [u64; 20] {
         [
             FRAMES.load(Relaxed),
             FUSED_MERGES.load(Relaxed),
@@ -162,6 +169,11 @@ pub mod fuse_counters {
             TIER_KEYS[2].load(Relaxed),
             STRUCT_KEYS.load(Relaxed),
             PARAM_KEYS.load(Relaxed),
+            TPL_FN_FRAMES.load(Relaxed),
+            TPL_FN_KEYS.load(Relaxed),
+            TPL_PAGE_FRAMES.load(Relaxed),
+            TPL_PAGE_KEYS.load(Relaxed),
+            TPL_MERGED.load(Relaxed),
         ]
     }
 
@@ -2913,6 +2925,21 @@ pub struct CfmlVirtualMachine {
     /// `cfinclude` runs in the SAME function-local scope as its caller, so
     /// `local.foo` set before the include is visible in the included file.
     include_share_local_keys: Option<std::collections::HashSet<String>>,
+    /// The includer's map, moved into the template frame about to run (see
+    /// [`MovedTemplateFrame`]). Taken at frame entry.
+    pending_template_frame: Option<MovedTemplateFrame>,
+    /// The including function's effective `localmode`, handed to the included
+    /// template with `include_share_local_keys` (taken the same way): the
+    /// template runs in that function's scopes, so a new unscoped name lands
+    /// in `local` under `localmode="modern"`, as on Lucee.
+    include_local_mode_modern: Option<bool>,
+    /// The including function's closure env, handed to the included template
+    /// (in) and back (out). A closure defined in an include captures the
+    /// including function's scopes on Lucee, live; with its own env, cleared
+    /// at the template's exit, it captured nothing at all — not even
+    /// `variables`.
+    include_closure_env_in: Option<Arc<RwLock<ValueMap>>>,
+    include_closure_env_out: Option<Arc<RwLock<ValueMap>>>,
     /// Depth of `include`s running inside a component pseudo-constructor
     /// (`__cfc_body__`), nested includes counted. While non-zero, a named
     /// function an included template declares is a METHOD of the component
@@ -5067,6 +5094,97 @@ impl InheritedKeys {
     }
 }
 
+/// A frame's scope map. For every frame but one kind it is just the map. A
+/// template that runs on its includer's map (see [`MovedTemplateFrame`]) also
+/// carries where that map goes back to, and `Drop` puts it there — so a `?`
+/// anywhere in the frame body returns the includer's variables instead of
+/// dropping them with the frame.
+#[derive(Default)]
+struct FrameMap {
+    map: ValueMap,
+    give_back: Option<Arc<parking_lot::Mutex<Option<ValueMap>>>>,
+}
+
+impl std::ops::Deref for FrameMap {
+    type Target = ValueMap;
+    #[inline]
+    fn deref(&self) -> &ValueMap {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for FrameMap {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut ValueMap {
+        &mut self.map
+    }
+}
+
+impl<'a> IntoIterator for &'a FrameMap {
+    type Item = <&'a ValueMap as IntoIterator>::Item;
+    type IntoIter = <&'a ValueMap as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        (&self.map).into_iter()
+    }
+}
+
+impl Drop for FrameMap {
+    fn drop(&mut self) {
+        if let Some(slot) = self.give_back.take() {
+            *slot.lock() = Some(std::mem::take(&mut self.map));
+        }
+    }
+}
+
+/// An included template runs on its includer's own map rather than a copy
+/// seeded from it, as Lucee and BoxLang run an include on the caller's scopes.
+/// The `Include` op moves the map in; the template frame hands it back through
+/// `give_back` on every exit, the error ones included.
+struct MovedTemplateFrame {
+    map: Option<ValueMap>,
+    /// The includer's inherited-or-parameter keys: the template marks exactly
+    /// these as inherited and treats the rest as its own `local`. `None` for an
+    /// include from a page, whose keys are all inherited.
+    inherited: Option<InheritedKeys>,
+    give_back: Arc<parking_lot::Mutex<Option<ValueMap>>>,
+}
+
+impl Drop for MovedTemplateFrame {
+    // A frame that never got as far as adopting the map (the recursion and
+    // memory guards return first) still owes it back.
+    fn drop(&mut self) {
+        if let Some(map) = self.map.take() {
+            *self.give_back.lock() = Some(map);
+        }
+    }
+}
+
+/// What the `Include` op takes out of the includer's map before moving it into
+/// the template, and puts back after: state that is the includer's alone.
+struct IncludeHandoff {
+    /// Compiler temporaries (`__iter_N`, `__idx_N`, `__cf…`): numbered per file,
+    /// so the template's own would overwrite the includer's mid-loop.
+    temps: Vec<(cfml_common::key::Key, CfmlValue)>,
+    /// Every other `__` key the includer holds; anything else the template
+    /// leaves under a `__` name is the template's own bookkeeping.
+    kept: Vec<cfml_common::key::Key>,
+    /// The includer's `arguments` handle, which a template frame may replace.
+    arguments: Option<CfmlValue>,
+    /// Classic-mode parameters and their values: `arguments` aliases them, so
+    /// one the template reassigns is synced into the struct afterwards.
+    params: Vec<(cfml_common::key::Key, CfmlValue)>,
+}
+
+/// A name the compiler synthesises for a frame's own bookkeeping.
+fn is_frame_temp(name: &str) -> bool {
+    const PREFIXES: [&str; 8] = [
+        "__iter_", "__idx_", "__cap_", "__switch_", "__fileline_", "__filehandle_",
+        "__funcmeta_", "__txn_e",
+    ];
+    name.starts_with("__")
+        && (is_engine_frame_local(name) || PREFIXES.iter().any(|p| name.starts_with(p)))
+}
+
 /// The names a frame has declared function-local (`var x`, `local.x`). Consulted
 /// by every classic-localMode write-back to keep a real local out of the caller's
 /// scope, and by the `local` scope view.
@@ -5259,6 +5377,26 @@ fn positional_arg_key(n: usize) -> cfml_common::key::Key {
 /// handle followed by a store of that handle back to its variable; when the
 /// variable already holds this very handle, the store is a no-op and is skipped
 /// — saving a map insert, a version bump and a closure-env sync per write.
+/// Did an included template change the value of a key its caller owns?
+/// `seeded` is the caller's value, `after` what the include's frame holds at
+/// exit (a clone of `seeded` unless the include assigned it). By-reference
+/// values changed iff the handle did — a member write mutates the shared
+/// handle, which the caller already sees. Anything without a cheap equality
+/// test counts as changed: writing an unchanged clone back is harmless.
+fn include_changed_value(seeded: &CfmlValue, after: &CfmlValue) -> bool {
+    match (seeded, after) {
+        (CfmlValue::Struct(_), _) | (CfmlValue::Array(_), _) | (CfmlValue::Query(_), _) => {
+            !same_reference(seeded, after)
+        }
+        (CfmlValue::String(a), CfmlValue::String(b)) => !Arc::ptr_eq(a, b) && a != b,
+        (CfmlValue::Int(a), CfmlValue::Int(b)) => a != b,
+        (CfmlValue::Double(a), CfmlValue::Double(b)) => a.to_bits() != b.to_bits(),
+        (CfmlValue::Bool(a), CfmlValue::Bool(b)) => a != b,
+        (CfmlValue::Null, CfmlValue::Null) => false,
+        _ => true,
+    }
+}
+
 #[inline]
 fn same_reference(a: &CfmlValue, b: &CfmlValue) -> bool {
     match (a, b) {
@@ -5500,6 +5638,10 @@ impl CfmlVirtualMachine {
             mappings_fingerprint: FNV_OFFSET,
             captured_locals: None,
             include_share_local_keys: None,
+            pending_template_frame: None,
+            include_local_mode_modern: None,
+            include_closure_env_in: None,
+            include_closure_env_out: None,
             cfc_body_include_depth: 0,
             method_include_depth: 0,
             include_depth: 0,
@@ -10307,6 +10449,7 @@ impl CfmlVirtualMachine {
             _cp_t = _cp0;
         }
         let fused_plan = self.pending_fused_parent.take();
+        let mut moved_frame = self.pending_template_frame.take();
         let (owned_parent, skip_method_writeback) = match self.pending_instance_frame.take() {
             Some((m, skip)) => (Some(m), skip),
             None => (None, false),
@@ -10374,13 +10517,21 @@ impl CfmlVirtualMachine {
         // path is the original per-call allocation, byte-identical.
         // Instance-method frame: the dispatch's map IS this frame's scope.
         let instance_frame = owned_parent.is_some();
-        let mut locals: ValueMap = match owned_parent {
-            Some(mut owned) => {
+        // An included template runs on its includer's map (MovedTemplateFrame).
+        let moved_inherited = moved_frame.as_mut().map(|m| m.inherited.take());
+        let mut locals = match (owned_parent, moved_frame.as_mut()) {
+            (_, Some(m)) => FrameMap {
+                map: m.map.take().unwrap_or_default(),
+                give_back: Some(m.give_back.clone()),
+            },
+            (Some(mut owned), None) => {
                 owned.reserve(func.params.len());
-                owned
+                FrameMap { map: owned, give_back: None }
             }
-            None => self.seed_locals_map(seed_cap + 1),
+            (None, None) => FrameMap { map: self.seed_locals_map(seed_cap + 1), give_back: None },
         };
+        drop(moved_frame);
+        let moved_template = locals.give_back.is_some();
         let mut stack: Vec<CfmlValue> = self.stack_pool.pop().unwrap_or_default();
         // Slot-resolved locals (perf plan T3.1 stage 1): direct-indexed storage
         // for the `var`-declared names in `func.slot_names`. `None` = not (yet)
@@ -10445,8 +10596,11 @@ impl CfmlVirtualMachine {
         // Effective Lucee localMode for this frame: function's declared attribute
         // wins; otherwise inherits the application default (`this.localMode` in
         // Application.cfc); otherwise classic.
-        let effective_local_mode_modern: bool =
-            func.declared_local_mode.unwrap_or(self.app_local_mode_modern);
+        let included_local_mode = self.include_local_mode_modern.take();
+        let effective_local_mode_modern: bool = match included_local_mode {
+            Some(m) if func.is_template_frame => m,
+            _ => func.declared_local_mode.unwrap_or(self.app_local_mode_modern),
+        };
 
         // A component pseudo-constructor (`__cfc_body__`) or page template
         // (`__main__`) frame: its locals are the component's `variables` scope,
@@ -10504,6 +10658,14 @@ impl CfmlVirtualMachine {
         // "locals" are the page `variables` scope), so its includes must not
         // leak page vars in as `local.*`.
         let frame_has_local_scope = !is_template_frame || share_local_keys.is_some();
+        // A template included from a function shares its closure env (see
+        // `include_closure_env_in`); taken unconditionally so it cannot leak
+        // to a later frame.
+        let included_env = self.include_closure_env_in.take();
+        let shares_caller_env = is_template_frame && share_local_keys.is_some();
+        if shares_caller_env {
+            closure_env = included_env;
+        }
         #[cfg(feature = "call-phases")]
         {
             // phase 1: allocate: locals map, stack, slots, declared_locals, flags
@@ -10513,7 +10675,19 @@ impl CfmlVirtualMachine {
             _cp_t = _n;
         }
         let _seed_t0 = ablate::wb_counters().then(std::time::Instant::now);
-        if instance_frame {
+        if let Some(includer_inherited) = moved_inherited {
+            // The includer's own map: nothing to copy. Its inherited keys stay
+            // inherited here and the rest are this frame's `local`, exactly
+            // what the copy-in below records for a seeded template.
+            let _ = fused_plan;
+            for k in locals.keys() {
+                seeded_env_marker |= k == &*cfml_common::key::well_known::CLOSURE_FRAME_ENV;
+                if includer_inherited.as_ref().is_none_or(|i| i.contains_key(k)) {
+                    inherited_or_param_keys.insert_key(k);
+                    inherited_from_parent.insert_key(k);
+                }
+            }
+        } else if instance_frame {
             // Scope already seeded by the dispatch (see `pending_instance_frame`).
             let _ = fused_plan;
         } else if let Some(plan) = fused_plan {
@@ -10554,7 +10728,12 @@ impl CfmlVirtualMachine {
                 // frame builds its own under this key and a lazy frame removed
                 // the carried handle again — a probe, an insert and a data key
                 // in the inherited set (an `Arc` per frame) for nothing. §2.1.
-                if k == &*cfml_common::key::well_known::ARGUMENTS_SCOPE {
+                // Except for a template included from a function: it runs in
+                // that function's scopes (Lucee: same PageContext), so
+                // `arguments.x = …` there writes the caller's struct.
+                if k == &*cfml_common::key::well_known::ARGUMENTS_SCOPE
+                    && !(is_template_frame && share_local_keys.is_some())
+                {
                     continue;
                 }
                 // Function values are normally skipped here: a named function /
@@ -10612,6 +10791,19 @@ impl CfmlVirtualMachine {
                         inherited_from_parent.insert_key(k);
                     }
                 }
+            }
+        }
+        if is_template_frame && fuse_counters::enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (frames, keys) = if share_local_keys.is_some() {
+                (&fuse_counters::TPL_FN_FRAMES, &fuse_counters::TPL_FN_KEYS)
+            } else {
+                (&fuse_counters::TPL_PAGE_FRAMES, &fuse_counters::TPL_PAGE_KEYS)
+            };
+            frames.fetch_add(1, Relaxed);
+            // A moved template copied nothing.
+            if !moved_template {
+                keys.fetch_add(locals.len() as u64, Relaxed);
             }
         }
         if let Some(t0) = _seed_t0 {
@@ -10693,7 +10885,7 @@ impl CfmlVirtualMachine {
         // so every error and fall-through is still produced by the real ops.
         // The wrapper still enforces the declared return type and fires the
         // function enter/exit hooks.
-        if args.is_empty() && direct_frame && self.pending_extra_named_args.is_none() {
+        if args.is_empty() && direct_frame && self.pending_extra_named_args.is_none() && !moved_template {
             if let Some(v) = Self::getter_shape(func)
                 .and_then(|shape| {
                     Self::trivial_getter_value(func, shape, &locals, &mut scope_cache, &self.request_scope)
@@ -10701,7 +10893,7 @@ impl CfmlVirtualMachine {
             {
                 self.pending_called_name = None;
                 #[cfg(feature = "scope-pool")]
-                self.recycle_locals_map(locals);
+                self.recycle_locals_map(std::mem::take(&mut locals.map));
                 self.recycle_stack(stack);
                 self.recycle_frame_tables(declared_locals.set, slots);
                 return Ok(v);
@@ -11083,8 +11275,10 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "call-phases")]
             let mut _p4_main_seed = false;
             if func.name == "__main__" {
-                if let Some(parent) = parent_scope {
-                    if let Some(CfmlValue::Struct(parent_args)) = parent.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
+                // A moved template's map IS its includer's.
+                let parent = if moved_template { Some(&*locals) } else { parent_scope };
+                if let Some(parent) = parent {
+                    if let Some(CfmlValue::Struct(parent_args)) = parent.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE).cloned() {
                         #[cfg(feature = "call-phases")]
                         {
                             _p4_main_seed = true;
@@ -11099,6 +11293,18 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
+            // A template included from a function shares that function's
+            // `arguments` STRUCT, not a copy of it: Lucee runs the include on
+            // the same PageContext, so `arguments.x = …` in the template is
+            // seen by the caller. The seed carried the caller's handle for
+            // exactly this frame kind (see the classic seed loop).
+            let shared_caller_args = (func.name == "__main__"
+                && func.params.is_empty()
+                && share_local_keys.is_some())
+            .then(|| locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE))
+            .flatten()
+            .is_some_and(|v| matches!(v, CfmlValue::Struct(_)));
+            if !shared_caller_args {
             locals.insert(
                 &*cfml_common::key::well_known::ARGUMENTS_SCOPE,
                 if untrack_arguments_scope {
@@ -11108,6 +11314,7 @@ impl CfmlVirtualMachine {
                     CfmlValue::strukt(arguments_map)
                 },
             );
+            }
             #[cfg(feature = "call-phases")]
             cfml_common::perf_counters::call_phases::record_p4_eager_tail(
                 !func.params.is_empty(), untrack_arguments_scope, _p4_main_seed);
@@ -11131,8 +11338,12 @@ impl CfmlVirtualMachine {
             // used to enforce this here — one probe on EVERY lazy frame — is a
             // debug assertion now. `arguments_supplied` is the authority for
             // presence on this path.
+            // (A template included from a function is the one exception: it
+            // runs in the caller's scopes and carries the caller's struct.)
             debug_assert!(
-                !locals.contains_key(&*cfml_common::key::well_known::ARGUMENTS_SCOPE),
+                !locals.contains_key(&*cfml_common::key::well_known::ARGUMENTS_SCOPE)
+                    || (is_template_frame && share_local_keys.is_some())
+                    || moved_template,
                 "lazy frame seeded with a caller's arguments scope"
             );
         }
@@ -14546,15 +14757,17 @@ impl CfmlVirtualMachine {
                         || func.name == "__cfc_body__"
                         || func.name == "__cfc_static_init__"
                     {
-                        for (_, v) in locals.iter_mut() {
-                            if let CfmlValue::Function(ref mut f) = v {
-                                Arc::make_mut(f).captured_scope = None;
-                            }
-                        }
-                        if let Some(ref env) = closure_env {
+                        Self::strip_template_closures(&mut locals, moved_template, &closure_env, shares_caller_env);
+                        if shares_caller_env {
+                            self.include_closure_env_out = closure_env.take();
+                        } else if let Some(ref env) = closure_env {
                             env.write().unwrap().clear();
                         }
-                        self.captured_locals = Some(std::mem::take(&mut locals));
+                        // A moved template's map goes back to its includer
+                        // through `give_back` when `locals` drops.
+                        if !moved_template {
+                            self.captured_locals = Some(std::mem::take(&mut locals.map));
+                        }
                     }
                     #[cfg(feature = "call-phases")]
                     {
@@ -14595,7 +14808,7 @@ impl CfmlVirtualMachine {
                     // `locals` to `captured_locals` above, so it must NOT be pooled.
                     #[cfg(feature = "scope-pool")]
                     if !is_template_frame {
-                        self.recycle_locals_map(std::mem::take(&mut locals));
+                        self.recycle_locals_map(std::mem::take(&mut locals.map));
                     }
                     #[cfg(feature = "call-phases")]
                     {
@@ -17284,7 +17497,6 @@ impl CfmlVirtualMachine {
                                 .position(|f| f.name == "__main__")
                                 .unwrap_or(0);
                             let inc_func = self.program.functions[main_idx].clone();
-                            // Snapshot caller's keys before include so we can detect new variables
                             // Isolate try-stack so throws inside the include
                             // don't consume outer handlers
                             let saved_try_stack = std::mem::take(&mut self.try_stack);
@@ -17306,14 +17518,27 @@ impl CfmlVirtualMachine {
                             // shared) in the included template. Skipped for a
                             // top-level page, which has no local scope.
                             if frame_has_local_scope {
-                                self.include_share_local_keys = Some(
-                                    locals
-                                        .keys()
-                                        .filter(|k| !inherited_or_param_keys.contains(*k))
-                                        .cloned()
-                                        .map(|k| k.as_str().to_string()).collect(),
-                                );
+                                self.include_closure_env_in = closure_env.clone();
+                                self.include_local_mode_modern = Some(effective_local_mode_modern);
+                                // The flag only: the template runs on this map,
+                                // so there is no key set to copy (see below).
+                                self.include_share_local_keys = Some(std::collections::HashSet::new());
                             }
+                            // The template runs on THIS map, moved in — not on a
+                            // copy seeded from it — and hands it back on every
+                            // exit (MovedTemplateFrame). Only state that is this
+                            // frame's alone is taken out first and restored after.
+                            let handoff = Self::include_handoff_out(
+                                &mut locals,
+                                func,
+                                frame_has_local_scope && !effective_local_mode_modern,
+                            );
+                            let give_back = Arc::new(parking_lot::Mutex::new(None));
+                            self.pending_template_frame = Some(MovedTemplateFrame {
+                                map: Some(std::mem::take(&mut locals.map)),
+                                inherited: frame_has_local_scope.then(|| inherited_or_param_keys.clone()),
+                                give_back: give_back.clone(),
+                            });
                             // An include from a CFC pseudo-constructor (or from an
                             // include already running in one) declares CLASS
                             // methods — see `cfc_body_include_depth`. An include
@@ -17338,8 +17563,13 @@ impl CfmlVirtualMachine {
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
-                                Some(&locals),
+                                None,
                             );
+                            // Dropping a hand-off the frame never adopted (it
+                            // returned before its prologue) gives the map back too.
+                            self.pending_template_frame = None;
+                            locals.map = give_back.lock().take().unwrap_or_default();
+                            Self::include_handoff_back(&mut locals, handoff, &declared_locals);
                             self.include_depth -= 1;
                             if declares_methods {
                                 self.cfc_body_include_depth -= 1;
@@ -17353,40 +17583,14 @@ impl CfmlVirtualMachine {
                                 let us = start.elapsed().as_micros() as i64;
                                 self.template_frame_end(&resolved, None, us);
                             }
-                            // Merge newly created variables from the include back
-                            // into the caller's locals. This makes variables set via
-                            // `variables.foo = "bar"` in the include accessible from
-                            // the caller. Only NEW keys are merged — existing keys are
-                            // not overwritten to prevent closure write-back from
-                            // reverting caller state. Function values are NOT merged
-                            // (they're already in user_functions); merging them would
-                            // inject captured_scope that triggers spurious write-backs.
-                            // The include ran on its own map, seeded from this one
-                            // and handed back whole. A key it holds is NEW iff this
-                            // map still lacks it — no pre-include key set needed
-                            // (that was a `HashSet<String>` of every caller key,
-                            // one String per key, built for each of a Preside
-                            // admin page's ~11,000 includes). The emptied map is
-                            // recycled: template frames were the one frame kind
-                            // that never returned its map to the pool, so every
-                            // include drained a pooled map and the pool starved.
-                            if let Some(mut inc_locals) = self.captured_locals.take() {
-                                for (k, v) in inc_locals.drain(..) {
-                                    if k == "arguments" || k.starts_with("__") {
-                                        continue;
-                                    }
-                                    // Only merge NEW variables that are not functions and
-                                    // don't shadow builtin function names (e.g. "val").
-                                    if !locals.contains_key(&k)
-                                        && !matches!(v, CfmlValue::Function(_))
-                                        && !self.builtins.contains_key(k.as_str())
-                                    {
-                                        locals.insert(k, v);
-                                    }
-                                }
-                                #[cfg(feature = "scope-pool")]
-                                self.recycle_locals_map(inc_locals);
+                            // The env the include used is this frame's (it may
+                            // have created it). Already in step with `locals`:
+                            // only later closure writes need reconciling.
+                            if let Some(env) = self.include_closure_env_out.take() {
+                                env_reconciled_version = env.read().unwrap().version();
+                                closure_env = Some(env);
                             }
+                            self.include_closure_env_in = None;
                             // Functions defined in the included file are already
                             // resolvable after the swap is popped: each was
                             // registered into `fn_registry` by its global_id when
@@ -17514,14 +17718,27 @@ impl CfmlVirtualMachine {
                             // Share the caller's function-`local` scope with the
                             // included template (see the static Include op above).
                             if frame_has_local_scope {
-                                self.include_share_local_keys = Some(
-                                    locals
-                                        .keys()
-                                        .filter(|k| !inherited_or_param_keys.contains(*k))
-                                        .cloned()
-                                        .map(|k| k.as_str().to_string()).collect(),
-                                );
+                                self.include_closure_env_in = closure_env.clone();
+                                self.include_local_mode_modern = Some(effective_local_mode_modern);
+                                // The flag only: the template runs on this map,
+                                // so there is no key set to copy (see below).
+                                self.include_share_local_keys = Some(std::collections::HashSet::new());
                             }
+                            // The template runs on THIS map, moved in — not on a
+                            // copy seeded from it — and hands it back on every
+                            // exit (MovedTemplateFrame). Only state that is this
+                            // frame's alone is taken out first and restored after.
+                            let handoff = Self::include_handoff_out(
+                                &mut locals,
+                                func,
+                                frame_has_local_scope && !effective_local_mode_modern,
+                            );
+                            let give_back = Arc::new(parking_lot::Mutex::new(None));
+                            self.pending_template_frame = Some(MovedTemplateFrame {
+                                map: Some(std::mem::take(&mut locals.map)),
+                                inherited: frame_has_local_scope.then(|| inherited_or_param_keys.clone()),
+                                give_back: give_back.clone(),
+                            });
                             // An include from a CFC pseudo-constructor (or from an
                             // include already running in one) declares CLASS
                             // methods — see `cfc_body_include_depth`. An include
@@ -17546,8 +17763,13 @@ impl CfmlVirtualMachine {
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
-                                Some(&locals),
+                                None,
                             );
+                            // Dropping a hand-off the frame never adopted (it
+                            // returned before its prologue) gives the map back too.
+                            self.pending_template_frame = None;
+                            locals.map = give_back.lock().take().unwrap_or_default();
+                            Self::include_handoff_back(&mut locals, handoff, &declared_locals);
                             self.include_depth -= 1;
                             if declares_methods {
                                 self.cfc_body_include_depth -= 1;
@@ -17561,25 +17783,14 @@ impl CfmlVirtualMachine {
                                 let us = start.elapsed().as_micros() as i64;
                                 self.template_frame_end(&resolved, None, us);
                             }
-                            // Merge new non-function variables from the include
-                            // Same merge as the static include above: new keys
-                            // only, decided against this map directly; the
-                            // include's map goes back to the pool.
-                            if let Some(mut inc_locals) = self.captured_locals.take() {
-                                for (k, v) in inc_locals.drain(..) {
-                                    if k == "arguments" || k.starts_with("__") {
-                                        continue;
-                                    }
-                                    if !locals.contains_key(&k)
-                                        && !matches!(v, CfmlValue::Function(_))
-                                        && !self.builtins.contains_key(k.as_str())
-                                    {
-                                        locals.insert(k, v);
-                                    }
-                                }
-                                #[cfg(feature = "scope-pool")]
-                                self.recycle_locals_map(inc_locals);
+                            // The env the include used is this frame's (it may
+                            // have created it). Already in step with `locals`:
+                            // only later closure writes need reconciling.
+                            if let Some(env) = self.include_closure_env_out.take() {
+                                env_reconciled_version = env.read().unwrap().version();
+                                closure_env = Some(env);
                             }
+                            self.include_closure_env_in = None;
                             // No merge-append or index fixup needed: the dynamic
                             // include's functions are already registered by global_id
                             // (sub-program swap-in) and by name (DefineFunction), and
@@ -17816,11 +18027,7 @@ impl CfmlVirtualMachine {
         {
             // Strip captured_scope from any top-level Function values before
             // snapshotting — CFC methods resolve via __variables, not closures.
-            for (_, v) in locals.iter_mut() {
-                if let CfmlValue::Function(ref mut f) = v {
-                    Arc::make_mut(f).captured_scope = None;
-                }
-            }
+            Self::strip_template_closures(&mut locals, moved_template, &closure_env, shares_caller_env);
             // Break the closure-env reference cycle. The pseudo-constructor's
             // shared `closure_env` holds scope structs (`this`, `variables`) that
             // contain the just-defined methods, and each method's `captured_scope`
@@ -17830,14 +18037,20 @@ impl CfmlVirtualMachine {
             // per repeated call to any closure-defining function). CFC methods
             // never use this env (they use __variables injected at call time), so
             // clearing it here severs the cycle without affecting behaviour.
-            if let Some(ref env) = closure_env {
+            // A template included from a function hands the env back to it
+            // instead: it is that function's env (see `include_closure_env_in`).
+            if shares_caller_env {
+                self.include_closure_env_out = closure_env.take();
+            } else if let Some(ref env) = closure_env {
                 env.write().unwrap().clear();
             }
             // `mem::take` (not a by-value move) so `locals` stays a valid — empty —
             // binding afterwards; the Lever D1 recycle below is a separate `if`, and
             // the borrow checker can't prove the two branches are exclusive. The
             // handed-off map is identical either way. Mirrors the Return-op path.
-            self.captured_locals = Some(std::mem::take(&mut locals));
+            if !moved_template {
+                self.captured_locals = Some(std::mem::take(&mut locals.map));
+            }
 
             // `cfexit` stops at the template boundary: a template frame is the
             // owner of an unwinding exit. Hand the method off to
@@ -17860,7 +18073,7 @@ impl CfmlVirtualMachine {
         // `locals` to `captured_locals` above (must not be pooled).
         #[cfg(feature = "scope-pool")]
         if !is_template_frame {
-            self.recycle_locals_map(std::mem::take(&mut locals));
+            self.recycle_locals_map(std::mem::take(&mut locals.map));
         }
         #[cfg(feature = "call-phases")]
         {
@@ -19208,6 +19421,7 @@ impl CfmlVirtualMachine {
                             let callback = callback.clone();
                             let mut pl: Option<ValueMap> = None;
                             for (k, v) in s.iter() {
+                                if cfml_common::component::is_hidden_variables_scope_key(&s, &k) { continue; }
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
@@ -19243,6 +19457,7 @@ impl CfmlVirtualMachine {
                             let callback = callback.clone();
                             let mut pl: Option<ValueMap> = None;
                             for (k, v) in s.iter() {
+                                if cfml_common::component::is_hidden_variables_scope_key(&s, &k) { continue; }
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
@@ -19278,6 +19493,7 @@ impl CfmlVirtualMachine {
                             let callback = callback.clone();
                             let mut pl: Option<ValueMap> = None;
                             for (k, v) in s.iter() {
+                                if cfml_common::component::is_hidden_variables_scope_key(&s, &k) { continue; }
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
@@ -19364,6 +19580,7 @@ impl CfmlVirtualMachine {
                             let mut acc = args.get(2).cloned().unwrap_or(CfmlValue::Null);
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
+                                if cfml_common::component::is_hidden_variables_scope_key(&s, &k) { continue; }
                                 let mut cb_args = Vec::with_capacity(4);
                                 cb_args.push(acc.clone());
                                 cb_args.push(CfmlValue::string(k.clone()));
@@ -19388,6 +19605,7 @@ impl CfmlVirtualMachine {
                         if let CfmlValue::Struct(s) = struct_val {
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
+                                if cfml_common::component::is_hidden_variables_scope_key(&s, &k) { continue; }
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
@@ -19415,6 +19633,7 @@ impl CfmlVirtualMachine {
                         if let CfmlValue::Struct(s) = struct_val {
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
+                                if cfml_common::component::is_hidden_variables_scope_key(&s, &k) { continue; }
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
@@ -32802,16 +33021,22 @@ impl CfmlVirtualMachine {
                         .collect();
                     return Ok(CfmlValue::array(entries));
                 }
-                // java.util.Map.get(key) passthrough. Lucee/ACF expose Map
-                // members on structs, so `someStruct.get("k")` returns the value
-                // for that key (case-insensitive) or null if absent — it is NOT
-                // structGet's dotted-path form. (GH #223: ColdBox ConcurrentStore
-                // does `variables.pool.get(key)` where pool is a plain struct.)
-                "get" => {
+                // `someStruct.get(key [, default])` reads one key, case-insensitively
+                // — it is NOT structGet's dotted-path form (GH #223). Lucee 7.1.1
+                // gives it structFind's contract: a missing or null key throws
+                // unless a default is passed (7.1.0 and ACF returned null). A Java
+                // map stand-in (ConcurrentHashMap etc.) keeps java.util.Map's null.
+                "get" if s.contains_key("__java_shim") => {
                     if let Some(key) = extra_args.first() {
                         return Ok(s.get_ci(&key.as_string()).unwrap_or(CfmlValue::Null));
                     }
                     return Ok(CfmlValue::Null);
+                }
+                "get" if matches!(extra_args.len(), 1 | 2) => Some("structFind"),
+                "get" => {
+                    return Err(self.wrap_error(CfmlError::expression(
+                        "The function [get] does not exist in the Struct.".to_string(),
+                    )));
                 }
                 "isempty" => Some("structIsEmpty"),
                 "sort" => Some("structSort"),
@@ -32820,7 +33045,8 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
                             // Skip a Map shim's internal markers (GH #239).
-                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
+                            if k.starts_with("__") && (s.contains_key("__java_shim")
+                                || cfml_common::component::is_hidden_variables_scope_key(&s, &k)) { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -32843,7 +33069,8 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         let mut result = ValueMap::default();
                         for (k, v) in s.iter() {
-                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
+                            if k.starts_with("__") && (s.contains_key("__java_shim")
+                                || cfml_common::component::is_hidden_variables_scope_key(&s, &k)) { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -32866,7 +33093,8 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         let mut result = ValueMap::default();
                         for (k, v) in s.iter() {
-                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
+                            if k.starts_with("__") && (s.contains_key("__java_shim")
+                                || cfml_common::component::is_hidden_variables_scope_key(&s, &k)) { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -32888,7 +33116,8 @@ impl CfmlVirtualMachine {
                 "some" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
-                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
+                            if k.starts_with("__") && (s.contains_key("__java_shim")
+                                || cfml_common::component::is_hidden_variables_scope_key(&s, &k)) { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -32911,7 +33140,8 @@ impl CfmlVirtualMachine {
                 "every" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
-                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
+                            if k.starts_with("__") && (s.contains_key("__java_shim")
+                                || cfml_common::component::is_hidden_variables_scope_key(&s, &k)) { continue; }
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
@@ -32940,7 +33170,8 @@ impl CfmlVirtualMachine {
                             CfmlValue::Null
                         };
                         for (k, v) in s.iter() {
-                            if k.starts_with("__") && s.contains_key("__java_shim") { continue; }
+                            if k.starts_with("__") && (s.contains_key("__java_shim")
+                                || cfml_common::component::is_hidden_variables_scope_key(&s, &k)) { continue; }
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
                             cb_args.push(CfmlValue::string(k.clone()));
@@ -35423,6 +35654,103 @@ impl CfmlVirtualMachine {
                         continue;
                     }
                     env.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    /// Take out of an includer's map what is the includer's alone, before the
+    /// map moves into the included template: its compiler temporaries (the
+    /// template's are numbered the same way and would overwrite them mid-loop),
+    /// and a record of its `__` keys, its `arguments` handle and — in classic
+    /// localmode — its parameter values. [`Self::include_handoff_back`] undoes it.
+    fn include_handoff_out(
+        locals: &mut ValueMap,
+        func: &BytecodeFunction,
+        classic_local_scope: bool,
+    ) -> IncludeHandoff {
+        let temp_keys: Vec<cfml_common::key::Key> =
+            locals.keys().filter(|k| is_frame_temp(k.as_str())).cloned().collect();
+        let mut temps = Vec::with_capacity(temp_keys.len());
+        for k in temp_keys {
+            if let Some(v) = locals.shift_remove(&k) {
+                temps.push((k, v));
+            }
+        }
+        let kept = locals.keys().filter(|k| k.starts_with("__")).cloned().collect();
+        let arguments = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE).cloned();
+        let params = if classic_local_scope && arguments.is_some() {
+            func.params
+                .iter()
+                .filter_map(|p| {
+                    locals.get_key_value(p.as_str()).map(|(k, v)| (k.clone(), v.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        IncludeHandoff { temps, kept, arguments, params }
+    }
+
+    /// Restore an includer's own state after its map comes back from the
+    /// template (see [`Self::include_handoff_out`]). Everything else the
+    /// template did to the map stands: it ran in the includer's scope.
+    fn include_handoff_back(
+        locals: &mut ValueMap,
+        handoff: IncludeHandoff,
+        declared_locals: &DeclaredLocals,
+    ) {
+        let IncludeHandoff { temps, kept, arguments, params } = handoff;
+        let template_own: Vec<cfml_common::key::Key> = locals
+            .keys()
+            .filter(|k| k.starts_with("__") && !kept.contains(k))
+            .cloned()
+            .collect();
+        for k in template_own {
+            locals.shift_remove(&k);
+        }
+        if let Some(args) = arguments {
+            // A parameter the template reassigned: `arguments` aliases it, the
+            // same sync a bare write in the includer's own body makes.
+            if let CfmlValue::Struct(ref a) = args {
+                for (k, before) in &params {
+                    if declared_locals.contains_key(k) {
+                        continue;
+                    }
+                    if let Some(after) = locals.get(k) {
+                        if include_changed_value(before, after) && a.get_ci(k.as_str()).is_some() {
+                            a.insert(k.clone(), after.clone());
+                        }
+                    }
+                }
+            }
+            locals.insert(&*cfml_common::key::well_known::ARGUMENTS_SCOPE, args);
+        }
+        for (k, v) in temps {
+            locals.insert(k, v);
+        }
+    }
+
+    /// A template frame's closures lose their captured env as the frame ends:
+    /// the env is cleared, or handed back to the includer, next. A moved
+    /// template's map is its includer's, so there only the closures this frame
+    /// minted against its OWN env are stripped — the includer's closures, and
+    /// any sharing the includer's env, stay live.
+    fn strip_template_closures(
+        locals: &mut ValueMap,
+        moved: bool,
+        env: &Option<Arc<RwLock<ValueMap>>>,
+        shares_env: bool,
+    ) {
+        if moved && (shares_env || env.is_none()) {
+            return;
+        }
+        for (_, v) in locals.iter_mut() {
+            if let CfmlValue::Function(ref mut f) = v {
+                let own = !moved
+                    || matches!((&f.captured_scope, env), (Some(c), Some(e)) if Arc::ptr_eq(c, e));
+                if own {
+                    Arc::make_mut(f).captured_scope = None;
                 }
             }
         }

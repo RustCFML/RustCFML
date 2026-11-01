@@ -44,11 +44,28 @@ s4 = {a: 1};
 s4.append({b: 2});
 assert("struct.append() then count", s4.count(), 2);
 
-// --- get (java.util.Map member passthrough, GH #223) ---
+// --- get (GH #223) ---
+// Lucee 7.1.1 gives struct.get(key [, default]) structFind's contract: a
+// missing key, or one holding null, throws unless a default is passed.
+// (7.1.0 and ACF returned null.)
 s5 = { myKey: "123", Other: 7 };
+s5.nothing = nullValue();
 assert("struct.get() returns value", s5.get("myKey"), "123");
 assert("struct.get() is case-insensitive", s5.get("OTHER"), 7);
-assertTrue("struct.get() missing key is null", isNull(s5.get("nope")));
+assertThrows("struct.get() missing key throws", function(){ return s5.get("nope"); });
+assertThrows("struct.get() null-valued key throws", function(){ return s5.get("nothing"); });
+assertThrows("struct.get() takes no dotted path", function(){ return { a: { b: 1 } }.get("a.b"); });
+assert("struct.get() missing key returns the default", s5.get("nope", "DEF"), "DEF");
+assert("struct.get() null-valued key returns the default", s5.get("nothing", "DEF"), "DEF");
+assert("struct.get() present key ignores the default", s5.get("myKey", "DEF"), "123");
+assertTrue("struct.get() default may be null", isNull(s5.get("nope", nullValue())));
+
+// --- structFind / struct.find: same contract ---
+assert("structFind() present key", structFind(s5, "OTHER"), 7);
+assertThrows("structFind() missing key throws", function(){ return structFind(s5, "nope"); });
+assertThrows("structFind() null-valued key throws", function(){ return structFind(s5, "nothing"); });
+assert("structFind() missing key returns the default", structFind(s5, "nope", "D2"), "D2");
+assert("struct.find() null-valued key returns the default", s5.find("nothing", "D3"), "D3");
 
 // --- user-defined function member shadows built-in member function ---
 // A struct key holding a closure whose name collides with a built-in member

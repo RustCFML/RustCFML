@@ -4146,6 +4146,10 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
     // component's public methods still enumerate even though they now live once
     // per class rather than per-instance. Plain structs have no table → == keys().
     let keys: Vec<String> = s.all_keys();
+    // A CFC's `variables` scope lists `this` and hides `__static` (Lucee).
+    if s.is_component_variables_scope() {
+        return cfml_common::component::variables_scope_keys(s, keys);
+    }
     // A Java-collection shim (e.g. createObject("java","java.util.LinkedHashMap"))
     // is a transparent map facade — its `__java_class`/`__java_shim` markers are
     // engine-internal and must never surface as struct keys (ColdBox's
@@ -4457,15 +4461,24 @@ fn fn_struct_update(args: Vec<CfmlValue>) -> CfmlResult {
     fn_struct_insert(args)
 }
 
+/// `structFind(struct, key [, default])`, and `struct.get(key [, default])`,
+/// which Lucee 7.1.1 gives the same contract: a missing key, or one holding
+/// null, throws unless a default is passed, and then the default is returned.
 fn fn_struct_find(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(s) = args.first().and_then(instance_public_as_struct) { let mut a = args; a[0] = s; return fn_struct_find(a); }
     if args.len() >= 2 {
         if let CfmlValue::Struct(s) = &args[0] {
             let key = args[1].as_string();
-            if let Some(actual_key) = struct_find_key_ci(s, &key) {
-                return Ok(s.get(&actual_key).unwrap_or(CfmlValue::Null));
-            }
-            return Ok(CfmlValue::Null);
+            let found = struct_find_key_ci(s, &key).map(|k| s.get(&k).unwrap_or(CfmlValue::Null));
+            return match (found, args.get(2)) {
+                (Some(CfmlValue::Null), None) => Err(CfmlError::expression(format!(
+                    "the value from key [{}]  is NULL, which is the same as not existing in CFML",
+                    key
+                ))),
+                (Some(CfmlValue::Null), Some(default)) | (None, Some(default)) => Ok(default.clone()),
+                (Some(v), _) => Ok(v),
+                (None, None) => Err(CfmlError::expression(format!("key [{}] doesn't exist", key))),
+            };
         }
     }
     Ok(CfmlValue::Null)
@@ -4721,7 +4734,11 @@ fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
     // members, matching Lucee (functions are ordinary struct values here).
     match args.first() {
         Some(CfmlValue::Struct(s)) if s.method_table().is_some() => {
-            Ok(CfmlValue::strukt(s.snapshot_with_methods()))
+            let mut copy = s.snapshot_with_methods();
+            if s.is_component_variables_scope() {
+                copy.retain(|k, _| !cfml_common::component::is_reserved_component_key(k.as_str()));
+            }
+            Ok(CfmlValue::strukt(copy))
         }
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::strukt(s.snapshot())),
         _ => Ok(CfmlValue::strukt(ValueMap::default())),
@@ -7343,10 +7360,14 @@ fn write_json_struct(s: &CfmlStruct, out: &mut String, visited: &mut Vec<usize>,
     // must too, or a struct built via structAppend(s, arguments) leaks
     // them into the JSON (Lucee has no such keys).
     let is_args = s.contains_key("__arguments_scope");
+    let is_variables_scope = s.is_component_variables_scope();
     out.push('{');
     let mut first = true;
     for (k, v) in s.iter() {
         if k.as_str() == cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER {
+            continue;
+        }
+        if is_variables_scope && cfml_common::component::is_reserved_component_key(k.as_str()) {
             continue;
         }
         if is_args
@@ -7531,9 +7552,13 @@ fn serialize_cfml_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
     let is_cfc = s.contains_key("__variables")
         && (s.contains_key("this") || s.contains_key("__name"));
     let is_args = s.contains_key("__arguments_scope");
+    let is_variables_scope = s.is_component_variables_scope();
     let items: Vec<String> = s
         .iter()
         .filter(|(k, _)| k.as_str() != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER)
+        .filter(|(k, _)| {
+            !is_variables_scope || !cfml_common::component::is_reserved_component_key(k.as_str())
+        })
         .filter(|(k, _)| {
             !is_args
                 || (k.as_str() != "__arguments_scope"
