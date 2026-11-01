@@ -58,6 +58,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [23](#23) | Custom-tag `caller` read of a shadowed key | 🌟 deferred |
 | [39](#39) | `.cfconfig.json` placeholders expand single-pass (GH #306) | 🌟 won't-fix |
 | [117](#117) | Dates are values, not shared objects; a few date edges (GH #441) | 🌟 by design |
+| [118](#118) | `cfthread`: a self-join returns at once; a thread outliving its request is not kept (GH #505) | 🌟 by design |
 
 **Part D — Implemented, with documented edges 🏗**
 
@@ -553,6 +554,23 @@ Precision beyond milliseconds is opt-in (`datePrecision`, GH [#479](https://gith
 
 The feature works. What follows are the known corners, scoping decisions and "by design"
 boundaries — not gaps to fix.
+
+<a id="118"></a>
+
+## 118. `cfthread` — where thread lifetimes differ from Lucee 🌟 *(divergence, GH [#505](https://github.com/RustCFML/RustCFML/issues/505))*
+
+Since v0.746.0 every thread a request starts, including threads started from
+other threads, is recorded in one registry for that request, as Lucee's root page
+context does. It backs `threadData()`, joins and `threadTerminate` by name across
+threads, and the "threads names must be unique within a request" check. A thread
+starts with an empty `cfthread` scope rather than a copy of its parent's
+(`tests/tags/test_cfthread_*.cfm`). What still differs:
+
+| Behaviour | Lucee 7.1 | RustCFML |
+|---|---|---|
+| A thread joins itself | Hangs until the join timeout | Returns at once |
+| A thread started after its request has ended | Not checked for a unique name (`PageContextImpl.release()` nulls the root's thread maps) | Same, and it is removed from the registry when it finishes, so a self-rescheduling chain holds only its running threads |
+| The tasks limit (`lucee.tasks.limit`, default 10,000) | System property | `RUSTCFML_TASKS_LIMIT` environment variable, same default; the oldest entry is evicted and can no longer be joined |
 
 <a id="5"></a>
 

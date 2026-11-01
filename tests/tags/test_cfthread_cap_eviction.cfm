@@ -5,7 +5,7 @@
 suiteBegin("cfthread: Cap eviction (RUSTCFML_TASKS_LIMIT)");
 
 // Check if limit is set for this test
-var limitEnv = server.system.environment.RUSTCFML_TASKS_LIMIT ?: "";
+limitEnv = server.system.environment.RUSTCFML_TASKS_LIMIT ?: "";
 if (limitEnv != "3") {
     // FAIL if env var not set - this test must run in CI with RUSTCFML_TASKS_LIMIT=3
     writeOutput("ERROR: test_cfthread_cap_eviction.cfm requires RUSTCFML_TASKS_LIMIT=3 but got: '" & limitEnv & "'" & chr(10));
@@ -47,13 +47,13 @@ assertTrue("cap_4 in scope", structKeyExists(cfthread, "cap_4"));
 assertTrue("cap_5 in scope", structKeyExists(cfthread, "cap_5"));
 
 // cap_1 and cap_2 should be evicted (oldest-first FIFO)
-var cap1Exists = structKeyExists(cfthread, "cap_1");
-var cap2Exists = structKeyExists(cfthread, "cap_2");
+cap1Exists = structKeyExists(cfthread, "cap_1");
+cap2Exists = structKeyExists(cfthread, "cap_2");
 assertFalse("cap_1 evicted from local scope", cap1Exists);
 assertFalse("cap_2 evicted from local scope", cap2Exists);
 
 // Joining an evicted thread should throw (Lucee parity)
-var joinEvictedThrew = false;
+joinEvictedThrew = false;
 try {
     thread action="join" name="cap_1";
 } catch (any e) {

@@ -1587,9 +1587,11 @@ impl Drop for CompletionGuard {
         
         // Item #4: Update the shared registry entry with final status/output/error/elapsed
         // so threadData() returns live data even for threads the spawner never joins.
-        if let (Some(registry), Some(name), Some(result)) = (&self.registry, &self.thread_name, &self.result) {
+        // Once the root request has ended, the entry is removed instead (see
+        // `RequestThreadRegistry::thread_finished`).
+        if let (Some(registry), Some(name)) = (&self.registry, &self.thread_name) {
             if let Ok(mut reg) = registry.write() {
-                reg.update_from_result(name, result);
+                reg.thread_finished(name, self.handle.as_ref(), self.result.as_ref());
             }
         }
     }
@@ -1662,6 +1664,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
                         Some(j) if !j.is_finished() => h.join.take(),
                         _ => None,
                     })
+                    .chain(vm.evicted_thread_joins.drain(..).filter(|j| !j.is_finished()))
                     .collect();
                 drop(vm);
                 if running_joins.is_empty() {
@@ -1989,8 +1992,9 @@ fn compile_and_run(
     // spawned by executors or long-lived threads share the root's registry Arc,
     // so this only clears when the ROOT request finishes (not child threads).
     // Serves both CLI (one-shot) and serve mode (per-request cleanup).
+    // Threads that outlive the request are then kept only while they run.
     if let Ok(mut reg) = vm.request_thread_registry.write() {
-        reg.clear();
+        reg.finish_request();
     }
     // Also clear the cfthread scope so it doesn't leak into the next request.
     // DO NOT clear vm.live_threads here: the cycle collector (below) needs to
@@ -2066,6 +2070,7 @@ fn compile_and_run(
                 Some(j) if !j.is_finished() => h.join.take(),
                 _ => None,
             })
+            .chain(vm.evicted_thread_joins.drain(..).filter(|j| !j.is_finished()))
             .collect();
         let any_running = !running_joins.is_empty();
         static GC_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

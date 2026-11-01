@@ -3329,6 +3329,10 @@ pub struct CfmlVirtualMachine {
     /// Live `cfthread` handles keyed by lowercased thread name, awaiting join.
     /// Empty and untouched for code that never spawns a thread.
     pub live_threads: HashMap<String, ThreadHandle>,
+    /// OS join handles of threads evicted from `live_threads` by the tasks
+    /// limit while still running. Nothing can join them by name any more, but
+    /// request end has to know they are running before it collects cycles.
+    pub evicted_thread_joins: Vec<std::thread::JoinHandle<()>>,
     /// Request-wide thread registry shared by all threads in this request
     /// (matching Lucee's root page context registry). Lets children join siblings
     /// or parent-spawned threads. Capped with FIFO eviction (default 10000).
@@ -4274,6 +4278,13 @@ pub struct RequestThreadRegistry {
     order: VecDeque<String>,
     /// Maximum number of entries (default 10000, matching Lucee).
     limit: usize,
+    /// Set when the root request ends. Lucee's `PageContextImpl.release()`
+    /// nulls the root's thread maps, so a thread chain that outlives its
+    /// request is no longer checked for unique names, and nothing keeps its
+    /// finished threads. Without this, a self-rescheduling chain left one
+    /// entry (metadata, output and `thread.*` values) per tick until the cap,
+    /// and a chain reusing one name collided with its own earlier tick.
+    root_finished: bool,
 }
 
 impl RequestThreadRegistry {
@@ -4282,6 +4293,7 @@ impl RequestThreadRegistry {
             entries: HashMap::new(),
             order: VecDeque::new(),
             limit,
+            root_finished: false,
         }
     }
 
@@ -4300,7 +4312,7 @@ impl RequestThreadRegistry {
         
         // Lucee throws on duplicate daemon names: "threads names must be unique within a request"
         // (ThreadTag.java L322-326)
-        if is_daemon && self.entries.contains_key(&key) {
+        if is_daemon && !self.root_finished && self.entries.contains_key(&key) {
             return Err(CfmlError::new(
                 format!("threads names must be unique within a request [{}]", name),
                 CfmlErrorType::Application
@@ -4484,6 +4496,43 @@ impl RequestThreadRegistry {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+    }
+
+    /// The root request has ended: drop every entry, and from now on keep a
+    /// thread only while it runs (see `root_finished`).
+    pub fn finish_request(&mut self) {
+        self.clear();
+        self.root_finished = true;
+    }
+
+    /// A thread has finished. While the root request runs, its entry keeps the
+    /// final status, output and `thread.*` values for `threadData()` and late
+    /// joins. Once the request has ended nobody can read them, so the entry is
+    /// removed instead — but only if it is still this thread's: a chain that
+    /// reuses a name may already have registered its next tick under it.
+    /// Waiters hold the completion handle itself, so a join in progress still
+    /// completes.
+    pub fn thread_finished(
+        &mut self,
+        name: &str,
+        completion: Option<&Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>>,
+        result: Option<&ThreadResult>,
+    ) {
+        if !self.root_finished {
+            if let Some(result) = result {
+                self.update_from_result(name, result);
+            }
+            return;
+        }
+        let key = name.to_lowercase();
+        let ours = match (self.entries.get(&key), completion) {
+            (Some(entry), Some(c)) => Arc::ptr_eq(&entry.completion, c),
+            _ => false,
+        };
+        if ours {
+            self.entries.remove(&key);
+            self.order.retain(|k| k != &key);
+        }
     }
 
     /// Get current size (for testing).
@@ -5541,6 +5590,7 @@ impl CfmlVirtualMachine {
             disallowed_imports: Vec::new(),
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
+            evicted_thread_joins: Vec::new(),
             request_thread_registry: Arc::new(RwLock::new(RequestThreadRegistry::new(tasks_limit))),
             cfthread_order: VecDeque::new(),
             cfthread_limit: tasks_limit,
@@ -7350,6 +7400,15 @@ impl CfmlVirtualMachine {
                 let cf2 = self.get_or_create_cfthread_scope();
                 if let Some(ts) = cf2.as_cfml_struct() {
                     ts.remove(&oldest);
+                }
+                // An evicted thread is unknown to a join, as on Lucee. Request
+                // end must still see it if it is running, so keep its OS join
+                // handle (see `evicted_thread_joins`).
+                if let Some(mut h) = self.live_threads.remove(&oldest) {
+                    self.evicted_thread_joins.retain(|j| !j.is_finished());
+                    if let Some(j) = h.join.take().filter(|j| !j.is_finished()) {
+                        self.evicted_thread_joins.push(j);
+                    }
                 }
             }
         }
@@ -48463,7 +48522,7 @@ mod app_datasource_binding_tests {
 #[cfg(test)]
 mod request_thread_registry_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     fn make_completion() -> Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)> {
         Arc::new((Mutex::new(None), std::sync::Condvar::new()))
@@ -48526,6 +48585,69 @@ mod request_thread_registry_tests {
         assert!(result.is_err(), "duplicate name should throw");
         let err = result.unwrap_err();
         assert!(err.message.to_lowercase().contains("unique"), "error should mention 'unique'");
+    }
+
+    fn finished(status: &str) -> ThreadResult {
+        ThreadResult {
+            status: status.to_string(),
+            output: String::new(),
+            error: String::new(),
+            error_struct: None,
+            mem_allocated: 0,
+            elapsed: 0,
+            thread_vars: ValueMap::default(),
+            return_value: None,
+        }
+    }
+
+    #[test]
+    fn registry_keeps_finished_threads_only_while_the_request_runs() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let during = make_completion();
+        reg.register("during".to_string(), cancel.clone(), during.clone(),
+            make_metadata("during", "RUNNING"), None, true).unwrap();
+        reg.thread_finished("during", Some(&during), Some(&finished("COMPLETED")));
+        assert!(reg.contains("during"), "kept for threadData() while the request runs");
+
+        reg.finish_request();
+        assert!(reg.is_empty());
+
+        // A chain that outlives the request: each tick is kept while it runs
+        // and removed when it finishes.
+        for i in 0..100 {
+            let c = make_completion();
+            let name = format!("tick{i}");
+            reg.register(name.clone(), cancel.clone(), c.clone(),
+                make_metadata(&name, "RUNNING"), None, true).unwrap();
+            assert!(reg.contains(&name));
+            reg.thread_finished(&name, Some(&c), Some(&finished("COMPLETED")));
+        }
+        assert!(reg.is_empty(), "finished threads after the request are not retained");
+    }
+
+    #[test]
+    fn registry_fixed_name_chain_survives_the_request() {
+        let mut reg = RequestThreadRegistry::new(10);
+        let cancel = Arc::new(AtomicBool::new(false));
+        reg.finish_request();
+
+        // Tick N spawns tick N+1 under the same name before it finishes itself.
+        let mut current = make_completion();
+        reg.register("heartbeat".to_string(), cancel.clone(), current.clone(),
+            make_metadata("heartbeat", "RUNNING"), None, true).unwrap();
+        for _ in 0..5 {
+            let next = make_completion();
+            reg.register("heartbeat".to_string(), cancel.clone(), next.clone(),
+                make_metadata("heartbeat", "RUNNING"), None, true)
+                .expect("a chain reusing its name must not collide after the request ends");
+            // The earlier tick finishing must not remove its successor's entry.
+            reg.thread_finished("heartbeat", Some(&current), Some(&finished("COMPLETED")));
+            assert!(reg.contains("heartbeat"));
+            current = next;
+        }
+        reg.thread_finished("heartbeat", Some(&current), Some(&finished("COMPLETED")));
+        assert!(reg.is_empty());
     }
 
     #[test]
