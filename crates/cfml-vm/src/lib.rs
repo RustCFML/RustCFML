@@ -7269,10 +7269,14 @@ impl CfmlVirtualMachine {
             let oldest_key = self.cfthread_order.front().cloned();
             if let Some(oldest) = oldest_key {
                 self.cfthread_order.pop_front();
-                // Remove from globals
+                // Remove from local cfthread scope
                 let cf2 = self.get_or_create_cfthread_scope();
                 if let Some(ts) = cf2.as_cfml_struct() {
                     ts.remove(&oldest);
+                }
+                // Also evict from registry (Lucee parity: joining evicted name throws)
+                if let Ok(mut reg) = self.request_thread_registry.write() {
+                    reg.remove(&oldest);
                 }
             }
         }
