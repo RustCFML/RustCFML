@@ -67,13 +67,14 @@ jobs:
         run: |
           RUSTCFML_TASKS_LIMIT=3 ./target/release/rustcfml --serve . --port 8612 > /tmp/cap_serve.log 2>&1 &
           PID=$!
-          trap "kill $PID 2>/dev/null; wait $PID 2>/dev/null" EXIT
+          # `|| true`: waiting on the killed server returns 143, and the EXIT
+          # trap's last status becomes the step's — failing a passing step.
+          trap "kill $PID 2>/dev/null; wait $PID 2>/dev/null || true" EXIT
           for i in $(seq 1 30); do
             [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8612/crab.svg)" = "200" ] && break
             sleep 1
           done
           curl -f -m 30 http://127.0.0.1:8612/tests/run_cap_eviction.cfm
-          kill $PID 2>/dev/null; wait $PID 2>/dev/null
 
       - name: Serve (production)
         run: ./scripts/serve-gate.sh ./target/release/rustcfml 8611 --production

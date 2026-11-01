@@ -18,15 +18,11 @@
 //! suite because these are `server.*` keys — server-level by design, so no
 //! app-level config can set them and `tests/runner.cfm` cannot ask for them.
 
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
 
 fn webroot() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server_hardening_app")
@@ -45,27 +41,33 @@ impl Drop for Server {
 }
 
 fn start_server() -> Server {
-    let port = free_port();
+    // `--port 0` and read the port back from the ready banner. Picking a free
+    // port first and passing it in raced the suite's other servers, which start
+    // in parallel: two tests could be handed the same port, one server failed
+    // to bind, and its test probed the OTHER test's server as "ready" and then
+    // got ConnectionRefused once that one shut down.
     let root = webroot();
-    let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
         .arg("--serve")
         .arg(&root)
         .arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .arg("--cfconfig")
         .arg(root.join(".cfconfig.json"))
+        .stdout(Stdio::piped())
         .spawn()
         .expect("spawn rustcfml --serve");
-    for _ in 0..200 {
-        // A socket whose local and peer addresses match connected to ITSELF (Linux
-        // TCP simultaneous open on an ephemeral-range port), not to a server.
-        if TcpStream::connect(("127.0.0.1", port))
-            .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let port = lines
+        .by_ref()
+        .map_while(Result::ok)
+        .find_map(|line| {
+            let addr = line.split("running on http://").nth(1)?;
+            addr.split_whitespace().next()?.rsplit(':').next()?.parse::<u16>().ok()
+        })
+        .expect("server exited before printing its ready banner");
+    // Keep draining stdout so the server never blocks on a full pipe.
+    std::thread::spawn(move || lines.for_each(drop));
     Server { child, port }
 }
 
