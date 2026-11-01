@@ -22,6 +22,40 @@ assert("mid(hello,2,3)", mid("hello", 2, 3), "ell");
 assert("left(hello,3)", left("hello", 3), "hel");
 assert("right(hello,3)", right("hello", 3), "llo");
 
+// left() and right() with negative counts (GitHub #504)
+testString = "/a.b";
+assert("left(/a.b, -5)", left(testString, -5), "/a.b");
+assert("left(/a.b, -4)", left(testString, -4), "/a.b");
+assert("left(/a.b, -3)", left(testString, -3), "/");
+assert("left(/a.b, -2)", left(testString, -2), "/a");
+assert("left(/a.b, -1)", left(testString, -1), "/a.");
+assert("left(/a.b, 1)", left(testString, 1), "/");
+assert("left(/a.b, 2)", left(testString, 2), "/a");
+assert("left(/a.b, 3)", left(testString, 3), "/a.");
+assert("left(/a.b, 4)", left(testString, 4), "/a.b");
+assert("left(/a.b, 5)", left(testString, 5), "/a.b");
+assert("right(/a.b, -5)", right(testString, -5), "/a.b");
+assert("right(/a.b, -4)", right(testString, -4), "/a.b");
+assert("right(/a.b, -3)", right(testString, -3), "b");
+assert("right(/a.b, -2)", right(testString, -2), ".b");
+assert("right(/a.b, -1)", right(testString, -1), "a.b");
+assert("right(/a.b, 1)", right(testString, 1), "b");
+assert("right(/a.b, 2)", right(testString, 2), ".b");
+assert("right(/a.b, 3)", right(testString, 3), "a.b");
+assert("right(/a.b, 4)", right(testString, 4), "/a.b");
+assert("right(/a.b, 5)", right(testString, 5), "/a.b");
+assertThrows("left() with count=0 throws", function() { left("test", 0); });
+assertThrows("right() with count=0 throws", function() { right("test", 0); });
+
+// left() and right() with multibyte characters and negative counts
+mbString = "café";
+assert("left(café, -1)", left(mbString, -1), "caf");
+assert("left(café, -2)", left(mbString, -2), "ca");
+assert("left(café, 3)", left(mbString, 3), "caf");
+assert("right(café, -1)", right(mbString, -1), "afé");
+assert("right(café, -2)", right(mbString, -2), "fé");
+assert("right(café, 3)", right(mbString, 3), "afé");
+
 // --- replace / replaceNoCase ---
 assert("replace ll with r", replace("hello", "ll", "r"), "hero");
 assert("replaceNoCase hello->world", replaceNoCase("Hello", "hello", "world"), "world");
