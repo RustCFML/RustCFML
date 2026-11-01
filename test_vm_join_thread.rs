@@ -250,4 +250,106 @@ mod vm_join_thread_tests {
         assert!(!names.contains(&"parent".to_string()), "should exclude parent");
         assert!(names.contains(&"sibling".to_string()), "should include sibling");
     }
+
+    #[test]
+    fn vm_join_thread_panic_disconnects_and_reads_terminated_from_registry() {
+        // Test that when a thread panics (channel disconnects), join_thread
+        // reads TERMINATED status from registry instead of timing out
+        let program = make_empty_program();
+        let mut vm = CfmlVirtualMachine::new(program);
+        
+        let thread_name = "panic_test";
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        
+        let mut metadata = ValueMap::default();
+        metadata.insert("name".to_string(), CfmlValue::string(thread_name.to_string()));
+        metadata.insert("status".to_string(), CfmlValue::string("RUNNING".to_string()));
+        
+        // Register in registry
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            reg.register(
+                thread_name.to_string(),
+                cancel.clone(),
+                completion.clone(),
+                CfmlValue::strukt(metadata),
+                None,
+                true,
+            ).unwrap();
+        }
+        
+        // Simulate a panic: channel disconnects and registry has TERMINATED with error
+        let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
+        drop(tx); // Disconnect channel (simulates panic drop)
+        
+        // Update registry to TERMINATED with error struct (CompletionGuard does this)
+        let mut error_map = ValueMap::default();
+        error_map.insert("message".to_string(), CfmlValue::string("Thread panicked".to_string()));
+        error_map.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+        
+        let result = ThreadResult {
+            status: "TERMINATED".to_string(),
+            output: String::new(),
+            error: String::new(),
+            mem_allocated: 0,
+            error_struct: Some(CfmlValue::strukt(error_map)),
+            elapsed: 0,
+            thread_vars: ValueMap::default(),
+            return_value: None,
+        };
+        
+        if let Ok(mut reg) = vm.request_thread_registry.write() {
+            reg.update_from_result(thread_name, &result);
+        }
+        
+        // Create ThreadHandle with disconnected channel
+        let handle = ThreadHandle {
+            name: thread_name.to_string(),
+            rx,
+            cancel: cancel.clone(),
+            join: None, // No join handle since this is simulated
+            result: None,
+        };
+        
+        vm.live_threads.insert(thread_name.to_lowercase(), handle);
+        
+        // Join should read TERMINATED from registry and complete promptly (not timeout)
+        let start = std::time::Instant::now();
+        let join_result = vm.join_thread(thread_name, 5000);
+        let elapsed = start.elapsed();
+        
+        assert!(join_result.is_ok(), "join should succeed even after panic");
+        assert!(elapsed < Duration::from_millis(500), "join should complete promptly reading from registry, not timeout");
+        
+        // Verify the thread is marked TERMINATED in cfthread scope with error struct
+        let cfthread = vm.get_or_create_cfthread_scope();
+        if let Some(ts) = cfthread.as_cfml_struct() {
+            if let Some(thread_result) = ts.get(&thread_name.to_lowercase()) {
+                if let Some(result_struct) = thread_result.as_cfml_struct() {
+                    // Status should be TERMINATED
+                    if let Some(status) = result_struct.get("status") {
+                        let status_str = status.as_string();
+                        assert_eq!(status_str.as_str(), "TERMINATED", "status should be TERMINATED after panic");
+                    }
+                    
+                    // Error should be a struct with message and type
+                    if let Some(error) = result_struct.get("error") {
+                        if let Some(error_struct) = error.as_cfml_struct() {
+                            assert!(error_struct.contains_key("message"), "error should have message field");
+                            assert!(error_struct.contains_key("type"), "error should have type field");
+                            
+                            if let Some(msg) = error_struct.get("message") {
+                                let msg_str = msg.as_string();
+                                assert!(msg_str.contains("panic"), "error message should mention panic");
+                            }
+                        } else {
+                            panic!("error should be a struct, got: {:?}", error);
+                        }
+                    } else {
+                        panic!("TERMINATED thread should have error field");
+                    }
+                }
+            }
+        }
+    }
 }

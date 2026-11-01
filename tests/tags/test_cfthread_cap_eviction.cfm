@@ -7,8 +7,9 @@ suiteBegin("cfthread: Cap eviction (RUSTCFML_TASKS_LIMIT)");
 // Check if limit is set for this test
 var limitEnv = server.system.environment.RUSTCFML_TASKS_LIMIT ?: "";
 if (limitEnv != "3") {
-    // Skip if not running with the test limit
-    assertTrue("RUSTCFML_TASKS_LIMIT test requires env var set to 3 (skipped)", true);
+    // FAIL if env var not set - this test must run in CI with RUSTCFML_TASKS_LIMIT=3
+    writeOutput("ERROR: test_cfthread_cap_eviction.cfm requires RUSTCFML_TASKS_LIMIT=3 but got: '" & limitEnv & "'" & chr(10));
+    assertTrue("RUSTCFML_TASKS_LIMIT=3 required (got: '" & limitEnv & "')", false);
     suiteEnd();
     return;
 }
