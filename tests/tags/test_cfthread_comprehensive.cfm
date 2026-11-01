@@ -300,6 +300,19 @@ if (structKeyExists(unjoinedData, "unjoined_test")) {
     assert("unjoined thread has result", unjoinedData.unjoined_test.result, "completed_value");
 }
 
+// Test 11b: threadData() called from inside a cfthread (Lucee ThreadData.java L19-24)
+request.childThreadData = {};
+thread name="child_caller" {
+    sleep(50);
+    // Child calls threadData() - should see root's direct children, not empty
+    request.childThreadData = threadData();
+}
+thread action="join" name="child_caller";
+assertTrue("child thread saw threadData", structKeyExists(request.childThreadData, "child_caller"));
+if (structKeyExists(request.childThreadData, "child_caller")) {
+    assert("child saw itself as COMPLETED", request.childThreadData.child_caller.status, "COMPLETED");
+}
+
 // Test 12: Stress test - N threads with cross-joins and siblings joining each other
 var stressStart = getTickCount();
 var stressThreadCount = 10;

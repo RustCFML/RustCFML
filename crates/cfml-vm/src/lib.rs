@@ -4245,16 +4245,12 @@ pub struct RequestThreadEntry {
     pub name: String,
     /// Cooperative-cancel flag shared with the running body.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Java-style interrupt flag (cleared by Thread.interrupted()).
-    pub interrupted: Arc<std::sync::atomic::AtomicBool>,
     /// Shared completion handle: any thread can wait on this.
     /// (Mutex<Option<ThreadResult>>, Condvar) - None while running, Some when done.
     pub completion: Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>,
     /// Metadata struct for the `cfthread.NAME` entry (status, output, etc.).
     /// Updated when the thread completes.
     pub metadata: CfmlValue,
-    /// Insertion order sequence number, for FIFO eviction.
-    pub seq: u64,
     /// Parent thread name (lowercase), if spawned from another daemon thread.
     /// Used for no-name join's ancestor exclusion (Lucee getAllNoneAncestorThreads).
     pub parent: Option<String>,
@@ -4270,8 +4266,6 @@ pub struct RequestThreadRegistry {
     entries: HashMap<String, RequestThreadEntry>,
     /// Insertion order queue (thread names) for FIFO eviction.
     order: VecDeque<String>,
-    /// Next sequence number for insertion order tracking.
-    next_seq: u64,
     /// Maximum number of entries (default 10000, matching Lucee).
     limit: usize,
 }
@@ -4281,7 +4275,6 @@ impl RequestThreadRegistry {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
-            next_seq: 0,
             limit,
         }
     }
@@ -4292,7 +4285,6 @@ impl RequestThreadRegistry {
         &mut self,
         name: String,
         cancel: Arc<std::sync::atomic::AtomicBool>,
-        interrupted: Arc<std::sync::atomic::AtomicBool>,
         completion: Arc<(Mutex<Option<ThreadResult>>, std::sync::Condvar)>,
         metadata: CfmlValue,
         parent: Option<String>,
@@ -4316,16 +4308,11 @@ impl RequestThreadRegistry {
             }
         }
         
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        
         let entry = RequestThreadEntry {
             name: name.clone(),
             cancel,
-            interrupted,
             completion,
             metadata,
-            seq,
             parent,
             is_daemon,
         };
@@ -4340,23 +4327,12 @@ impl RequestThreadRegistry {
         Ok(())
     }
 
-    /// Signal completion for a thread (called when thread finishes).
-    /// Stores the result and wakes all waiting threads.
-    pub fn signal_completion(&self, name: &str, result: ThreadResult) {
-        let key = name.to_lowercase();
-        if let Some(entry) = self.entries.get(&key) {
-            let (lock, cvar) = &*entry.completion;
-            // Recover from poisoning: we still want to deliver the result
-            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(result);
-            cvar.notify_all();
-        }
-    }
-
     /// Wait for a thread to complete with optional timeout (matching Lucee's join).
     /// Returns the ThreadResult if the thread completed, Err if not found, or times out.
     /// Fixes B2 (deadlock): clones the handle under lock, drops guard, then waits.
     /// Fixes B3 (spurious wakeup): loops while None, with fixed deadline.
+    /// Only used in tests.
+    #[cfg(test)]
     pub fn wait_for_completion(&self, name: &str, timeout_ms: i64) -> Result<ThreadResult, String> {
         let key = name.to_lowercase();
         
@@ -4516,18 +4492,20 @@ impl RequestThreadRegistry {
 
     /// Update thread metadata from ThreadResult (for CompletionGuard live updates).
     /// Updates status, output, error, elapsedtime, and copies thread.* scope values.
-    /// Matches Lucee ThreadsImpl.java L150-161, L265-267: error only when failed.
+    /// Matches Lucee ThreadsImpl.java L150-161, L265-267: error struct and zero ELAPSEDTIME for TERMINATED.
     pub fn update_from_result(&mut self, name: &str, result: &ThreadResult) {
         let key = name.to_lowercase();
         if let Some(entry) = self.entries.get_mut(&key) {
             if let CfmlValue::Struct(ref mut s) = entry.metadata {
                 s.insert("status".to_string(), CfmlValue::string(result.status.clone()));
                 s.insert("output".to_string(), CfmlValue::string(result.output.clone()));
-                // Lucee only includes "error" when the thread failed (not empty string)
-                if !result.error.is_empty() {
-                    s.insert("error".to_string(), CfmlValue::string(result.error.clone()));
+                // Lucee ThreadsImpl L158: use error_struct, not string
+                if let Some(ref err_struct) = result.error_struct {
+                    s.insert("error".to_string(), err_struct.clone());
                 }
-                s.insert("elapsedtime".to_string(), CfmlValue::Int(result.elapsed));
+                // Lucee ThreadsImpl L151: ELAPSEDTIME 0 for TERMINATED threads
+                let elapsed_time = if result.status == "TERMINATED" { 0 } else { result.elapsed };
+                s.insert("elapsedtime".to_string(), CfmlValue::Int(elapsed_time));
                 // Copy all thread.* scope values into the metadata (scenario 11: result, etc.)
                 for (k, v) in &result.thread_vars {
                     s.insert(k.clone(), v.clone());
@@ -4536,23 +4514,11 @@ impl RequestThreadRegistry {
         }
     }
 
-    /// Look up a thread's interrupt flag by name.
-    pub fn get_interrupted_flag(&self, name: &str) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        self.entries
-            .get(&name.to_lowercase())
-            .map(|e| e.interrupted.clone())
-    }
-
     /// Get thread metadata by name.
     pub fn get_metadata(&self, name: &str) -> Option<CfmlValue> {
         self.entries
             .get(&name.to_lowercase())
             .map(|e| e.metadata.clone())
-    }
-
-    /// Get all thread names in the registry.
-    pub fn all_names(&self) -> Vec<String> {
-        self.entries.keys().cloned().collect()
     }
 }
 
@@ -7137,7 +7103,7 @@ impl CfmlVirtualMachine {
                             let _ = j.join(); // Reap the panicked thread
                         }
                         // Try to read TERMINATED result from registry
-                        if let Ok(reg) = self.request_thread_registry.read() {
+                        let from_registry = if let Ok(reg) = self.request_thread_registry.read() {
                             if let Some(meta) = reg.get_metadata(name) {
                                 if let CfmlValue::Struct(ref s) = meta {
                                     // Build a ThreadResult from the metadata
@@ -7154,7 +7120,7 @@ impl CfmlVirtualMachine {
                                     } else {
                                         0
                                     };
-                                    let res = ThreadResult {
+                                    Some(ThreadResult {
                                         status,
                                         output,
                                         error,
@@ -7163,9 +7129,7 @@ impl CfmlVirtualMachine {
                                         elapsed,
                                         thread_vars: ValueMap::default(),
                                         return_value: None,
-                                    };
-                                    handle.result = Some(res.clone());
-                                    Some(res)
+                                    })
                                 } else {
                                     None
                                 }
@@ -7173,8 +7137,27 @@ impl CfmlVirtualMachine {
                                 None
                             }
                         } else {
-                            None // can't read registry, treat as timeout
-                        }
+                            None
+                        };
+                        
+                        // If registry entry was evicted/cleared, construct a TERMINATED result
+                        let res = from_registry.unwrap_or_else(|| {
+                            let mut error_struct_map = ValueMap::default();
+                            error_struct_map.insert("message".to_string(), CfmlValue::string("Thread terminated".to_string()));
+                            error_struct_map.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+                            ThreadResult {
+                                status: "TERMINATED".to_string(),
+                                output: String::new(),
+                                error: "Thread terminated".to_string(),
+                                mem_allocated: 0,
+                                error_struct: Some(CfmlValue::strukt(error_struct_map)),
+                                elapsed: 0,
+                                thread_vars: ValueMap::default(),
+                                return_value: None,
+                            }
+                        });
+                        handle.result = Some(res.clone());
+                        Some(res)
                     }
                 }
             };
@@ -7373,10 +7356,7 @@ impl CfmlVirtualMachine {
         if let Some(ts) = thread_struct.as_cfml_struct() {
             ts.insert(key.clone(), metadata_value.clone());
         }
-        // Signal completion in the request-wide registry and update metadata
-        if let Ok(reg) = self.request_thread_registry.read() {
-            reg.signal_completion(thread_name, r);
-        }
+        // Update metadata in the request-wide registry
         if let Ok(mut reg) = self.request_thread_registry.write() {
             reg.update_metadata(thread_name, metadata_value);
         }
@@ -24553,7 +24533,6 @@ impl CfmlVirtualMachine {
                         // Create seed, completion handle, and flags BEFORE spawn
                         let mut seed = self.build_thread_seed(callback, attributes.clone());
                         let completion = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
-                        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let cancel_flag = seed.cancel_flag.clone();
                         
                         // Pass completion handle and thread name through seed (B1 fix)
@@ -24585,7 +24564,6 @@ impl CfmlVirtualMachine {
                             if let Err(e) = reg.register(
                                 thread_name.clone(),
                                 cancel_flag.clone(),
-                                interrupted,
                                 completion.clone(),
                                 CfmlValue::strukt(metadata),
                                 parent_name,
@@ -24733,18 +24711,9 @@ impl CfmlVirtualMachine {
                 // S5: threadData() returns the request-wide cfthread registry view (Lucee parity)
                 "threaddata" => {
                     // Lucee ThreadData.java L19-24: return root page context's cfthread struct
-                    // Only returns the ROOT request's DIRECT children (not all threads).
+                    // ALWAYS returns the ROOT request's DIRECT children, regardless of caller.
                     if let Ok(reg) = self.request_thread_registry.read() {
-                        // If this VM is a child thread, walk up to find root's children
-                        // If this VM is root (no cfml_thread_name), return threads with no parent
-                        let metadata = if self.cfml_thread_name.is_none() {
-                            // Root request: return only threads with no parent (direct children)
-                            reg.get_root_children_metadata()
-                        } else {
-                            // Child thread: for now return empty (Lucee behavior unclear for this case)
-                            // The spawner should call this, not the child
-                            ValueMap::default()
-                        };
+                        let metadata = reg.get_root_children_metadata();
                         return Ok(CfmlValue::strukt(metadata));
                     }
                     // If registry is unavailable, return empty struct

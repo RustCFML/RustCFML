@@ -1563,11 +1563,16 @@ impl Drop for CompletionGuard {
             // instead of None, so waiters see a completed thread rather than hanging forever
             if self.result.is_none() {
                 if std::thread::panicking() {
+                    // Create a proper error struct (Lucee ThreadsImpl L158 parity)
+                    let mut error_struct_map = cfml_common::dynamic::ValueMap::default();
+                    error_struct_map.insert("message".to_string(), cfml_common::dynamic::CfmlValue::string("Thread panicked".to_string()));
+                    error_struct_map.insert("type".to_string(), cfml_common::dynamic::CfmlValue::string("Application".to_string()));
+                    
                     self.result = Some(cfml_vm::ThreadResult {
                         status: "TERMINATED".to_string(),
                         output: String::new(),
                         error: "Thread panicked".to_string(),
-                        error_struct: None,
+                        error_struct: Some(cfml_common::dynamic::CfmlValue::strukt(error_struct_map)),
                         mem_allocated: 0,
                         elapsed: 0,
                         thread_vars: cfml_common::dynamic::ValueMap::default(),
