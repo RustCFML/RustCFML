@@ -1,17 +1,46 @@
 <cfscript>
 // Test cap eviction with RUSTCFML_TASKS_LIMIT
 // This test requires RUSTCFML_TASKS_LIMIT=3 environment variable
+// Runs standalone (not through runner.cfm) in CI
 
-suiteBegin("cfthread: Cap eviction (RUSTCFML_TASKS_LIMIT)");
+var passed = 0;
+var failed = 0;
+
+function assert(label, actual, expected) {
+    if (actual == expected) {
+        passed++;
+    } else {
+        failed++;
+        writeOutput("FAIL: " & label & " | expected: " & expected & " | got: " & actual & chr(10));
+    }
+}
+
+function assertTrue(label, condition) {
+    if (condition) {
+        passed++;
+    } else {
+        failed++;
+        writeOutput("FAIL: " & label & " | expected truthy | got: [" & condition & "]" & chr(10));
+    }
+}
+
+function assertFalse(label, condition) {
+    if (!condition) {
+        passed++;
+    } else {
+        failed++;
+        writeOutput("FAIL: " & label & " | expected falsy | got: [" & condition & "]" & chr(10));
+    }
+}
+
+writeOutput("=== cfthread: Cap eviction (RUSTCFML_TASKS_LIMIT) ===" & chr(10));
 
 // Check if limit is set for this test
 var limitEnv = server.system.environment.RUSTCFML_TASKS_LIMIT ?: "";
 if (limitEnv != "3") {
     // FAIL if env var not set - this test must run in CI with RUSTCFML_TASKS_LIMIT=3
     writeOutput("ERROR: test_cfthread_cap_eviction.cfm requires RUSTCFML_TASKS_LIMIT=3 but got: '" & limitEnv & "'" & chr(10));
-    assertTrue("RUSTCFML_TASKS_LIMIT=3 required (got: '" & limitEnv & "')", false);
-    suiteEnd();
-    return;
+    throw(message="RUSTCFML_TASKS_LIMIT=3 required (got: '" & limitEnv & "')");
 }
 
 // Spawn 5 threads with limit of 3 - oldest should be evicted
@@ -62,5 +91,10 @@ try {
 }
 assertTrue("joining evicted thread threw", joinEvictedThrew);
 
-suiteEnd();
+// Summary
+writeOutput(chr(10) & "SUMMARY: " & passed & "/" & (passed + failed) & " passed" & chr(10));
+if (failed > 0) {
+    throw(message="Cap eviction test failed: " & failed & " assertion(s) failed");
+}
+writeOutput("PASS" & chr(10));
 </cfscript>
