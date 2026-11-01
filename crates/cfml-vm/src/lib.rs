@@ -7274,9 +7274,11 @@ impl CfmlVirtualMachine {
                 if let Some(ts) = cf2.as_cfml_struct() {
                     ts.remove(&oldest);
                 }
-                // Also evict from registry (Lucee parity: joining evicted name throws)
+                // Also evict from live_threads and registry (Lucee parity: joining evicted name throws)
+                self.live_threads.remove(&oldest);
                 if let Ok(mut reg) = self.request_thread_registry.write() {
-                    reg.remove(&oldest);
+                    reg.entries.remove(&oldest);
+                    reg.order.retain(|k| k != &oldest);
                 }
             }
         }
