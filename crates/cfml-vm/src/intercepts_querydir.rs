@@ -27,6 +27,39 @@ pub(crate) fn handles(name_lower: &str) -> bool {
 }
 
 impl CfmlVirtualMachine {
+    /// Validate a directory filter UDF/closure signature before use.
+    /// Per Lucee UDFFilter.java:
+    /// - Return type must be boolean or any
+    /// - At most 3 parameters
+    /// - With exactly 1 parameter, it must be string or any
+    fn validate_directory_filter(filter: &CfmlValue) -> Result<(), CfmlError> {
+        if let CfmlValue::Function(func) = filter {
+            let param_count = func.params.len();
+            
+            // Check parameter count (max 3)
+            if param_count > 3 {
+                return Err(CfmlError::runtime(format!(
+                    "Directory filter function must have at most 3 parameters, got {}",
+                    param_count
+                )));
+            }
+            
+            // If exactly 1 param, check its type (must be string or any)
+            if param_count == 1 {
+                if let Some(param) = func.params.first() {
+                    let param_type = param.param_type.as_ref().map(|s| s.to_lowercase()).unwrap_or_else(|| "any".to_string());
+                    if param_type != "any" && param_type != "string" {
+                        return Err(CfmlError::runtime(format!(
+                            "Single-parameter filter must have type string or any, got {}",
+                            param_type
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Bodies moved VERBATIM from `call_function`: `args` stays an owned `Vec` exactly as
     /// it was in the original scope, so `?`, `return Ok(..)`, `&args` and `args.into_iter()`
     /// all still work and the diff is a pure move. The caller checks [`handles`] first, so
@@ -44,7 +77,12 @@ impl CfmlVirtualMachine {
                         .map(|v| v.as_string().to_lowercase())
                         .unwrap_or_else(|| "list".to_string());
                     if action == "list" {
-                        return self.cfdirectory_list_from_opts(opts, parent_locals);
+                        // Check if filter is a closure/UDF
+                        if let Some(CfmlValue::Function(_)) = opts.get_ci("filter") {
+                            return self.cfdirectory_list_with_closure(opts, parent_locals);
+                        }
+                        // String filter: use the lib.rs implementation (which calls this method)
+                        // We need to NOT return here for string filters - let it fall through
                     } else if action == "copy" {
                         return self.cfdirectory_copy_from_opts(opts, parent_locals);
                     }
@@ -95,6 +133,9 @@ impl CfmlVirtualMachine {
         };
         let sort = args.get(4).map(|v| v.as_string()).unwrap_or_default();
         let type_filter = args.get(5).map(|v| v.as_string().to_lowercase()).unwrap_or_else(|| "all".to_string());
+
+        // Validate filter signature
+        Self::validate_directory_filter(&filter)?;
 
         // Validate type
         let type_filter_trimmed = type_filter.trim();
@@ -420,6 +461,48 @@ impl CfmlVirtualMachine {
     }
 
     /// cfdirectory action=copy with closure filter support
+    fn cfdirectory_list_with_closure(
+        &mut self,
+        opts: &CfmlStruct,
+        parent_locals: &ValueMap,
+    ) -> CfmlResult {
+        let dir = opts
+            .get_ci("directory")
+            .map(|v| v.as_string())
+            .unwrap_or_default();
+        let filter = opts
+              .get_ci("filter")
+              .unwrap_or_else(|| CfmlValue::string("*"));
+        let recurse = opts
+            .get_ci("recurse")
+            .map(|v| v.is_true())
+            .unwrap_or(false);
+        let list_info = opts
+            .get_ci("listinfo")
+            .map(|v| v.as_string().to_lowercase())
+            .unwrap_or_else(|| "all".to_string());
+        let sort = opts
+            .get_ci("sort")
+            .map(|v| v.as_string())
+            .unwrap_or_default();
+        let type_filter = opts
+            .get_ci("type")
+            .map(|v| v.as_string().to_lowercase())
+            .unwrap_or_else(|| "all".to_string());
+        
+        // Build args for directory_list_with_closure: (path, recurse, listInfo, filter, sort, type)
+        let args = vec![
+            CfmlValue::string(dir),
+            CfmlValue::Bool(recurse),
+            CfmlValue::string(list_info),
+            filter,
+            CfmlValue::string(sort),
+            CfmlValue::string(type_filter),
+        ];
+        
+        self.directory_list_with_closure(args, parent_locals)
+    }
+
     fn cfdirectory_copy_from_opts(
         &mut self,
         opts: &CfmlStruct,
