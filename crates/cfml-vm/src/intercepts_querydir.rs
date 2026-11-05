@@ -197,6 +197,13 @@ impl CfmlVirtualMachine {
             self.closure_parent_deletes = None;
             let keep = self.call_function(&filter, cb_args, parent_locals)?;
             
+            // Check for null/undefined return (Lucee throws on this)
+            if matches!(keep, CfmlValue::Null) {
+                return Err(CfmlError::runtime(
+                    "Can't cast String [] to a boolean".to_string()
+                ));
+            }
+            
             // Coerce return value to boolean
             let should_include = keep.to_condition().map_err(|e| {
                 CfmlError::runtime(format!("Can't cast {} to a boolean", e))
@@ -383,6 +390,13 @@ impl CfmlVirtualMachine {
             self.closure_parent_deletes = None;
             let keep = self.call_function(filter, cb_args, parent_locals)?;
 
+            // Check for null/undefined return (Lucee throws on this)
+            if matches!(keep, CfmlValue::Null) {
+                return Err(CfmlError::runtime(
+                    "Can't cast String [] to a boolean".to_string()
+                ));
+            }
+
             let should_copy = keep.to_condition().map_err(|e| {
                 CfmlError::runtime(format!("Can't cast {} to a boolean", e))
             })?;
@@ -448,6 +462,13 @@ impl CfmlVirtualMachine {
                     self.closure_parent_writeback = None;
                     self.closure_parent_deletes = None;
                     let keep = self.call_function(filter, cb_args, parent_locals)?;
+                    
+                    // Check for null/undefined return (Lucee throws on this)
+                    if matches!(keep, CfmlValue::Null) {
+                        return Err(CfmlError::runtime(
+                            "Can't cast String [] to a boolean".to_string()
+                        ));
+                    }
                     
                     let should_keep = keep.to_condition().unwrap_or(true);
                     if !should_keep {
