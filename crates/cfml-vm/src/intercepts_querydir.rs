@@ -35,7 +35,7 @@ impl CfmlVirtualMachine {
         &mut self,
         name_lower: &str,
         args: Vec<CfmlValue>,
-        _parent_locals: &ValueMap,
+        parent_locals: &ValueMap,
     ) -> CfmlResult {
             if matches!(name_lower, "cfdirectory" | "__cfdirectory") {
                 if let Some(CfmlValue::Struct(opts)) = args.first() {
@@ -134,7 +134,6 @@ impl CfmlVirtualMachine {
 
         // Filter with closure
         let mut filtered = Vec::new();
-        let mut pl: Option<ValueMap> = None;
         for (name, full_path, is_dir) in entries {
             let entry_type = if is_dir { "directory" } else { "file" };
             let extension = if is_dir {
