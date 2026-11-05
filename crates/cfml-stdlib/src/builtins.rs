@@ -9563,110 +9563,30 @@ fn fn_directory_delete(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // directoryList(path [, recurse [, listInfo [, filter [, sort [, type]]]]])
+    //
+    // When the filter is a closure or UDF, the VM intercepts this call (see
+    // `intercepts_querydir.rs`). This body handles only string patterns.
     let path = get_str(&args, 0);
     let recurse = if args.len() >= 2 { args[1].is_true() } else { false };
     let list_info = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "path".to_string() };
     let filter = if args.len() >= 4 { get_str(&args, 3) } else { String::new() };
-    // 5th arg `sort` — applied to the QUERY form only; Lucee returns the
-    // `name`/`path` arrays in filesystem order whatever it says.
     let sort = if args.len() >= 5 { get_str(&args, 4) } else { String::new() };
-    // 6th arg `type` (dir|file|all, default all) — Lucee parity. Wheels' plugin
-    // loader uses directoryList(..., "dir") to enumerate only sub-directories.
+    // 6th arg `type` (dir|file|directory|all) — Lucee parity.
     let type_filter = if args.len() >= 6 { get_str(&args, 5).to_lowercase() } else { "all".to_string() };
 
-    // A filter is a pipe-delimited list of glob patterns (e.g. "*.cfm|*.cfc") —
-    // match if ANY sub-pattern matches. Each sub-pattern is compiled ONCE here
-    // (not per directory entry): a wildcard-free pattern (Sticker's asset lookups
-    // pass an exact filename like "user.svg") becomes a cheap case-insensitive
-    // string compare with no regex at all; a glob compiles to a single anchored,
-    // case-insensitive regex reused across every entry. Compiling per-entry made
-    // a filtered scan of a 1000-file dir do ~1000 regex compilations — Preside's
-    // Sticker re-scans a FontAwesome icon dir hundreds of times per request, so
-    // the old code cost ~500K compilations and pinned /admin at ~100s of CPU.
-    // …but `compile_filter` still ran on every directoryList CALL, so a repeated
-    // scan recompiled the same glob each time — 187 MiB of allocation churn on a
-    // live Preside request. The derived regex depends only on the glob text, so
-    // memoize it. Keyed by the glob (not the derived pattern) to skip rebuilding
-    // the translation too. Deliberately a separate cache from REGEX_CACHE: these
-    // patterns are already Rust-syntax, and must NOT go through
-    // `translate_cfml_regex`, whose CFML/Java rewrites would change their meaning.
-    static GLOB_RX_CACHE: Lazy<std::sync::RwLock<HashMap<String, std::sync::Arc<Regex>>>> =
-        Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
-    // Bounded and cleared wholesale when full (REGEX_CACHE, which can see
-    // request-supplied patterns, evicts least-recently-used instead): globs come
-    // from application code, so the set is small in practice, but it must not
-    // be unbounded.
-    const GLOB_RX_CACHE_CAP: usize = 1024;
+    // Lucee-style wildcard pattern matcher (case-sensitive on Linux/macOS,
+    // insensitive on Windows). Compiled once per call; cheaper than regex.
+    let wildcard = cfml_common::wildcard::WildcardPattern::new(&filter, "|");
 
-    enum PatMatcher {
-        Exact(String),              // lowercased literal — case-insensitive equality
-        Rx(std::sync::Arc<Regex>),  // compiled glob, shared so the scratch pool stays warm
-        Contains(String),           // lowercased fallback for a malformed glob
-    }
-    fn compile_filter(filter: &str) -> Vec<PatMatcher> {
-        if filter.is_empty() {
-            return Vec::new();
-        }
-        filter
-            .split('|')
-            // Lucee trims each sub-pattern, so a stray space in application code
-            // ("*.css | *.min.js", or a hand-typed exact filename with a trailing
-            // space) still matches. We used to compare the raw slice, which made
-            // such a filter silently match nothing — Preside's Sticker turns
-            // `addAsset( path="/js/lib/x.min.js " )` into an exact-name filter and
-            // threw Sticker.missingAsset for a file that was right there on disk.
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|pattern| {
-                if !pattern.contains('*') && !pattern.contains('?') {
-                    return PatMatcher::Exact(pattern.to_lowercase());
-                }
-                if let Some(rx) = GLOB_RX_CACHE.read().unwrap().get(pattern) {
-                    return PatMatcher::Rx(std::sync::Arc::clone(rx));
-                }
-                let mut re = String::with_capacity(pattern.len() + 8);
-                re.push_str("(?i)^");
-                for ch in pattern.chars() {
-                    match ch {
-                        '*' => re.push_str(".*"),
-                        '?' => re.push('.'),
-                        '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' | '|' => {
-                            re.push('\\');
-                            re.push(ch);
-                        }
-                        _ => re.push(ch),
-                    }
-                }
-                re.push('$');
-                match Regex::new(&re) {
-                    Ok(r) => {
-                        let r = std::sync::Arc::new(r);
-                        let mut cache = GLOB_RX_CACHE.write().unwrap();
-                        if cache.len() >= GLOB_RX_CACHE_CAP {
-                            cache.clear();
-                        }
-                        PatMatcher::Rx(std::sync::Arc::clone(
-                            cache
-                                .entry(pattern.to_string())
-                                .or_insert_with(|| std::sync::Arc::clone(&r)),
-                        ))
-                    }
-                    Err(_) => PatMatcher::Contains(pattern.replace('*', "").to_lowercase()),
-                }
-            })
-            .collect()
-    }
-    fn matches_filter(filename: &str, matchers: &[PatMatcher]) -> bool {
-        if matchers.is_empty() {
-            return true;
-        }
-        // Only lowercase once, and only if a case-insensitive matcher needs it.
-        let lower = filename.to_lowercase();
-        matchers.iter().any(|m| match m {
-            PatMatcher::Exact(p) => lower == *p,
-            PatMatcher::Rx(r) => r.is_match(filename),
-            PatMatcher::Contains(p) => lower.contains(p),
-        })
+    // Validate type filter
+    let type_filter_trimmed = type_filter.trim();
+    if !type_filter_trimmed.is_empty()
+        && !matches!(type_filter_trimmed, "all" | "dir" | "directory" | "file")
+    {
+        return Err(CfmlError::runtime(format!(
+            "Invalid type [{}], valid types are [all, directory, file]",
+            type_filter
+        )));
     }
 
     enum Entry {
@@ -9677,7 +9597,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     fn list_dir(
         path: &str,
         recurse: bool,
-        filter: &[PatMatcher],
+        wildcard: &cfml_common::wildcard::WildcardPattern,
         list_info: &str,
         type_filter: &str,
         visited: &mut std::collections::HashSet<std::path::PathBuf>,
@@ -9710,14 +9630,14 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
             // The name filter applies to BOTH files and directories (Lucee/ACF
             // behavior); directories are still always recursed into below
             // regardless of whether their own name matches the filter. The type
-            // filter (dir|file|all) gates which entries are emitted but never
-            // suppresses recursion.
+            // filter (dir|directory|file|all) gates which entries are emitted but
+            // never suppresses recursion.
             let type_ok = match type_filter {
-                "dir" => is_dir,
+                "dir" | "directory" => is_dir,
                 "file" => is_file,
                 _ => true,
             };
-            if (is_file || is_dir) && type_ok && matches_filter(&file_name, filter) {
+            if (is_file || is_dir) && type_ok && wildcard.matches(&file_name) {
                 match list_info {
                     "query" => {
                         let meta = entry_path.metadata().ok();
@@ -9742,7 +9662,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 // divergence — no engine should follow a directory cycle).
                 let canon = std::fs::canonicalize(&entry_path).unwrap_or_else(|_| entry_path.clone());
                 if visited.insert(canon) {
-                    results.extend(list_dir(&full_path, true, filter, list_info, type_filter, visited)?);
+                    results.extend(list_dir(&full_path, true, wildcard, list_info, type_filter, visited)?);
                 }
             }
         }
@@ -9753,9 +9673,8 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // than throwing (ColdBox/Preside scan optional module locations like
     // `/app/extensions_app` that may not exist). Only a genuine I/O failure
     // (permissions, etc.) still surfaces as an error.
-    let compiled_filter = compile_filter(&filter);
     let mut visited = std::collections::HashSet::new();
-    let listing = match list_dir(&path, recurse, &compiled_filter, &list_info, &type_filter, &mut visited) {
+    let listing = match list_dir(&path, recurse, &wildcard, &list_info, &type_filter_trimmed, &mut visited) {
         Ok(entries) => Ok(entries),
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         // A path that exists but is a FILE yields ENOTDIR (os error 20). Lucee
@@ -9795,10 +9714,39 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 cfml_common::dirlist::sort_listing_query(&q, &sort);
                 Ok(CfmlValue::Query(q))
             } else {
-                let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
-                    if let Entry::Scalar(v) = e { Some(v) } else { None }
-                }).collect();
-                Ok(CfmlValue::array(files))
+                // LDEV-3188: sort applies to name/path arrays too (Lucee 7.1.3.85).
+                // Build as a query with a hidden path column, sort, then extract.
+                if !sort.is_empty() {
+                    let columns = vec!["name".to_string(), "directory".to_string(), "size".to_string(), "type".to_string(), "dateLastModified".to_string(), "attributes".to_string(), "mode".to_string()];
+                    let q = cfml_common::dynamic::CfmlQuery::new(columns);
+                    for e in entries {
+                        if let Entry::Scalar(v) = e {
+                            let path_str = v.as_string();
+                            let path = std::path::Path::new(&path_str);
+                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path_str.clone());
+                            let mut row = ValueMap::default();
+                            row.insert("name".to_string(), CfmlValue::string(name));
+                            row.insert("directory".to_string(), v.clone());
+                            row.insert("size".to_string(), CfmlValue::Int(0));
+                            row.insert("type".to_string(), CfmlValue::string(String::new()));
+                            row.insert("dateLastModified".to_string(), CfmlValue::Null);
+                            row.insert("attributes".to_string(), CfmlValue::Null);
+                            row.insert("mode".to_string(), CfmlValue::Null);
+                            q.add_row(row);
+                        }
+                    }
+                    cfml_common::dirlist::sort_listing_query(&q, &sort);
+                    let col_idx = if list_info == "name" { 0 } else { 1 };
+                    let result: Vec<CfmlValue> = q.with_read(|d| {
+                        d.data[col_idx].iter().cloned().collect()
+                    });
+                    Ok(CfmlValue::array(result))
+                } else {
+                    let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
+                        if let Entry::Scalar(v) = e { Some(v) } else { None }
+                    }).collect();
+                    Ok(CfmlValue::array(files))
+                }
             }
         }
         Err(e) => Err(CfmlError::runtime(format!("directoryList: {} (path: {})", e, path))),
@@ -20106,26 +20054,166 @@ fn fn_directory_rename(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_directory_copy(args: Vec<CfmlValue>) -> CfmlResult {
+    // directoryCopy(source, destination [, recurse [, filter [, createPath]]])
+    //
+    // When the filter is a closure or UDF, the VM intercepts this call (see
+    // `intercepts_querydir.rs`). This body handles only string patterns.
     let src = get_str(&args, 0);
     let dst = get_str(&args, 1);
-    fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            let dest_path = dst.join(entry.file_name());
-            if ty.is_dir() {
-                copy_dir_recursive(&entry.path(), &dest_path)?;
-            } else {
-                std::fs::copy(entry.path(), &dest_path)?;
+    let recurse = if args.len() >= 3 { args[2].is_true() } else { false };
+    let filter_str = if args.len() >= 4 { get_str(&args, 3) } else { String::new() };
+    let create_path = if args.len() >= 5 { args[4].is_true() } else { true };
+
+    // Validate source
+    let src_path = std::path::Path::new(&src);
+    if !src_path.exists() {
+        return Err(CfmlError::runtime(format!("Directory [{}] doesn't exist", src)));
+    }
+    if !src_path.is_dir() {
+        return Err(CfmlError::runtime(format!("File [{}] exists, but isn't a directory", src)));
+    }
+
+    // Resolve destination: if it has no / or \, it's a sibling of source
+    let dst_path = if !dst.contains('/') && !dst.contains('\\') && !dst.contains(std::path::MAIN_SEPARATOR) {
+        if let Some(parent) = src_path.parent() {
+            parent.join(&dst)
+        } else {
+            std::path::PathBuf::from(&dst)
+        }
+    } else {
+        std::path::PathBuf::from(&dst)
+    };
+
+    // Check createPath
+    if !create_path {
+        if let Some(parent) = dst_path.parent() {
+            if !parent.exists() {
+                return Err(CfmlError::runtime(format!(
+                    "parent directory for [{}] doesn't exist",
+                    dst_path.display()
+                )));
             }
         }
-        Ok(())
     }
-    match copy_dir_recursive(std::path::Path::new(&src), std::path::Path::new(&dst)) {
-        Ok(_) => Ok(CfmlValue::Null),
-        Err(e) => Err(CfmlError::runtime(format!("directoryCopy(): {}", e))),
+
+    // Create destination root
+    std::fs::create_dir_all(&dst_path).map_err(|e| {
+        CfmlError::runtime(format!("directoryCopy: failed to create destination: {}", e))
+    })?;
+
+    // Compile filter
+    let wildcard = cfml_common::wildcard::WildcardPattern::new(&filter_str, "|");
+
+    // Copy according to recurse/filter matrix
+    if recurse {
+        // Recursive: copy all files matching filter, create all directories,
+        // then remove empty rejected directories
+        copy_recursive(src_path, &dst_path, &wildcard)?;
+        remove_empty_folders(&dst_path, &wildcard)?;
+    } else {
+        // Non-recursive: copy only top-level files matching filter
+        for entry in std::fs::read_dir(src_path).map_err(|e| {
+            CfmlError::runtime(format!("directoryCopy: {}", e))
+        })? {
+            let entry = entry.map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?;
+            let file_type = entry.file_type().map_err(|e| {
+                CfmlError::runtime(format!("directoryCopy: {}", e))
+            })?;
+            
+            if file_type.is_file() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                if wildcard.matches(&name) {
+                    let dest_file = dst_path.join(&file_name);
+                    std::fs::copy(entry.path(), dest_file).map_err(|e| {
+                        CfmlError::runtime(format!("directoryCopy: {}", e))
+                    })?;
+                }
+            }
+        }
     }
+
+    Ok(CfmlValue::Null)
+}
+
+fn copy_recursive(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    wildcard: &cfml_common::wildcard::WildcardPattern,
+) -> CfmlResult {
+    for entry in std::fs::read_dir(src).map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))? {
+        let entry = entry.map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let dest_path = dst.join(&file_name);
+        let file_type = entry.file_type().map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?;
+
+        if file_type.is_dir() {
+            // Always create and descend into directories
+            std::fs::create_dir_all(&dest_path).map_err(|e| {
+                CfmlError::runtime(format!("directoryCopy: {}", e))
+            })?;
+            copy_recursive(&entry.path(), &dest_path, wildcard)?;
+        } else if file_type.is_file() {
+            // Copy only matching files
+            if wildcard.matches(&name) {
+                std::fs::copy(entry.path(), &dest_path).map_err(|e| {
+                    CfmlError::runtime(format!("directoryCopy: {}", e))
+                })?;
+            }
+        }
+    }
+    Ok(CfmlValue::Null)
+}
+
+fn remove_empty_folders(
+    path: &std::path::Path,
+    wildcard: &cfml_common::wildcard::WildcardPattern,
+) -> CfmlResult {
+    // Remove empty directories that the filter rejects (bottom-up)
+    let entries: Vec<_> = std::fs::read_dir(path)
+        .map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?;
+
+    for entry in entries {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            // Recurse first (bottom-up)
+            remove_empty_folders(&entry_path, wildcard)?;
+            
+            // Check if directory is empty and name doesn't match filter
+            let is_empty = std::fs::read_dir(&entry_path)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
+            
+            if is_empty {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !wildcard.matches(&name_str) {
+                    let _ = std::fs::remove_dir(&entry_path);
+                }
+            }
+        }
+    }
+
+    // Check the root itself
+    if path.exists() {
+        let is_empty = std::fs::read_dir(path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        
+        if is_empty {
+            if let Some(name) = path.file_name() {
+                let name_str = name.to_string_lossy();
+                if !wildcard.matches(&name_str) {
+                    let _ = std::fs::remove_dir(path);
+                }
+            }
+        }
+    }
+
+    Ok(CfmlValue::Null)
 }
 
 // Real file handles live in `crate::file_handles` (a process-wide registry);
