@@ -18847,7 +18847,7 @@ impl CfmlVirtualMachine {
             }
 
             if intercepts_querydir::handles(&name_lower) {
-                match self.dispatch_querydir(&name_lower, args.clone()) {
+                match self.dispatch_querydir(&name_lower, args.clone(), parent_locals) {
                     Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
                     other => return other,
                 }
@@ -43385,7 +43385,7 @@ impl CfmlVirtualMachine {
                     let action = opts.data_get("action").map(|v| v.as_string().to_lowercase())
                         .unwrap_or_else(|| "list".to_string());
                     match action.as_str() {
-                        "list" => Some(self.cfdirectory_list_from_opts(opts)),
+                        "list" => Some(self.cfdirectory_list_from_opts(opts, &ValueMap::default())),
                         _ => Some(Err(CfmlError::runtime(format!(
                             "cfdirectory action='{}': filesystem writes are disabled in sandbox mode", action
                         )))),
@@ -43471,7 +43471,7 @@ impl CfmlVirtualMachine {
         }
     }
 
-    fn cfdirectory_list_from_opts(&self, opts: &CfmlStruct) -> CfmlResult {
+    fn cfdirectory_list_from_opts(&self, opts: &CfmlStruct, _parent_locals: &ValueMap) -> CfmlResult {
         let dir = opts
             .get_ci("directory")
             .map(|v| v.as_string())
