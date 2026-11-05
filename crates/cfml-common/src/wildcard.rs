@@ -16,6 +16,7 @@
 pub struct WildcardPattern {
     patterns: Vec<ParsedPattern>,
     is_include: bool, // false when negated with leading `!`
+    was_empty: bool, // true if the original pattern was empty/whitespace only
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,8 @@ impl WildcardPattern {
     /// pattern with delimiters but no tokens (e.g. `"|"`) matches NOTHING.
     pub fn new(pattern: &str, delimiters: &str) -> Self {
         let trimmed = pattern.trim();
+        let was_empty = trimmed.is_empty();
+        
         let (is_include, text) = if let Some(rest) = trimmed.strip_prefix('!') {
             (false, rest)
         } else {
@@ -60,7 +63,7 @@ impl WildcardPattern {
             patterns.push(Self::parse_token(token));
         }
 
-        Self { patterns, is_include }
+        Self { patterns, is_include, was_empty }
     }
 
     /// Split the text by any character in `delimiters`.
@@ -117,7 +120,11 @@ impl WildcardPattern {
     /// unchanged on Linux/macOS).
     pub fn matches(&self, name: &str) -> bool {
         if self.patterns.is_empty() {
-            // A pattern with no tokens (e.g. `"|"`) matches NOTHING.
+            // Empty/whitespace-only input: no filter, matches everything
+            if self.was_empty {
+                return true;
+            }
+            // Non-empty input that yielded no tokens (e.g. "|"): matches nothing
             return !self.is_include;
         }
 
@@ -352,8 +359,16 @@ mod tests {
 
     #[test]
     fn test_empty_pattern() {
-        let pat = WildcardPattern::new("|", "|");
-        assert!(!pat.matches("anything"));
+        // "|" has no tokens, so matches nothing
+        let pat1 = WildcardPattern::new("|", "|");
+        assert!(!pat1.matches("anything"));
+
+        // "" or whitespace-only matches everything (no filter)
+        let pat2 = WildcardPattern::new("", "|");
+        assert!(pat2.matches("anything"));
+
+        let pat3 = WildcardPattern::new("  ", "|");
+        assert!(pat3.matches("anything"));
     }
 
     #[test]
