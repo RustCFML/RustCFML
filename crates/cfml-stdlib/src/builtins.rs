@@ -9715,36 +9715,31 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 Ok(CfmlValue::Query(q))
             } else {
                 // LDEV-3188: sort applies to name/path arrays too (Lucee 7.1.3.85).
-                // Build as a query with a hidden path column, sort, then extract.
+                // Build as a query with a name column, sort, then extract.
+                let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
+                    if let Entry::Scalar(v) = e { Some(v) } else { None }
+                }).collect();
+
                 if !sort.is_empty() {
                     let columns = vec!["name".to_string(), "directory".to_string(), "size".to_string(), "type".to_string(), "dateLastModified".to_string(), "attributes".to_string(), "mode".to_string()];
                     let q = cfml_common::dynamic::CfmlQuery::new(columns);
-                    for e in entries {
-                        if let Entry::Scalar(v) = e {
-                            let path_str = v.as_string();
-                            let path = std::path::Path::new(&path_str);
-                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path_str.clone());
-                            let mut row = ValueMap::default();
-                            row.insert("name".to_string(), CfmlValue::string(name));
-                            row.insert("directory".to_string(), v.clone());
-                            row.insert("size".to_string(), CfmlValue::Int(0));
-                            row.insert("type".to_string(), CfmlValue::string(String::new()));
-                            row.insert("dateLastModified".to_string(), CfmlValue::Null);
-                            row.insert("attributes".to_string(), CfmlValue::Null);
-                            row.insert("mode".to_string(), CfmlValue::Null);
-                            q.add_row(row);
-                        }
+                    for v in &files {
+                        let mut row = ValueMap::default();
+                        row.insert("name".to_string(), v.clone());
+                        row.insert("directory".to_string(), CfmlValue::Null);
+                        row.insert("size".to_string(), CfmlValue::Int(0));
+                        row.insert("type".to_string(), CfmlValue::Null);
+                        row.insert("dateLastModified".to_string(), CfmlValue::Null);
+                        row.insert("attributes".to_string(), CfmlValue::Null);
+                        row.insert("mode".to_string(), CfmlValue::Null);
+                        q.add_row(row);
                     }
                     cfml_common::dirlist::sort_listing_query(&q, &sort);
-                    let col_idx = if list_info == "name" { 0 } else { 1 };
                     let result: Vec<CfmlValue> = q.with_read(|d| {
-                        d.data[col_idx].iter().cloned().collect()
+                        d.data[0].iter().cloned().collect()
                     });
                     Ok(CfmlValue::array(result))
                 } else {
-                    let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
-                        if let Entry::Scalar(v) = e { Some(v) } else { None }
-                    }).collect();
                     Ok(CfmlValue::array(files))
                 }
             }

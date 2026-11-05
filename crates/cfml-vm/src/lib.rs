@@ -43452,7 +43452,7 @@ impl CfmlVirtualMachine {
                 for v in &values {
                     let mut row = ValueMap::default();
                     row.insert("name".to_string(), v.clone());
-                    row.insert("directory".to_string(), v.clone());
+                    row.insert("directory".to_string(), CfmlValue::Null);
                     row.insert("size".to_string(), CfmlValue::Int(0));
                     row.insert("type".to_string(), CfmlValue::Null);
                     row.insert("dateLastModified".to_string(), CfmlValue::Null);
@@ -43461,9 +43461,8 @@ impl CfmlVirtualMachine {
                     q.add_row(row);
                 }
                 cfml_common::dirlist::sort_listing_query(&q, sort);
-                let col_idx = if list_info == "name" { 0 } else { 1 };
                 let result: Vec<CfmlValue> = q.with_read(|d| {
-                    d.data[col_idx].iter().cloned().collect()
+                    d.data[0].iter().cloned().collect()
                 });
                 Ok(CfmlValue::array(result))
             } else {

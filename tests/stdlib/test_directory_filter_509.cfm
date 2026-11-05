@@ -16,7 +16,7 @@ Expected values match Lucee 7.1 on Linux.
 <cfscript>
 try { include "harness.cfm"; } catch( any e ) { abort; }
 
-suiteBegin("directory filter parity (#509)");
+suiteBegin("directory filter parity (##509)");
 
 // Create test fixture directory
 testRoot = getTempDirectory() & "dirfilter509_" & createUUID() & "/";
@@ -43,7 +43,7 @@ function setupFixture(root) {
 // Helper to sort and format array
 function sortedNames(arr) {
 	arraySort(arr, "text");
-	return arrayToList(arr, ",");
+	return arr.toList();
 }
 
 // Setup main fixture
