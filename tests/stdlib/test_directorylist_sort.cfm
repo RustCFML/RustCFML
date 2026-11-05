@@ -28,8 +28,8 @@ assert( "named sort argument", _dlNames( directoryList( path = _dlRoot, listInfo
 unsorted = _dlQ( "" );
 assert( "unknown column leaves filesystem order", _dlQ( "bogus" ), unsorted );
 assert( "unknown direction leaves filesystem order", _dlQ( "name sideways" ), unsorted );
-// The name/path arrays ignore sort.
-assert( "listInfo=name ignores sort", directoryList( _dlRoot, false, "name", "", "name desc" ).toList(), directoryList( _dlRoot, false, "name" ).toList() );
+// LDEV-3188: since Lucee 7.1.3.85, sort applies to name/path arrays too.
+assert( "listInfo=name honors sort (LDEV-3188)", directoryList( _dlRoot, false, "name", "", "name desc" ).toList(), "c.txt,beta,a.txt,B.txt,Alpha" );
 
 q = directoryList( _dlRoot, false, "query", "a.txt" );
 assertTrue( "dateLastModified is a date", isDate( q.dateLastModified ) );

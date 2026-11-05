@@ -165,6 +165,7 @@ static SIGNATURES: &[(&str, &[&[&str]])] = &[
     ("decimalformat", &[&["number", "value"]]),
     ("decrementvalue", &[&["number", "value"]]),
     ("deserializejson", &[&["json", "var", "value", "jsonvar", "data"], &["strictmapping"]]),
+    ("directorycopy", &[&["source", "directory"], &["destination", "newdirectory"], &["recurse", "recursive"], &["filter"], &["createpath"]]),
     ("directorycreate", &[&["path", "directory"], &["createpath", "doparent"], &["ignoreexists"]]),
     ("directorydelete", &[&["path", "directory"], &["recurse", "recursive"]]),
     ("directoryexists", &[&["path", "directory", "absolute_path", "absolutepath"]]),

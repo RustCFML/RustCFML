@@ -18847,7 +18847,7 @@ impl CfmlVirtualMachine {
             }
 
             if intercepts_querydir::handles(&name_lower) {
-                match self.dispatch_querydir(&name_lower, args.clone()) {
+                match self.dispatch_querydir(&name_lower, args.clone(), parent_locals) {
                     Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
                     other => return other,
                 }
@@ -43250,7 +43250,12 @@ impl CfmlVirtualMachine {
                     .map(|v| v.as_string().to_lowercase())
                     .unwrap_or_else(|| "path".to_string());
                 let filter = args.get(3).map(|v| v.as_string()).unwrap_or_default();
-                Some(self.sandbox_directory_list(&path, recurse, &list_info, &filter))
+                let sort = args.get(4).map(|v| v.as_string()).unwrap_or_default();
+                let type_filter = args
+                    .get(5)
+                    .map(|v| v.as_string().to_lowercase())
+                    .unwrap_or_else(|| "all".to_string());
+                Some(self.sandbox_directory_list(&path, recurse, &list_info, &filter, &sort, &type_filter))
             }
             "getfileinfo" => {
                 let path = get_str(0);
@@ -43380,7 +43385,7 @@ impl CfmlVirtualMachine {
                     let action = opts.data_get("action").map(|v| v.as_string().to_lowercase())
                         .unwrap_or_else(|| "list".to_string());
                     match action.as_str() {
-                        "list" => Some(self.cfdirectory_list_from_opts(opts)),
+                        "list" => Some(self.cfdirectory_list_from_opts(opts, &ValueMap::default())),
                         _ => Some(Err(CfmlError::runtime(format!(
                             "cfdirectory action='{}': filesystem writes are disabled in sandbox mode", action
                         )))),
@@ -43396,7 +43401,18 @@ impl CfmlVirtualMachine {
     }
 
     /// Sandbox directoryList: list entries from the VFS.
-    fn sandbox_directory_list(&self, path: &str, recurse: bool, list_info: &str, filter: &str) -> CfmlResult {
+    fn sandbox_directory_list(&self, path: &str, recurse: bool, list_info: &str, filter: &str, sort: &str, type_filter: &str) -> CfmlResult {
+        // Validate type
+        let type_filter_trimmed = type_filter.trim();
+        if !type_filter_trimmed.is_empty()
+            && !matches!(type_filter_trimmed, "all" | "dir" | "directory" | "file")
+        {
+            return Err(CfmlError::runtime(format!(
+                "Invalid type [{}], valid types are [all, directory, file]",
+                type_filter
+            )));
+        }
+
         let mut entries = Vec::new();
         let mut visited = std::collections::HashSet::new();
         if let Ok(canon) = self.vfs.canonicalize(path) {
@@ -43404,33 +43420,40 @@ impl CfmlVirtualMachine {
         }
         self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
 
-        // The name filter applies to both files and directories (Lucee/ACF);
-        // recursion already descended into every subdir above regardless.
-        if !filter.is_empty() {
-            entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
-        }
+        // Apply type filter first, then name filter (Lucee order)
+        let wildcard = cfml_common::wildcard::WildcardPattern::new(filter, "|");
+        entries.retain(|(name, _, is_dir)| {
+            let type_ok = match type_filter_trimmed {
+                "dir" | "directory" => *is_dir,
+                "file" => !*is_dir,
+                _ => true,
+            };
+            type_ok && wildcard.matches(name)
+        });
 
-        if list_info == "name" {
-            Ok(CfmlValue::array(
-                entries
-                    .into_iter()
-                    .map(|(name, _, _)| CfmlValue::string(name))
-                    .collect(),
-            ))
-        } else if list_info == "query" {
-            Ok(Self::build_directory_query(&entries, path))
+        if list_info == "query" {
+            let listing = Self::build_directory_query(&entries, path);
+            if let CfmlValue::Query(ref q) = listing {
+                cfml_common::dirlist::sort_listing_query(q, sort);
+            }
+            Ok(listing)
         } else {
-            // "path" mode: return array of full paths
+            // name/path arrays. LDEV-3188: with a sort, the full query listing is
+            // sorted on its real columns, then projected (Directory.java:451-464).
+            let want_name = list_info == "name";
+            if !sort.trim().is_empty() {
+                return Ok(Self::sorted_listing_array(&entries, path, sort, want_name));
+            }
             Ok(CfmlValue::array(
                 entries
                     .into_iter()
-                    .map(|(_, full, _)| CfmlValue::string(full))
+                    .map(|(name, full, _)| CfmlValue::string(if want_name { name } else { full }))
                     .collect(),
             ))
         }
     }
 
-    fn cfdirectory_list_from_opts(&self, opts: &CfmlStruct) -> CfmlResult {
+    fn cfdirectory_list_from_opts(&self, opts: &CfmlStruct, _parent_locals: &ValueMap) -> CfmlResult {
         let dir = opts
             .get_ci("directory")
             .map(|v| v.as_string())
@@ -43439,6 +43462,10 @@ impl CfmlVirtualMachine {
             .get_ci("filter")
             .map(|v| v.as_string())
             .unwrap_or_else(|| "*".to_string());
+        let filter_delimiters = opts
+            .get_ci("filterdelimiters")
+            .map(|v| v.as_string())
+            .unwrap_or_else(|| "|".to_string());
         let recurse = opts
             .get_ci("recurse")
             .map(|v| v.is_true())
@@ -43451,8 +43478,12 @@ impl CfmlVirtualMachine {
             .get_ci("sort")
             .map(|v| v.as_string())
             .unwrap_or_default();
+        let type_filter = opts
+            .get_ci("type")
+            .map(|v| v.as_string().to_lowercase())
+            .unwrap_or_else(|| "all".to_string());
         match self.resolve_directory_path_with_mappings(&dir) {
-            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter, &list_info, &sort),
+            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter, &filter_delimiters, &list_info, &sort, &type_filter),
             // Lucee/ACF: `action="list"` on a missing directory returns an EMPTY
             // query (recordcount=0), it does NOT throw. (Wheels' controller-
             // discovery lists a non-existent nested controllers/ subdir.)
@@ -43471,16 +43502,39 @@ impl CfmlVirtualMachine {
         path: &str,
         recurse: bool,
         filter: &str,
+        filter_delimiters: &str,
         list_info: &str,
         sort: &str,
+        type_filter: &str,
     ) -> CfmlResult {
+        // Validate type
+        let type_filter_trimmed = type_filter.trim();
+        if !type_filter_trimmed.is_empty()
+            && !matches!(type_filter_trimmed, "all" | "dir" | "directory" | "file")
+        {
+            return Err(CfmlError::runtime(format!(
+                "Invalid type [{}], valid types are [all, directory, file]",
+                type_filter
+            )));
+        }
+
         let mut entries = Vec::new();
         let mut visited = std::collections::HashSet::new();
         if let Ok(canon) = self.vfs.canonicalize(path) {
             visited.insert(canon);
         }
         self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
-        entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
+        
+        // Apply type filter first, then name filter
+        let wildcard = cfml_common::wildcard::WildcardPattern::new(filter, filter_delimiters);
+        entries.retain(|(name, _, is_dir)| {
+            let type_ok = match type_filter_trimmed {
+                "dir" | "directory" => *is_dir,
+                "file" => !*is_dir,
+                _ => true,
+            };
+            type_ok && wildcard.matches(name)
+        });
         // Lucee/ACF: `cfdirectory action="list" listinfo="name"` returns a
         // single-column (`name`) query whose `name` is the path RELATIVE to the
         // listed directory (subdirectories included, `/`-separated) when
@@ -43587,17 +43641,6 @@ impl CfmlVirtualMachine {
         }
         None
     }
-
-    fn matches_directory_filter(name: &str, pattern: &str) -> bool {
-        if pattern == "*" || pattern.is_empty() {
-            return true;
-        }
-        if let Some(ext) = pattern.strip_prefix("*.") {
-            return name.to_lowercase().ends_with(&format!(".{}", ext.to_lowercase()));
-        }
-        name.eq_ignore_ascii_case(pattern)
-    }
-
     fn sandbox_collect_entries(
         &self,
         path: &str,
