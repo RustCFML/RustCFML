@@ -74,7 +74,7 @@ arraySort(result3, "text");
 assert("directoryList named args with UDF", sortedNames(result3), "B.TXT,a.txt,test1.txt");
 
 // Test 4: Closure filter with path-based logic
-result4 = directoryList(R, false, "name", function(p) { return p.contains("txt") || p.endsWith("sub"); });
+result4 = directoryList(R, false, "name", function(p) { return listLast(p, ".") == "txt" || p.endsWith("sub"); });
 assert("closure filter (path-only signature) works", sortedNames(result4), "B.TXT,a.txt,sub,test1.txt");
 
 // Test 5: Filter called for directories
@@ -151,10 +151,21 @@ assertThrows("invalid return type throws", function() {
 	directoryList(R, false, "name", badReturn);
 }, "");
 
+string function badReturnTyped(p) { return "true"; }
+try {
+	directoryList(R, false, "name", badReturnTyped);
+	assert("typed non-boolean return type throws", "no exception", "exception");
+} catch (any e) {
+	assert("typed non-boolean return type throws", e.message contains "invalid return type [string] for UDF Filter", true);
+}
+
 function tooManyArgs(a, b, c, d) { return true; }
 assertThrows("too many params throws", function() {
 	directoryList(R, false, "name", tooManyArgs);
 }, "");
+
+// Missing directory with a closure filter -> empty result (local FS), not an error
+assert("missing dir with closure is empty", arrayLen(directoryList(R & "nope", false, "name", function(p) { return true; })), 0);
 
 // Test 13: Outer variable writeback
 counter13 = 0;
@@ -170,12 +181,18 @@ closure14 = function(p) {
 	return p.endsWith(".txt");
 };
 result14 = directoryList(R, false, "query", closure14, "name desc");
-assert("listInfo=query with closure", result14.recordCount, 3);
+assert("listInfo=query with closure", result14.recordCount, 2);
 assert("sort applies to query", result14.name[1], "test1.txt");
 
 // Test 15: LDEV-3188 - sort on name array
 result15 = directoryList(R, false, "name", "*.txt", "name desc");
-assert("sort applies to name array (LDEV-3188)", result15[1] == "test1.txt" || result15[1] == "B.TXT", true);
+if (server.os.name.findNoCase("linux") || server.os.name.findNoCase("mac")) {
+	assert("sort applies to name array (LDEV-3188)", result15.toList(), "test1.txt,a.txt");
+}
+fileWrite(R & "sub/big.txt", repeatString("x", 50));
+result15b = directoryList(R & "sub", false, "name", function(p) { return true; }, "size desc");
+assert("closure + sort uses real size column", result15b[1], "big.txt");
+fileDelete(R & "sub/big.txt");
 
 // ========================================================================
 // Part 2: directoryList with string patterns
@@ -237,7 +254,7 @@ assert("empty pattern | matches nothing", arrayLen(result23), 0);
 
 // Test 24: Whitespace-only matches everything
 result24 = directoryList(R, false, "name", "  ");
-assert("whitespace pattern matches all", arrayLen(result24) > 10, true);
+assert("whitespace pattern matches all", arrayLen(result24), 10);
 
 // Test 25: Recursion with pattern
 result25 = directoryList(R, true, "name", "*.txt");
@@ -270,7 +287,7 @@ directoryCopy(inc, d1);
 result28 = directoryList(d1, false, "name");
 arraySort(result28, "text");
 // Should only have top-level files, not subdirectories
-assert("directoryCopy non-recursive (default)", sortedNames(result28), "B.TXT,a.txt,abab,abra.cfm,noext,test1.txt");
+assert("directoryCopy non-recursive (default)", sortedNames(result28), ".hidden,B.TXT,a.txt,abab,abra.cfm,noext,test1.txt");
 
 // Test 29: Non-recursive with filter
 d2 = testRoot & "d2/";
@@ -324,6 +341,8 @@ assert("directoryCopy closure filter keeps non-empty dirs", !hasAbra && hasTest1
 // Verify closure was called with destination paths during cleanup
 hasD5Path = arrayFilter(d5Calls, function(p) { return p.contains("d5"); }).len() > 0;
 assert("directoryCopy closure called with dest paths", hasD5Path, true);
+hasSrcPath = arrayFilter(d5Calls, function(p) { return p.contains("/inc/"); }).len() > 0;
+assert("directoryCopy closure called with source paths while copying", hasSrcPath, true);
 
 // Test 33: Non-recursive with closure - closure sees directories
 d6 = testRoot & "d6/";
@@ -367,7 +386,7 @@ try {
 	assert("copy filter exception propagates", false, true);
 } catch (application e) {
 	assert("copy filter exception is application type", e.type, "application");
-	assert("copy filter exception message preserved", e.message contains "boom", true);
+	assert("copy filter exception message preserved", e.message, "boom");
 }
 
 // ========================================================================
@@ -382,7 +401,7 @@ assert("cfdirectory list with pattern", result38.recordCount, 2);
 // Test 39: cfdirectory with filterDelimiters
 result39 = queryNew("");
 cfdirectory(action="list", directory=R, filter="*.txt,*.cfm", filterDelimiters=",", name="result39");
-assert("cfdirectory with filterDelimiters", result39.recordCount >= 3, true);
+assert("cfdirectory with filterDelimiters", result39.recordCount, 3);
 
 // Test 40: cfdirectory with closure
 closure40 = function(p) {

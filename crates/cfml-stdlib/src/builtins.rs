@@ -9674,7 +9674,12 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // `/app/extensions_app` that may not exist). Only a genuine I/O failure
     // (permissions, etc.) still surfaces as an error.
     let mut visited = std::collections::HashSet::new();
-    let listing = match list_dir(&path, recurse, &wildcard, &list_info, &type_filter_trimmed, &mut visited) {
+    // LDEV-3188 (Lucee Directory.java:451-464, 532-539): a name/path array with a
+    // sort is built as the full query listing, sorted on its real columns, then
+    // projected. Collect rows in that case.
+    let sorted_array = list_info != "query" && !sort.trim().is_empty();
+    let collect_info: &str = if sorted_array { "query" } else { &list_info };
+    let listing = match list_dir(&path, recurse, &wildcard, collect_info, &type_filter_trimmed, &mut visited) {
         Ok(entries) => Ok(entries),
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         // A path that exists but is a FILE yields ENOTDIR (os error 20). Lucee
@@ -9687,7 +9692,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
     match listing {
         Ok(entries) => {
-            if list_info == "query" {
+            if list_info == "query" || sorted_array {
                 let columns = vec![
                     "name".to_string(),
                     "directory".to_string(),
@@ -9712,36 +9717,37 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                     }
                 }
                 cfml_common::dirlist::sort_listing_query(&q, &sort);
+                if sorted_array {
+                    let want_name = list_info == "name";
+                    let (names, dirs) = (q.column_values_ci("name"), q.column_values_ci("directory"));
+                    let out: Vec<CfmlValue> = match (names, dirs) {
+                        (Some(n), Some(d)) => n
+                            .iter()
+                            .zip(d.iter())
+                            .map(|(n, d)| {
+                                if want_name {
+                                    n.clone()
+                                } else {
+                                    CfmlValue::string(
+                                        std::path::Path::new(&d.as_string())
+                                            .join(n.as_string())
+                                            .to_string_lossy()
+                                            .to_string(),
+                                    )
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    return Ok(CfmlValue::array(out));
+                }
                 Ok(CfmlValue::Query(q))
             } else {
-                // LDEV-3188: sort applies to name/path arrays too (Lucee 7.1.3.85).
-                // Build as a query with a name column, sort, then extract.
+                // Unsorted name/path arrays (sorted ones are projected above).
                 let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
                     if let Entry::Scalar(v) = e { Some(v) } else { None }
                 }).collect();
-
-                if !sort.is_empty() {
-                    let columns = vec!["name".to_string(), "directory".to_string(), "size".to_string(), "type".to_string(), "dateLastModified".to_string(), "attributes".to_string(), "mode".to_string()];
-                    let q = cfml_common::dynamic::CfmlQuery::new(columns);
-                    for v in &files {
-                        let mut row = ValueMap::default();
-                        row.insert("name".to_string(), v.clone());
-                        row.insert("directory".to_string(), CfmlValue::Null);
-                        row.insert("size".to_string(), CfmlValue::Int(0));
-                        row.insert("type".to_string(), CfmlValue::Null);
-                        row.insert("dateLastModified".to_string(), CfmlValue::Null);
-                        row.insert("attributes".to_string(), CfmlValue::Null);
-                        row.insert("mode".to_string(), CfmlValue::Null);
-                        q.add_row(row);
-                    }
-                    cfml_common::dirlist::sort_listing_query(&q, &sort);
-                    let result: Vec<CfmlValue> = q.with_read(|d| {
-                        d.data[0].iter().cloned().collect()
-                    });
-                    Ok(CfmlValue::array(result))
-                } else {
-                    Ok(CfmlValue::array(files))
-                }
+                Ok(CfmlValue::array(files))
             }
         }
         Err(e) => Err(CfmlError::runtime(format!("directoryList: {} (path: {})", e, path))),

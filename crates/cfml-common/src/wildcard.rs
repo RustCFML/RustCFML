@@ -45,17 +45,18 @@ impl WildcardPattern {
     /// An empty or whitespace-only pattern matches EVERYTHING (no filter). A
     /// pattern with delimiters but no tokens (e.g. `"|"`) matches NOTHING.
     pub fn new(pattern: &str, delimiters: &str) -> Self {
-        let trimmed = pattern.trim();
-        let was_empty = trimmed.is_empty();
-        
-        let (is_include, text) = if let Some(rest) = trimmed.strip_prefix('!') {
+        // Check for leading `!` on the raw pattern before trimming (WildcardPattern.java:53).
+        let (is_include, text) = if let Some(rest) = pattern.strip_prefix('!') {
             (false, rest)
         } else {
-            (true, trimmed)
+            (true, pattern)
         };
+        
+        let trimmed = text.trim();
+        let was_empty = trimmed.is_empty();
 
         let mut patterns = Vec::new();
-        for token in Self::split_by_delimiters(text, delimiters) {
+        for token in Self::split_by_delimiters(trimmed, delimiters) {
             let token = token.trim();
             if token.is_empty() {
                 continue;

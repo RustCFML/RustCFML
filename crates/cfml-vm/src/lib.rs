@@ -43438,36 +43438,18 @@ impl CfmlVirtualMachine {
             }
             Ok(listing)
         } else {
-            // name or path arrays: build, sort if needed, then return
-            let values: Vec<CfmlValue> = if list_info == "name" {
-                entries.into_iter().map(|(name, _, _)| CfmlValue::string(name)).collect()
-            } else {
-                entries.into_iter().map(|(_, full, _)| CfmlValue::string(full)).collect()
-            };
-
-            if !sort.is_empty() {
-                // LDEV-3188: sort name/path arrays via a temporary query
-                let columns = vec!["name".to_string(), "directory".to_string(), "size".to_string(), "type".to_string(), "dateLastModified".to_string(), "attributes".to_string(), "mode".to_string()];
-                let q = cfml_common::dynamic::CfmlQuery::new(columns);
-                for v in &values {
-                    let mut row = ValueMap::default();
-                    row.insert("name".to_string(), v.clone());
-                    row.insert("directory".to_string(), CfmlValue::Null);
-                    row.insert("size".to_string(), CfmlValue::Int(0));
-                    row.insert("type".to_string(), CfmlValue::Null);
-                    row.insert("dateLastModified".to_string(), CfmlValue::Null);
-                    row.insert("attributes".to_string(), CfmlValue::Null);
-                    row.insert("mode".to_string(), CfmlValue::Null);
-                    q.add_row(row);
-                }
-                cfml_common::dirlist::sort_listing_query(&q, sort);
-                let result: Vec<CfmlValue> = q.with_read(|d| {
-                    d.data[0].iter().cloned().collect()
-                });
-                Ok(CfmlValue::array(result))
-            } else {
-                Ok(CfmlValue::array(values))
+            // name/path arrays. LDEV-3188: with a sort, the full query listing is
+            // sorted on its real columns, then projected (Directory.java:451-464).
+            let want_name = list_info == "name";
+            if !sort.trim().is_empty() {
+                return Ok(Self::sorted_listing_array(&entries, path, sort, want_name));
             }
+            Ok(CfmlValue::array(
+                entries
+                    .into_iter()
+                    .map(|(name, full, _)| CfmlValue::string(if want_name { name } else { full }))
+                    .collect(),
+            ))
         }
     }
 

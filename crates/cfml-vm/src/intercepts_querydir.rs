@@ -27,284 +27,318 @@ pub(crate) fn handles(name_lower: &str) -> bool {
 }
 
 impl CfmlVirtualMachine {
-    /// Validate a directory filter UDF/closure signature before use.
-    /// Per Lucee UDFFilter.java:
-    /// - Return type must be boolean or any
-    /// - At most 3 parameters
-    /// - With exactly 1 parameter, it must be string or any
+    /// A closure or named UDF passed as a directory `filter` (Lucee: `instanceof UDF`,
+    /// UDFFilter.java:78). RustCFML has two callable variants; match both.
+    fn is_callable_filter(v: &CfmlValue) -> bool {
+        matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
+    }
+
+    /// Validate a directory filter UDF/closure before any I/O, with Lucee's messages
+    /// (UDFFilterSupport.java:30-48): return type boolean|any, at most 3 params, and a
+    /// single param must be string|any.
     fn validate_directory_filter(filter: &CfmlValue) -> Result<(), CfmlError> {
         if let CfmlValue::Function(func) = filter {
+            if let Some(rt) = func.return_type.as_deref() {
+                let rt_lc = rt.trim().to_lowercase();
+                if !rt_lc.is_empty() && rt_lc != "any" && rt_lc != "boolean" {
+                    return Err(CfmlError::expression(format!(
+                        "invalid return type [{}] for UDF Filter, valid return types are [boolean,any]",
+                        rt
+                    )));
+                }
+            }
             let param_count = func.params.len();
-            
-            // Check parameter count (max 3)
             if param_count > 3 {
-                return Err(CfmlError::runtime(format!(
-                    "Directory filter function must have at most 3 parameters, got {}",
+                return Err(CfmlError::expression(format!(
+                    "UDF filter has too many arguments [{}], should have at maximum 3 argument",
                     param_count
                 )));
             }
-            
-            // If exactly 1 param, check its type (must be string or any)
             if param_count == 1 {
-                if let Some(param) = func.params.first() {
-                    let param_type = param.param_type.as_ref().map(|s| s.to_lowercase()).unwrap_or_else(|| "any".to_string());
-                    if param_type != "any" && param_type != "string" {
-                        return Err(CfmlError::runtime(format!(
-                            "Single-parameter filter must have type string or any, got {}",
-                            param_type
-                        )));
-                    }
+                let t = func.params[0]
+                    .param_type
+                    .as_deref()
+                    .map(|s| s.trim().to_lowercase())
+                    .unwrap_or_else(|| "any".to_string());
+                if !t.is_empty() && t != "any" && t != "string" {
+                    return Err(CfmlError::expression(format!(
+                        "invalid type [{}] for first argument of UDF Filter, valid return types are [string,any]",
+                        func.params[0].param_type.as_deref().unwrap_or("")
+                    )));
                 }
             }
         }
         Ok(())
     }
 
-    /// Bodies moved VERBATIM from `call_function`: `args` stays an owned `Vec` exactly as
-    /// it was in the original scope, so `?`, `return Ok(..)`, `&args` and `args.into_iter()`
-    /// all still work and the diff is a pure move. The caller checks [`handles`] first, so
-    /// `args` is only moved when this domain will actually consume it.
+    /// Lucee `Caster.toBooleanValue` on the filter's return (UDFFilter.java:41,57;
+    /// Caster.java:268-299): null/void goes through `toBooleanValue("")` and throws.
+    fn directory_filter_result(keep: &CfmlValue) -> Result<bool, CfmlError> {
+        if matches!(keep, CfmlValue::Null) {
+            return Err(CfmlError::expression("Can't cast String [] to a boolean".to_string()));
+        }
+        keep.to_condition()
+    }
+
+    /// Call the filter for one entry with Lucee's Resource-form arguments
+    /// (UDFFilter.java:50-57): absolute path, "file"|"directory", extension
+    /// (`""` for a directory, null for a file without a dot).
+    fn call_directory_filter(
+        &mut self,
+        filter: &CfmlValue,
+        abs_path: &str,
+        name: &str,
+        is_dir: bool,
+        parent_locals: &ValueMap,
+    ) -> Result<bool, CfmlError> {
+        let ext = if is_dir {
+            CfmlValue::string(String::new())
+        } else {
+            match name.rfind('.') {
+                Some(i) => CfmlValue::string(name[i + 1..].to_string()),
+                None => CfmlValue::Null,
+            }
+        };
+        let cb_args = vec![
+            CfmlValue::string(abs_path.to_string()),
+            CfmlValue::string(if is_dir { "directory" } else { "file" }.to_string()),
+            ext,
+        ];
+        self.closure_parent_writeback = None;
+        self.closure_parent_deletes = None;
+        let keep = self.call_function(filter, cb_args, parent_locals)?;
+        Self::directory_filter_result(&keep)
+    }
+
+    fn validate_directory_type(type_filter: &str) -> Result<&str, CfmlError> {
+        let t = type_filter.trim();
+        if t.is_empty() || matches!(t, "all" | "dir" | "directory" | "file") {
+            Ok(t)
+        } else {
+            Err(CfmlError::application(format!(
+                "Invalid type [{}], valid types are [all, directory, file]",
+                t
+            )))
+        }
+    }
+
     pub(crate) fn dispatch_querydir(
         &mut self,
         name_lower: &str,
         args: Vec<CfmlValue>,
         parent_locals: &ValueMap,
     ) -> CfmlResult {
-            if matches!(name_lower, "cfdirectory" | "__cfdirectory") {
-                if let Some(CfmlValue::Struct(opts)) = args.first() {
-                    let action = opts
-                        .get_ci("action")
-                        .map(|v| v.as_string().to_lowercase())
-                        .unwrap_or_else(|| "list".to_string());
-                    if action == "list" {
-                        // Check if filter is a closure/UDF
-                        if let Some(CfmlValue::Function(_)) = opts.get_ci("filter") {
-                            return self.cfdirectory_list_with_closure(opts, parent_locals);
-                        }
-                        // String filter: use the lib.rs implementation (which calls this method)
-                        // We need to NOT return here for string filters - let it fall through
-                    } else if action == "copy" {
-                        return self.cfdirectory_copy_from_opts(opts, parent_locals);
+        if matches!(name_lower, "cfdirectory" | "__cfdirectory") {
+            if let Some(CfmlValue::Struct(opts)) = args.first() {
+                let action = opts
+                    .get_ci("action")
+                    .map(|v| v.as_string().to_lowercase())
+                    .unwrap_or_else(|| "list".to_string());
+                if action == "list" {
+                    if opts.get_ci("filter").map(|f| Self::is_callable_filter(&f)).unwrap_or(false) {
+                        return self.cfdirectory_list_with_closure(opts, parent_locals);
                     }
+                    // String/no filter: the VM list path (Lucee wildcard, type,
+                    // filterDelimiters, sort). Must NOT fall through to the stdlib
+                    // `fn_cfdirectory` list, which has the old matcher and sort.
+                    return self.cfdirectory_list_from_opts(opts, parent_locals);
+                } else if action == "copy" {
+                    // Sandbox: fall through so `sandbox_intercept` blocks the write.
+                    if self.sandbox {
+                        return Err(intercepts_common::unhandled());
+                    }
+                    return self.cfdirectory_copy_from_opts(opts, parent_locals);
                 }
             }
+        }
 
-            if name_lower == "directorylist" {
-                // directoryList(path [, recurse [, listInfo [, filter [, sort [, type [, filterDelimiters]]]]]])
-                // If filter is a closure/UDF, handle it here
-                if args.len() >= 4 {
-                    if let Some(filter) = args.get(3) {
-                        if matches!(filter, CfmlValue::Function(_)) {
-                            return self.directory_list_with_closure(args, parent_locals);
-                        }
-                    }
-                }
+        if name_lower == "directorylist" {
+            if args.get(3).map(Self::is_callable_filter).unwrap_or(false) {
+                return self.directory_list_with_closure(args, parent_locals);
             }
+        }
 
-            if name_lower == "directorycopy" {
-                // directoryCopy(source, destination [, recurse [, filter [, createPath]]])
-                // If filter is a closure/UDF, handle it here
-                if args.len() >= 4 {
-                    if let Some(filter) = args.get(3) {
-                        if matches!(filter, CfmlValue::Function(_)) {
-                            return self.directory_copy_with_closure(args, parent_locals);
-                        }
-                    }
-                }
+        if name_lower == "directorycopy" && !self.sandbox {
+            if args.get(3).map(Self::is_callable_filter).unwrap_or(false) {
+                return self.directory_copy_with_closure(args, parent_locals);
             }
+        }
 
-        // Fell out of every branch — exactly what the original `if` chain did.
-        // The caller turns this into fall-through; it is never seen by CFML.
         Err(intercepts_common::unhandled())
     }
 
-    /// directoryList with closure/UDF filter
-    fn directory_list_with_closure(
+    /// Walk + type gate + closure filter. Returns `None` for a missing / non-directory
+    /// path, which Lucee answers with an EMPTY result for the local filesystem
+    /// (Directory.java:474-481), not an error.
+    fn collect_with_closure(
         &mut self,
-        args: Vec<CfmlValue>,
+        path: &str,
+        recurse: bool,
+        type_filter: &str,
+        filter: &CfmlValue,
         parent_locals: &ValueMap,
-    ) -> CfmlResult {
-        let path = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-        let recurse = args.get(1).map(|v| v.is_true()).unwrap_or(false);
-        let list_info = args.get(2).map(|v| v.as_string().to_lowercase()).unwrap_or_else(|| "path".to_string());
-        let filter = match args.get(3) {
-            Some(f) => f.clone(),
-            None => return Err(CfmlError::runtime("directoryList: filter required".to_string())),
-        };
-        let sort = args.get(4).map(|v| v.as_string()).unwrap_or_default();
-        let type_filter = args.get(5).map(|v| v.as_string().to_lowercase()).unwrap_or_else(|| "all".to_string());
-
-        // Validate filter signature
-        Self::validate_directory_filter(&filter)?;
-
-        // Validate type
-        let type_filter_trimmed = type_filter.trim();
-        if !type_filter_trimmed.is_empty()
-            && !matches!(type_filter_trimmed, "all" | "dir" | "directory" | "file")
-        {
-            return Err(CfmlError::runtime(format!(
-                "Invalid type [{}], valid types are [all, directory, file]",
-                type_filter
-            )));
-        }
-
-        // Resolve and validate path
-        let resolved_path = match self.resolve_directory_path_with_mappings(&path) {
+    ) -> Result<Option<(String, Vec<(String, String, bool)>)>, CfmlError> {
+        // Validation happens when Lucee builds the filter, before any I/O.
+        Self::validate_directory_filter(filter)?;
+        let type_filter = Self::validate_directory_type(type_filter)?.to_string();
+        let resolved = match self.resolve_directory_path_with_mappings(path) {
             Some(p) => p,
-            None => {
-                return Err(CfmlError::runtime(format!("Directory [{}] doesn't exist", path)));
-            }
+            None => return Ok(None),
         };
-
-        // Collect entries
         let mut entries = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        if let Ok(canon) = self.vfs.canonicalize(&resolved_path) {
+        if let Ok(canon) = self.vfs.canonicalize(&resolved) {
             visited.insert(canon);
         }
-        self.sandbox_collect_entries(&resolved_path, recurse, &mut entries, &mut visited)?;
-
-        // Apply type filter first, then closure filter
-        entries.retain(|(_, _, is_dir)| {
-            match type_filter_trimmed {
-                "dir" | "directory" => *is_dir,
-                "file" => !*is_dir,
+        self.sandbox_collect_entries(&resolved, recurse, &mut entries, &mut visited)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (name, full, is_dir) in entries {
+            // AndResourceFilter{type, filter} short-circuits (Directory.java:435-439):
+            // the UDF is never called for an entry of the wrong type.
+            let type_ok = match type_filter.as_str() {
+                "dir" | "directory" => is_dir,
+                "file" => !is_dir,
                 _ => true,
-            }
-        });
-
-        // Filter with closure
-        let mut filtered = Vec::new();
-        for (name, full_path, is_dir) in entries {
-            let entry_type = if is_dir { "directory" } else { "file" };
-            let extension = if is_dir {
-                CfmlValue::string("".to_string())
-            } else {
-                // Extract extension (no dot, preserve case)
-                if let Some(dot_idx) = name.rfind('.') {
-                    CfmlValue::string(name[(dot_idx + 1)..].to_string())
-                } else {
-                    CfmlValue::Null
-                }
             };
-
-            let cb_args = vec![
-                CfmlValue::string(full_path.clone()),
-                CfmlValue::string(entry_type.to_string()),
-                extension,
-            ];
-            self.closure_parent_writeback = None;
-            self.closure_parent_deletes = None;
-            let keep = self.call_function(&filter, cb_args, parent_locals)?;
-            
-            // Check for null/undefined return (Lucee throws on this)
-            if matches!(keep, CfmlValue::Null) {
-                return Err(CfmlError::runtime(
-                    "Can't cast String [] to a boolean".to_string()
-                ));
+            if !type_ok {
+                continue;
             }
-            
-            // Coerce return value to boolean
-            let should_include = keep.to_condition().map_err(|e| {
-                CfmlError::runtime(format!("Can't cast {} to a boolean", e))
-            })?;
-            if should_include {
-                filtered.push((name, full_path, is_dir));
+            if self.call_directory_filter(filter, &full, &name, is_dir, parent_locals)? {
+                out.push((name, full, is_dir));
             }
         }
-
-        // Build result based on list_info
-        let result = match list_info.as_str() {
-            "name" => {
-                let names: Vec<CfmlValue> = filtered
-                    .iter()
-                    .map(|(n, _, _)| CfmlValue::string(n.clone()))
-                    .collect();
-                CfmlValue::array(names)
-            }
-            "path" => {
-                let paths: Vec<CfmlValue> = filtered
-                    .iter()
-                    .map(|(_, p, _)| CfmlValue::string(p.clone()))
-                    .collect();
-                CfmlValue::array(paths)
-            }
-            "query" => Self::build_directory_query(&filtered, &resolved_path),
-            _ => {
-                let paths: Vec<CfmlValue> = filtered
-                    .iter()
-                    .map(|(_, p, _)| CfmlValue::string(p.clone()))
-                    .collect();
-                CfmlValue::array(paths)
-            }
-        };
-
-        // Apply sort for arrays (same as query sort - use a temp query)
-        if matches!(result, CfmlValue::Array(_)) && !sort.is_empty() {
-            if let CfmlValue::Array(arr) = &result {
-                // Create a single-column query to sort
-                let query = cfml_common::dynamic::CfmlQuery::new(vec!["name".to_string()]);
-                for item in arr.iter() {
-                    let mut row = ValueMap::default();
-                    row.insert("name".to_string(), item.clone());
-                    query.add_row(row);
-                }
-                cfml_common::dirlist::sort_listing_query(&query, &sort);
-                // Extract back to array
-                if let Some(col_arc) = query.column_values_ci("name") {
-                    return Ok(CfmlValue::array((*col_arc).clone()));
-                }
-            }
-        }
-        
-        // Apply sort for queries
-        if let CfmlValue::Query(ref q) = result {
-            cfml_common::dirlist::sort_listing_query(q, &sort);
-        }
-
-        Ok(result)
+        Ok(Some((resolved, out)))
     }
 
-    /// directoryCopy with closure/UDF filter
-    fn directory_copy_with_closure(
-        &mut self,
-        args: Vec<CfmlValue>,
-        parent_locals: &ValueMap,
-    ) -> CfmlResult {
+    /// directoryList with a closure/UDF filter.
+    fn directory_list_with_closure(&mut self, args: Vec<CfmlValue>, parent_locals: &ValueMap) -> CfmlResult {
+        let path = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+        let recurse = args.get(1).map(|v| v.is_true()).unwrap_or(false);
+        // DirectoryList.java:60-75: "name" | "query", anything else is "path".
+        let list_info = args.get(2).map(|v| v.as_string().trim().to_lowercase()).unwrap_or_default();
+        let filter = args.get(3).cloned().unwrap_or(CfmlValue::Null);
+        let sort = args.get(4).map(|v| v.as_string()).unwrap_or_default();
+        let type_filter = args.get(5).map(|v| v.as_string().to_lowercase()).unwrap_or_default();
+
+        let (resolved, entries) =
+            match self.collect_with_closure(&path, recurse, &type_filter, &filter, parent_locals)? {
+                Some(x) => x,
+                None => (path.clone(), Vec::new()),
+            };
+
+        if list_info == "query" {
+            let listing = Self::build_directory_query(&entries, &resolved);
+            if let CfmlValue::Query(ref q) = listing {
+                cfml_common::dirlist::sort_listing_query(q, &sort);
+            }
+            return Ok(listing);
+        }
+        let want_name = list_info == "name";
+        if sort.trim().is_empty() {
+            return Ok(CfmlValue::array(
+                entries
+                    .into_iter()
+                    .map(|(n, p, _)| CfmlValue::string(if want_name { n } else { p }))
+                    .collect(),
+            ));
+        }
+        // LDEV-3188 (Directory.java:451-464, 532-539): a sorted array is the full
+        // query listing, sorted on its real columns, then projected to name/path.
+        Ok(Self::sorted_listing_array(&entries, &resolved, &sort, want_name))
+    }
+
+    /// Sort `entries` as the full directory query (so `size`, `dateLastModified`,
+    /// `type`, `directory` sort on real values) and project to names or paths.
+    pub(crate) fn sorted_listing_array(
+        entries: &[(String, String, bool)],
+        listed_dir: &str,
+        sort: &str,
+        want_name: bool,
+    ) -> CfmlValue {
+        // Carry the original index through the sort in an extra column.
+        let listing = Self::build_directory_query(entries, listed_dir);
+        let CfmlValue::Query(q) = listing else { return CfmlValue::array(Vec::new()) };
+        let idx: Vec<CfmlValue> = (0..entries.len()).map(|i| CfmlValue::Int(i as i64)).collect();
+        q.with_write(|d| d.add_column("__idx".to_string(), idx));
+        cfml_common::dirlist::sort_listing_query(&q, sort);
+        let order: Vec<usize> = q
+            .column_values_ci("__idx")
+            .map(|c| c.iter().filter_map(|v| match v { CfmlValue::Int(i) => Some(*i as usize), _ => None }).collect())
+            .unwrap_or_else(|| (0..entries.len()).collect());
+        CfmlValue::array(
+            order
+                .into_iter()
+                .filter_map(|i| entries.get(i))
+                .map(|(n, p, _)| CfmlValue::string(if want_name { n.clone() } else { p.clone() }))
+                .collect(),
+        )
+    }
+
+    /// cfdirectory action=list with a closure/UDF filter: always a QUERY
+    /// (tag listInfo: "name" → single-column relative-name query, else full query;
+    /// Directory.java:283-285, 498-503).
+    fn cfdirectory_list_with_closure(&mut self, opts: &CfmlStruct, parent_locals: &ValueMap) -> CfmlResult {
+        let dir = opts.get_ci("directory").map(|v| v.as_string()).unwrap_or_default();
+        let filter = opts.get_ci("filter").unwrap_or(CfmlValue::Null);
+        let recurse = opts.get_ci("recurse").map(|v| v.is_true()).unwrap_or(false);
+        let list_info = opts
+            .get_ci("listinfo")
+            .map(|v| v.as_string().trim().to_lowercase())
+            .unwrap_or_else(|| "all".to_string());
+        let sort = opts.get_ci("sort").map(|v| v.as_string()).unwrap_or_default();
+        let type_filter = opts.get_ci("type").map(|v| v.as_string().to_lowercase()).unwrap_or_default();
+
+        let (resolved, entries) =
+            match self.collect_with_closure(&dir, recurse, &type_filter, &filter, parent_locals)? {
+                Some(x) => x,
+                None => (dir.clone(), Vec::new()),
+            };
+        let listing = if list_info == "name" {
+            Self::build_directory_name_query(&entries, &resolved)
+        } else {
+            Self::build_directory_query(&entries, &resolved)
+        };
+        if let CfmlValue::Query(ref q) = listing {
+            cfml_common::dirlist::sort_listing_query(q, &sort);
+        }
+        Ok(listing)
+    }
+
+    /// directoryCopy with a closure/UDF filter (Directory.actionCopy, Directory.java:904-958).
+    fn directory_copy_with_closure(&mut self, args: Vec<CfmlValue>, parent_locals: &ValueMap) -> CfmlResult {
+        // Invalidate file-exists/is-dir cache after the copy completes (guard dropped on exit).
+        let _retire_negatives = RetireNegativesOnDrop;
+        
         let src = args.get(0).map(|v| v.as_string()).unwrap_or_default();
         let dst = args.get(1).map(|v| v.as_string()).unwrap_or_default();
         let recurse = args.get(2).map(|v| v.is_true()).unwrap_or(false);
-        let filter = match args.get(3) {
-            Some(f) => f.clone(),
-            None => return Err(CfmlError::runtime("directoryCopy: filter required".to_string())),
-        };
+        let filter = args.get(3).cloned().unwrap_or(CfmlValue::Null);
         let create_path = args.get(4).map(|v| v.is_true()).unwrap_or(true);
 
-        // Validate source
-        let src_path = std::path::Path::new(&src);
-        if !src_path.exists() {
-            return Err(CfmlError::runtime(format!("Directory [{}] doesn't exist", src)));
-        }
+        Self::validate_directory_filter(&filter)?;
+        
+        // Resolve source path through mappings (same resolution as directoryList with closure).
+        let resolved_src = match self.resolve_directory_path_with_mappings(&src) {
+            Some(p) => p,
+            None => return Err(CfmlError::application(format!("Directory [{}] doesn't exist", src))),
+        };
+        let src_path = std::path::Path::new(&resolved_src);
         if !src_path.is_dir() {
-            return Err(CfmlError::runtime(format!("File [{}] exists, but isn't a directory", src)));
+            return Err(CfmlError::application(format!("File [{}] exists, but isn't a directory", src)));
         }
-
-        // Resolve destination
-        let dst_path = if !dst.contains('/') && !dst.contains('\\') && !dst.contains(std::path::MAIN_SEPARATOR) {
-            if let Some(parent) = src_path.parent() {
-                parent.join(&dst)
-            } else {
-                std::path::PathBuf::from(&dst)
-            }
+        if dst.is_empty() {
+            return Err(CfmlError::application("Attribute [destination] is not defined".to_string()));
+        }
+        // Directory.java:960-966: no separator at all → sibling of the source.
+        let dst_path = if !dst.contains('/') && !dst.contains('\\') {
+            src_path.parent().map(|p| p.join(&dst)).unwrap_or_else(|| std::path::PathBuf::from(&dst))
         } else {
             std::path::PathBuf::from(&dst)
         };
-
-        // Check createPath
         if !create_path {
             if let Some(parent) = dst_path.parent() {
                 if !parent.exists() {
-                    return Err(CfmlError::runtime(format!(
+                    return Err(CfmlError::application(format!(
                         "parent directory for [{}] doesn't exist",
                         dst_path.display()
                     )));
@@ -312,265 +346,120 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // Create destination root
-        std::fs::create_dir_all(&dst_path).map_err(|e| {
-            CfmlError::runtime(format!("directoryCopy: failed to create destination: {}", e))
-        })?;
-
-        // Copy with filter
-        let copy_result = self.copy_recursive_with_closure(
-            src_path,
-            &dst_path,
-            src_path,
-            &dst_path,
-            recurse,
-            &filter,
-            parent_locals,
-        );
-
-        // Wrap errors as application errors (Lucee parity)
-        let copy_result = copy_result.map_err(|e| {
-            CfmlError::application(format!("directoryCopy filter error: {}", e))
-        })?;
-
-        // Remove empty directories if we filtered (Lucee parity)
-        if recurse {
-            self.remove_empty_folders_closure(&dst_path, &filter, parent_locals)?;
-        }
-
-        Ok(copy_result)
+        // Everything inside Lucee's try{} becomes ApplicationException(t.getMessage())
+        // (Directory.java:950-953): type `application`, message unchanged.
+        let run = (|| -> Result<(), CfmlError> {
+            std::fs::create_dir_all(&dst_path)
+                .map_err(|e| CfmlError::application(e.to_string()))?;
+            self.copy_recursive_with_closure(src_path, &dst_path, recurse, &filter, parent_locals)?;
+            if recurse {
+                // removeEmptyFolders(newdirectory, Not(filter)) — root included
+                // (Directory.java:947; ResourceUtil.java:1648-1666).
+                self.remove_empty_folders_closure(&dst_path, &filter, parent_locals)?;
+            }
+            Ok(())
+        })();
+        run.map_err(|e| CfmlError::application(e.message.clone()))?;
+        Ok(CfmlValue::Null)
     }
 
-    /// Recursive copy with closure filter
+    /// ResourceUtil.copyRecursive with the effective filter of Directory.java:924-938:
+    /// non-recursive → And(filter, Not(Dir)); recursive → Or(filter, Dir). The UDF is
+    /// evaluated FIRST in both, so it is called for directories too, and it receives
+    /// the SOURCE path (`src.listResources(filter)`, ResourceUtil.java:1070).
     fn copy_recursive_with_closure(
         &mut self,
-        current_src: &std::path::Path,
-        _current_dst: &std::path::Path,
-        root_src: &std::path::Path,
-        root_dst: &std::path::Path,
+        src: &std::path::Path,
+        dst: &std::path::Path,
         recurse: bool,
         filter: &CfmlValue,
         parent_locals: &ValueMap,
-    ) -> CfmlResult {
-        let entries = std::fs::read_dir(current_src).map_err(|e| {
-            CfmlError::runtime(format!("Failed to read directory: {}", e))
-        })?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| CfmlError::runtime(format!("Directory entry error: {}", e)))?;
+    ) -> Result<(), CfmlError> {
+        let rd = std::fs::read_dir(src).map_err(|e| CfmlError::application(e.to_string()))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| CfmlError::application(e.to_string()))?;
             let src_entry = entry.path();
-            let name = src_entry
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            
+            let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = src_entry.is_dir();
-            let rel_path = src_entry.strip_prefix(root_src).unwrap_or(&src_entry);
-            let dst_entry = root_dst.join(rel_path);
-
-            // Call filter
-            let entry_type = if is_dir { "directory" } else { "file" };
-            let extension = if is_dir {
-                CfmlValue::string("".to_string())
-            } else {
-                if let Some(dot_idx) = name.rfind('.') {
-                    CfmlValue::string(name[(dot_idx + 1)..].to_string())
-                } else {
-                    CfmlValue::Null
-                }
-            };
-
-            let cb_args = vec![
-                CfmlValue::string(dst_entry.to_string_lossy().to_string()),
-                CfmlValue::string(entry_type.to_string()),
-                extension,
-            ];
-            self.closure_parent_writeback = None;
-            self.closure_parent_deletes = None;
-            let keep = self.call_function(filter, cb_args, parent_locals)?;
-
-            // Check for null/undefined return (Lucee throws on this)
-            if matches!(keep, CfmlValue::Null) {
-                return Err(CfmlError::runtime(
-                    "Can't cast String [] to a boolean".to_string()
-                ));
-            }
-
-            let should_copy = keep.to_condition().map_err(|e| {
-                CfmlError::runtime(format!("Can't cast {} to a boolean", e))
-            })?;
-
+            let accepted = self.call_directory_filter(
+                filter,
+                &src_entry.to_string_lossy(),
+                &name,
+                is_dir,
+                parent_locals,
+            )?;
+            let dst_entry = dst.join(&name);
             if is_dir {
-                // Always recurse into directories, even if rejected (Lucee parity)
                 if recurse {
-                    std::fs::create_dir_all(&dst_entry).ok();
-                    self.copy_recursive_with_closure(
-                        &src_entry,
-                        &dst_entry,
-                        root_src,
-                        root_dst,
-                        recurse,
-                        filter,
-                        parent_locals,
-                    )?;
+                    std::fs::create_dir_all(&dst_entry).map_err(|e| CfmlError::application(e.to_string()))?;
+                    self.copy_recursive_with_closure(&src_entry, &dst_entry, recurse, filter, parent_locals)?;
                 }
-            } else if should_copy {
-                // Copy file
-                if let Some(parent) = dst_entry.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                std::fs::copy(&src_entry, &dst_entry).map_err(|e| {
-                    CfmlError::runtime(format!("Failed to copy file: {}", e))
-                })?;
+            } else if accepted && src_entry.is_file() {
+                std::fs::copy(&src_entry, &dst_entry).map_err(|e| CfmlError::application(e.to_string()))?;
             }
         }
-
-        Ok(CfmlValue::Null)
+        Ok(())
     }
 
-    /// Remove empty directories, checking each with closure filter
+    /// ResourceUtil.removeEmptyFolders(dir, Not(filter)), bottom-up, root included.
+    /// Emptiness ignores `.DS_Store` (IgnoreSystemFiles), which `remove(true)` then
+    /// deletes along with the directory. The filter sees DESTINATION paths here.
     fn remove_empty_folders_closure(
         &mut self,
-        path: &std::path::Path,
+        dir: &std::path::Path,
         filter: &CfmlValue,
         parent_locals: &ValueMap,
-    ) -> CfmlResult {
-        let entries: Vec<_> = std::fs::read_dir(path)
-            .map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?
-            .collect::<Result<_, _>>()
-            .map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?;
-
-        for entry in entries {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                // Recurse first (bottom-up)
-                self.remove_empty_folders_closure(&entry_path, filter, parent_locals)?;
-                
-                // Check if directory is empty
-                let is_empty = std::fs::read_dir(&entry_path)
-                    .map(|mut d| d.next().is_none())
-                    .unwrap_or(false);
-                
-                if is_empty {
-                    // Check filter with closure
-                    let cb_args = vec![
-                        CfmlValue::string(entry_path.to_string_lossy().to_string()),
-                        CfmlValue::string("directory"),
-                        CfmlValue::string(""),
-                    ];
-                    self.closure_parent_writeback = None;
-                    self.closure_parent_deletes = None;
-                    let keep = self.call_function(filter, cb_args, parent_locals)?;
-                    
-                    // Check for null/undefined return (Lucee throws on this)
-                    if matches!(keep, CfmlValue::Null) {
-                        return Err(CfmlError::runtime(
-                            "Can't cast String [] to a boolean".to_string()
-                        ));
-                    }
-                    
-                    let should_keep = keep.to_condition().unwrap_or(true);
-                    if !should_keep {
-                        let _ = std::fs::remove_dir(&entry_path);
-                    }
-                }
+    ) -> Result<(), CfmlError> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        let list = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name() != ".DS_Store")
+                        .map(|e| e.path())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for child in list(dir) {
+            if child.is_dir() {
+                self.remove_empty_folders_closure(&child, filter, parent_locals)?;
             }
         }
-
-        Ok(CfmlValue::Null)
+        if list(dir).is_empty() {
+            let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let keep = self.call_directory_filter(filter, &dir.to_string_lossy(), &name, true, parent_locals)?;
+            if !keep {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        Ok(())
     }
 
-    /// cfdirectory action=copy with closure filter support
-    fn cfdirectory_list_with_closure(
-        &mut self,
-        opts: &CfmlStruct,
-        parent_locals: &ValueMap,
-    ) -> CfmlResult {
-        let dir = opts
-            .get_ci("directory")
-            .map(|v| v.as_string())
-            .unwrap_or_default();
-        let filter = opts
-              .get_ci("filter")
-              .unwrap_or_else(|| CfmlValue::string("*"));
-        let recurse = opts
-            .get_ci("recurse")
-            .map(|v| v.is_true())
-            .unwrap_or(false);
-        let list_info = opts
-            .get_ci("listinfo")
-            .map(|v| v.as_string().to_lowercase())
-            .unwrap_or_else(|| "all".to_string());
-        let sort = opts
-            .get_ci("sort")
-            .map(|v| v.as_string())
-            .unwrap_or_default();
-        let type_filter = opts
-            .get_ci("type")
-            .map(|v| v.as_string().to_lowercase())
-            .unwrap_or_else(|| "all".to_string());
-        
-        // Build args for directory_list_with_closure: (path, recurse, listInfo, filter, sort, type)
-        let args = vec![
-            CfmlValue::string(dir),
-            CfmlValue::Bool(recurse),
-            CfmlValue::string(list_info),
-            filter,
-            CfmlValue::string(sort),
-            CfmlValue::string(type_filter),
-        ];
-        
-        self.directory_list_with_closure(args, parent_locals)
-    }
-
-    fn cfdirectory_copy_from_opts(
-        &mut self,
-        opts: &CfmlStruct,
-        parent_locals: &ValueMap,
-    ) -> CfmlResult {
-        let source = opts
-            .get_ci("source")
-            .or_else(|| opts.get_ci("directory"))
-            .map(|v| v.as_string())
-            .unwrap_or_default();
+    /// cfdirectory action=copy (same Directory.actionCopy as the BIF).
+    fn cfdirectory_copy_from_opts(&mut self, opts: &CfmlStruct, parent_locals: &ValueMap) -> CfmlResult {
+        let filter = opts.get_ci("filter");
+        if !filter.as_ref().map(Self::is_callable_filter).unwrap_or(false) {
+            // String / no filter: stdlib `fn_cfdirectory` "copy" → fn_directory_copy.
+            return Err(intercepts_common::unhandled());
+        }
+        let source = opts.get_ci("directory").map(|v| v.as_string()).unwrap_or_default();
         let destination = opts
             .get_ci("destination")
             .or_else(|| opts.get_ci("newdirectory"))
             .map(|v| v.as_string())
             .unwrap_or_default();
-        let recurse = opts
-            .get_ci("recurse")
-            .or_else(|| opts.get_ci("recursive"))
-            .map(|v| v.is_true())
-            .unwrap_or(false);
-        let create_path = opts
-            .get_ci("createpath")
-            .map(|v| v.is_true())
-            .unwrap_or(true);
-        let filter = opts.get_ci("filter");
-
-        // Build args for directory_copy_with_closure
-        let mut args = vec![
+        let recurse = opts.get_ci("recurse").map(|v| v.is_true()).unwrap_or(false);
+        let create_path = opts.get_ci("createpath").map(|v| v.is_true()).unwrap_or(true);
+        let args = vec![
             CfmlValue::string(source),
             CfmlValue::string(destination),
             CfmlValue::Bool(recurse),
+            filter.unwrap_or(CfmlValue::Null),
+            CfmlValue::Bool(create_path),
         ];
-        
-        if let Some(f) = filter {
-            args.push(f.clone());
-        } else {
-            args.push(CfmlValue::string(""));
-        }
-        
-        args.push(CfmlValue::Bool(create_path));
-
-        // If filter is a closure/UDF, use the closure path; otherwise fall through to stdlib
-        if let Some(CfmlValue::Function(_)) = args.get(3) {
-            self.directory_copy_with_closure(args, parent_locals)
-        } else {
-            // String filter or no filter: let the stdlib cfdirectory handle it
-            Err(intercepts_common::unhandled())
-        }
+        self.directory_copy_with_closure(args, parent_locals)
     }
 }
