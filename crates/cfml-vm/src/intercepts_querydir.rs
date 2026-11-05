@@ -35,7 +35,7 @@ impl CfmlVirtualMachine {
         &mut self,
         name_lower: &str,
         args: Vec<CfmlValue>,
-        parent_locals: &ValueMap,
+        _parent_locals: &ValueMap,
     ) -> CfmlResult {
             if matches!(name_lower, "cfdirectory" | "__cfdirectory") {
                 if let Some(CfmlValue::Struct(opts)) = args.first() {
@@ -155,16 +155,7 @@ impl CfmlVirtualMachine {
             ];
             self.closure_parent_writeback = None;
             self.closure_parent_deletes = None;
-            let scope = pl.as_ref().unwrap_or(parent_locals);
-            let keep = self.call_function(&filter, cb_args, scope)?;
-            if let Some(wb) = self.closure_parent_writeback.take() {
-                let pl_ref = pl.get_or_insert_with(|| parent_locals.clone());
-                for (k, v) in &wb {
-                    pl_ref.insert(k.clone(), v.clone());
-                }
-                Self::write_back_to_captured_scope(&filter, &wb);
-                self.closure_parent_writeback = Some(wb);
-            }
+            let keep = self.call_function(&filter, cb_args, parent_locals)?;
             
             // Coerce return value to boolean
             let should_include = keep.to_condition().map_err(|e| {
@@ -173,10 +164,6 @@ impl CfmlVirtualMachine {
             if should_include {
                 filtered.push((name, full_path, is_dir));
             }
-        }
-        
-        if let Some(ref pl_ref) = pl {
-            self.set_ho_final_writeback(pl_ref, parent_locals);
         }
 
         // Build result based on list_info
@@ -284,7 +271,6 @@ impl CfmlVirtualMachine {
         })?;
 
         // Copy with filter
-        let mut pl: Option<ValueMap> = None;
         let copy_result = self.copy_recursive_with_closure(
             src_path,
             &dst_path,
@@ -293,12 +279,7 @@ impl CfmlVirtualMachine {
             recurse,
             &filter,
             parent_locals,
-            &mut pl,
         );
-
-        if let Some(ref pl_ref) = pl {
-            self.set_ho_final_writeback(pl_ref, parent_locals);
-        }
 
         // Wrap errors as application errors (Lucee parity)
         let copy_result = copy_result.map_err(|e| {
@@ -307,7 +288,7 @@ impl CfmlVirtualMachine {
 
         // Remove empty directories if we filtered (Lucee parity)
         if recurse {
-            self.remove_empty_folders_closure(&dst_path, &filter, parent_locals, &mut pl)?;
+            self.remove_empty_folders_closure(&dst_path, &filter, parent_locals)?;
         }
 
         Ok(copy_result)
@@ -323,7 +304,6 @@ impl CfmlVirtualMachine {
         recurse: bool,
         filter: &CfmlValue,
         parent_locals: &ValueMap,
-        pl: &mut Option<ValueMap>,
     ) -> CfmlResult {
         let entries = std::fs::read_dir(current_src).map_err(|e| {
             CfmlError::runtime(format!("Failed to read directory: {}", e))
@@ -361,16 +341,7 @@ impl CfmlVirtualMachine {
             ];
             self.closure_parent_writeback = None;
             self.closure_parent_deletes = None;
-            let scope = pl.as_ref().unwrap_or(parent_locals);
-            let keep = self.call_function(filter, cb_args, scope)?;
-            if let Some(wb) = self.closure_parent_writeback.take() {
-                let pl_ref = pl.get_or_insert_with(|| parent_locals.clone());
-                for (k, v) in &wb {
-                    pl_ref.insert(k.clone(), v.clone());
-                }
-                Self::write_back_to_captured_scope(filter, &wb);
-                self.closure_parent_writeback = Some(wb);
-            }
+            let keep = self.call_function(filter, cb_args, parent_locals)?;
 
             let should_copy = keep.to_condition().map_err(|e| {
                 CfmlError::runtime(format!("Can't cast {} to a boolean", e))
@@ -388,7 +359,6 @@ impl CfmlVirtualMachine {
                         recurse,
                         filter,
                         parent_locals,
-                        pl,
                     )?;
                 }
             } else if should_copy {
@@ -411,7 +381,6 @@ impl CfmlVirtualMachine {
         path: &std::path::Path,
         filter: &CfmlValue,
         parent_locals: &ValueMap,
-        pl: &mut Option<ValueMap>,
     ) -> CfmlResult {
         let entries: Vec<_> = std::fs::read_dir(path)
             .map_err(|e| CfmlError::runtime(format!("directoryCopy: {}", e)))?
@@ -422,7 +391,7 @@ impl CfmlVirtualMachine {
             let entry_path = entry.path();
             if entry_path.is_dir() {
                 // Recurse first (bottom-up)
-                self.remove_empty_folders_closure(&entry_path, filter, parent_locals, pl)?;
+                self.remove_empty_folders_closure(&entry_path, filter, parent_locals)?;
                 
                 // Check if directory is empty
                 let is_empty = std::fs::read_dir(&entry_path)
@@ -438,16 +407,7 @@ impl CfmlVirtualMachine {
                     ];
                     self.closure_parent_writeback = None;
                     self.closure_parent_deletes = None;
-                    let scope = pl.as_ref().unwrap_or(parent_locals);
-                    let keep = self.call_function(filter, cb_args, scope)?;
-                    if let Some(wb) = self.closure_parent_writeback.take() {
-                        let pl_ref = pl.get_or_insert_with(|| parent_locals.clone());
-                        for (k, v) in &wb {
-                            pl_ref.insert(k.clone(), v.clone());
-                        }
-                        Self::write_back_to_captured_scope(filter, &wb);
-                        self.closure_parent_writeback = Some(wb);
-                    }
+                    let keep = self.call_function(filter, cb_args, parent_locals)?;
                     
                     let should_keep = keep.to_condition().unwrap_or(true);
                     if !should_keep {
@@ -502,11 +462,11 @@ impl CfmlVirtualMachine {
         
         args.push(CfmlValue::Bool(create_path));
 
-        // If filter is a closure/UDF, use the closure path
+        // If filter is a closure/UDF, use the closure path; otherwise fall through to stdlib
         if let Some(CfmlValue::Function(_)) = args.get(3) {
             self.directory_copy_with_closure(args, parent_locals)
         } else {
-            // Fall through to the builtin string-based implementation
+            // String filter or no filter: let the stdlib cfdirectory handle it
             Err(intercepts_common::unhandled())
         }
     }

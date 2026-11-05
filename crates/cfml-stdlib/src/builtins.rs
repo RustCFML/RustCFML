@@ -17000,6 +17000,33 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
             })?;
             Ok(CfmlValue::Null)
         }
+        "copy" => {
+            // cfdirectory action="copy" delegates to directoryCopy
+            let destination = get_ci(opts, "destination")
+                .or_else(|| get_ci(opts, "newdirectory"))
+                .map(|v| v.as_string())
+                .unwrap_or_else(String::new);
+            let recurse = get_ci(opts, "recurse")
+                .or_else(|| get_ci(opts, "recursive"))
+                .map(|v| v.is_true())
+                .unwrap_or(false);
+            let filter = get_ci(opts, "filter")
+                .unwrap_or_else(|| CfmlValue::string(""));
+            let create_path = get_ci(opts, "createpath")
+                .map(|v| v.is_true())
+                .unwrap_or(true);
+            
+            // Build args for directoryCopy: (source, destination, recurse, filter, createPath)
+            let dir_copy_args = vec![
+                CfmlValue::string(directory),
+                CfmlValue::string(destination),
+                CfmlValue::Bool(recurse),
+                filter,
+                CfmlValue::Bool(create_path),
+            ];
+            
+            fn_directory_copy(dir_copy_args)
+        }
         _ => Err(CfmlError::runtime(format!(
             "cfdirectory: unsupported action '{}'",
             action
