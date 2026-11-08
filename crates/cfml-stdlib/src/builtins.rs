@@ -9810,16 +9810,56 @@ fn fn_get_temp_directory(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(cfml_common::vfs::temp_dir_with_separator()))
 }
 
+/// getTempFile(dir, prefix): a new, empty file in `dir`, created here so no
+/// other caller can be handed the same path, as Lucee and ACF do.
+///
+/// The name used to be the prefix plus the clock in nanoseconds, with no file
+/// created. macOS's clock moves in whole microseconds, so callers in the same
+/// microsecond (any two threads, or one fast loop) got the same path: Preside
+/// generating two image derivatives at once wrote both into one temp file and
+/// stored the same image for both assets. A process-wide counter keeps names
+/// apart within the process; `create_new` makes the reservation atomic across
+/// processes and against files already there.
 fn fn_get_temp_file(args: Vec<CfmlValue>) -> CfmlResult {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let dir = if args.is_empty() {
         std::env::temp_dir().to_string_lossy().to_string()
     } else {
         get_str(&args, 0)
     };
     let prefix = if args.len() >= 2 { get_str(&args, 1) } else { "tmp".to_string() };
-    let ts = cfml_common::clock::now_unix_nanos();
-    let path = std::path::Path::new(&dir).join(format!("{}{}.tmp", prefix, ts));
-    Ok(CfmlValue::string(path.to_string_lossy().to_string()))
+    let dir_path = std::path::Path::new(&dir);
+
+    for _ in 0..100 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Random-looking bits so names are not guessable from one another;
+        // uniqueness comes from the counter and create_new, not from these.
+        let noise = splitmix64(
+            (cfml_common::clock::now_unix_nanos() as u64) ^ ((std::process::id() as u64) << 32) ^ n,
+        );
+        let path = dir_path.join(format!("{}{:x}{:012x}.tmp", prefix, n, noise & 0xFFFF_FFFF_FFFF));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(CfmlValue::string(path.to_string_lossy().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // No filesystem (the wasm targets): the name is still unique to
+            // this process, which is all a caller there can use it for.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Ok(CfmlValue::string(path.to_string_lossy().to_string()))
+            }
+            Err(e) => {
+                return Err(CfmlError::runtime(format!(
+                    "getTempFile: could not create a file in [{}]: {}",
+                    dir, e
+                )))
+            }
+        }
+    }
+    Err(CfmlError::runtime(format!(
+        "getTempFile: could not find a free file name in [{}]",
+        dir
+    )))
 }
 
 fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
