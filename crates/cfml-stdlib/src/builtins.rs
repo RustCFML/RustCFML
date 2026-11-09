@@ -21855,13 +21855,14 @@ fn fn_csrf_verify_token(args: Vec<CfmlValue>) -> CfmlResult {
         return Err(CfmlError::runtime("csrfVerifyToken requires at least 1 argument: token".to_string()));
     }
 
-    let token = get_str(&args, 0);
-    // key (args[1]) is accepted but ignored
-
-    // Verify: must be exactly 64 hex characters (32 bytes)
-    let is_valid = token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit());
-
-    Ok(CfmlValue::Bool(is_valid))
+    // Verification needs the session that issued the token, which only the VM
+    // has; it intercepts this name. This body is reached only where there is no
+    // VM session (an embedder calling the stdlib directly). It used to accept
+    // ANY 64-hex string — a forgery check that verified nothing — so it now
+    // refuses to answer rather than answer wrongly.
+    Err(CfmlError::runtime(
+        "csrfVerifyToken needs a session: it is only available inside a request".to_string(),
+    ))
 }
 
 // ---- cfzip ----

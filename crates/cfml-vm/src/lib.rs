@@ -3975,6 +3975,16 @@ pub fn report_live_bodies() {
 /// same request twice and diff. This is the view neither the heap profiler
 /// (which attributes to allocation SITES, not owners) nor the cycle collector
 /// (which only sees tracked nodes) can give.
+/// Compare two secrets without an early exit on the first differing byte.
+/// (Length is not hidden; tokens here have a fixed, public length.)
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Render one `cookie` scope entry as a `Set-Cookie` value (GH #423).
 ///
 /// A scalar is `name=value;Path=/`. A struct is Lucee's long form, whose keys
@@ -24281,10 +24291,15 @@ impl CfmlVirtualMachine {
                     let found = match self.get_session_scope() {
                         CfmlValue::Struct(s) => match s.get("__csrf_tokens") {
                             Some(CfmlValue::Struct(m)) => match m.get(&key) {
+                                // Constant-time per comparison, so response
+                                // timing does not reveal how much of a guessed
+                                // token matched.
                                 Some(CfmlValue::Array(a)) => a
                                     .snapshot()
                                     .iter()
-                                    .any(|t| t.as_string() == token),
+                                    .fold(false, |hit, t| {
+                                        hit | constant_time_str_eq(&t.as_string(), &token)
+                                    }),
                                 _ => false,
                             },
                             _ => false,
