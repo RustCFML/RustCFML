@@ -91,6 +91,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | § | Item | Status |
 |---|---|---|
 | [8](#8) | wasm / CLI restrictions | 🌍 |
+| [121](#121) | SQL Server TLS fails on macOS against some servers; `encrypt=false` skips TLS there | 🌍 |
 
 
 ---
@@ -2028,6 +2029,26 @@ worker thread — is already done by the engine's thread seed.
 | `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
 | `java.security.KeyPairGenerator.generateKeyPair()` | Not supported on `wasm32`: there is no OS entropy source, and inventing a key from a deterministic source would be worse than failing. Throws with that explanation. Generate the pair elsewhere and supply it as PEM. |
 | `SHA512withECDSA` **signing** (P-521 only) | Not supported on `wasm32`, for the same reason: `p521` has no RFC 6979 implementation, so P-521 signing draws a random nonce. P-521 *verification*, and both signing and verification on P-256/P-384 (which are RFC 6979 deterministic), work everywhere. |
+
+<a id="121"></a>
+
+## 121. SQL Server TLS fails on macOS against some servers 🌍
+
+The SQL Server driver (tiberius) uses `native-tls`, which is Apple's Secure
+Transport on macOS and OpenSSL on Linux. Against a SQL Server instance using its
+self-signed fallback certificate (RSA 3072, SHA-256, TLS 1.2
+`ECDHE-RSA-AES256-GCM-SHA384`), the macOS build fails every connection with
+`Error forming TLS connection: connection closed via error`. The Linux build,
+and OpenSSL itself, complete the same handshake.
+
+`encrypt=false` (in an `mssql://` URL, or carried over from a translated
+`jdbc:sqlserver://` connection string) encrypts only the login, as the Microsoft
+JDBC driver does — except on macOS, where until this is fixed it skips TLS
+entirely, login included, and so needs a server that does not force encryption.
+Connections that want encryption have no workaround on macOS.
+
+To fix: find what Secure Transport rejects in the handshake (or move macOS to
+the OpenSSL backend), then give macOS the same `encrypt=false` mapping as Linux.
 
 ---
 

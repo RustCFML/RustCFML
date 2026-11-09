@@ -275,10 +275,13 @@ both `jdbc:sqlserver://host:1433;databaseName=db;…` and jTDS's
 `password`. `databaseName`, `encrypt` and `trustServerCertificate` carry over;
 other JDBC properties (timeouts, `applicationIntent`, …) are ignored.
 
+`encrypt=false` encrypts only the login, as the JDBC driver does. On macOS it
+currently skips TLS altogether — see [known issue §121](known-issues.md#121).
+
 Credentials in the URL are percent-decoded, like MySQL and PostgreSQL URLs, so
 a password containing `@`, `:`, `/`, `?`, `#` or `%` must be percent-encoded
 (`p%40ss`). A datasource declared with separate `username` / `password` keys in
-`.cfconfig.json` is encoded for you.
+`.cfconfig.json`, or a JDBC connection string, is encoded for you.
 
 ## Tracing the SQL an app actually sends
 

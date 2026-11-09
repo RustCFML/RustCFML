@@ -12796,6 +12796,9 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
     // server with a self-signed certificate opts out with
     // `trustServerCertificate=true` in the URL.
     let mut trust_cert = false;
+    // `encrypt=false` (JDBC's spelling, carried over from a translated
+    // `jdbc:sqlserver://` URL): no TLS for the session. See `login_only` below.
+    let mut login_only = false;
     if let Some(q) = &query {
         for pair in q.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -12804,6 +12807,7 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
                         trust_cert = !(v.eq_ignore_ascii_case("false") || v == "0");
                     }
                     "encrypt" if v.eq_ignore_ascii_case("strict") => trust_cert = false,
+                    "encrypt" if v.eq_ignore_ascii_case("false") || v == "0" => login_only = true,
                     _ => {}
                 }
             }
@@ -12817,6 +12821,17 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
     config.authentication(AuthMethod::sql_server(user, pass));
     if trust_cert {
         config.trust_cert();
+    }
+    if login_only {
+        // As the Microsoft JDBC driver does, encrypt the login only.
+        #[cfg(not(target_os = "macos"))]
+        config.encryption(tiberius::EncryptionLevel::Off);
+        // macOS's TLS stack (Secure Transport, via native-tls) aborts the
+        // handshake with some SQL Servers that OpenSSL connects to fine
+        // (docs/known-issues.md). Until that is fixed, `encrypt=false` there
+        // skips TLS entirely, login included; the server must allow it.
+        #[cfg(target_os = "macos")]
+        config.encryption(tiberius::EncryptionLevel::NotSupported);
     }
 
     Ok((config, format!("{}:{}", host, port)))
