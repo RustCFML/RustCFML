@@ -834,17 +834,26 @@ fn strip_one_trailing_crlf(part: &[u8]) -> &[u8] {
 /// Everything up to the last `/` or `\\` is dropped (a browser sends a bare
 /// name; historically IE sent a full Windows path, which ACF/Lucee also strip),
 /// and a name that reduces to nothing, `.` or `..` becomes `upload`.
+///
+/// Trailing dots and spaces are removed and `:` is replaced: Windows drops the
+/// former when it creates the file and reads the latter as an NTFS stream, so
+/// `shell.cfm.` and `shell.cfm::$DATA` both land on disk as `shell.cfm` while
+/// their extension (`""`, `cfm::$data`) slipped past the blocked-extension
+/// check. Normalising here makes the name that is checked the name that is
+/// written, on every platform.
 pub fn sanitize_upload_filename(raw: &str) -> String {
     let base = raw
         .rsplit(|c| c == '/' || c == '\\')
         .next()
         .unwrap_or("")
         .trim()
-        .trim_matches('\0');
+        .trim_matches('\0')
+        .trim_end_matches(['.', ' '])
+        .replace(':', "_");
     if base.is_empty() || base == "." || base == ".." {
         return "upload".to_string();
     }
-    base.to_string()
+    base
 }
 
 /// Build the `form.<field>` struct describing one uploaded file.
@@ -1192,6 +1201,11 @@ mod tests {
         assert_eq!(sanitize_upload_filename(".."), "upload");
         assert_eq!(sanitize_upload_filename(""), "upload");
         assert_eq!(sanitize_upload_filename("/"), "upload");
+        // Windows would write these as `shell.cfm`; the extension check must see that.
+        assert_eq!(sanitize_upload_filename("shell.cfm."), "shell.cfm");
+        assert_eq!(sanitize_upload_filename("shell.cfm . ."), "shell.cfm");
+        assert_eq!(sanitize_upload_filename("shell.cfm::$DATA"), "shell.cfm__$DATA");
+        assert_eq!(sanitize_upload_filename("..."), "upload");
     }
 
     #[test]
