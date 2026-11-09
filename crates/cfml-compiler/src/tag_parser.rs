@@ -1246,15 +1246,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // must also resolve to the current row (Lucee puts the query at
                 // the head of the loop body's scope cascade) — the same
                 // row-into-variables merge `<cfoutput query>` and the grouped
-                // form already do (docs known-issues §13, GitHub PR #318).
+                // form already do (docs known-issues §13, GitHub PR #318). The
+                // pseudo-columns come too: a bare `currentRow` / `recordCount` /
+                // `columnList` in the body is the looped query's, as on Lucee
+                // (`queryGetRow( q, currentRow )`).
                 (
                     format!(
-                        "{window}for (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\nstructAppend(variables, queryGetRow({q}, {i}), true);\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
+                        "{window}for (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\nstructAppend(variables, queryGetRow({q}, {i}), true);\nvariables.currentRow = {i};\nvariables.recordCount = {rc};\nvariables.columnList = {q}.columnlist;\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
                         window = window,
                         q = q,
                         sr = sr,
                         er = er,
                         i = i,
+                        rc = rc,
                         query = query,
                         body = body_script,
                     ),

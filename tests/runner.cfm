@@ -588,6 +588,7 @@ include "harness.cfm";
 
 <!--- --- Tags --- --->
 <cf_runtest file="tags/test_cfdump_tag.cfm" />
+<cf_runtest file="tags/test_cfloop_query_pseudo_columns.cfm" />
 <cf_runtest file="tags/test_script_child_tags.cfm" />
 <cf_runtest file="tags/test_zip_tag_params.cfm" />
 <cf_runtest file="tags/test_tag_preprocessor_masa_fixes.cfm" />
