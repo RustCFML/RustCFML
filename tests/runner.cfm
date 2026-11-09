@@ -329,6 +329,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_file_io.cfm" />
 <cf_runtest file="stdlib/test_gettempfile.cfm" />
 <cf_runtest file="security/test_allocation_caps.cfm" rustcfmlOnly="true" why="Lucee has no per-call cap; it relies on the JVM heap limit" />
+<cf_runtest file="security/test_encode_hash_parity.cfm" />
 <cf_runtest file="stdlib/test_exists_memo_invalidation.cfm" />
 <!--- Request-scoped fileExists()/directoryExists() memo: positives only, and --->
 <!--- every mutating file BIF drops it (GH #299). --->

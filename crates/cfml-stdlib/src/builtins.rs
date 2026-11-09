@@ -9084,34 +9084,50 @@ fn fn_hash(args: Vec<CfmlValue>) -> CfmlResult {
     // producing a plausible-looking but wrong digest that broke AWS SigV4
     // payload signing and every other hash-the-bytes protocol (GH #376).
     // A plain string argument still hashes its UTF-8 bytes, exactly as before.
-    let input = get_bytes(&args, 0);
+    //
+    // `encoding` (3rd) and `numIterations` (4th) follow Lucee's
+    // `Hash.invoke`: a string is encoded in `encoding` (default UTF-8) and the
+    // DIGEST BYTES are re-digested `numIterations` times
+    // (`data = md.digest(data)`), hex-encoded once at the end. Both arguments
+    // used to be ignored, so `hash(pw, "SHA-512", "UTF-8", 1000)` silently
+    // returned a single-round digest — a password "stretching" that did nothing.
+    let input = match (args.first(), args.get(2).map(|v| v.as_string())) {
+        (Some(CfmlValue::Binary(_)), _) | (_, None) => get_bytes(&args, 0),
+        (_, Some(enc)) if enc.trim().is_empty() => get_bytes(&args, 0),
+        (_, Some(enc)) => {
+            let cs = cfml_common::charset::resolve(enc.trim()).ok_or_else(|| {
+                CfmlError::runtime(format!("hash: unsupported encoding [{}]", enc))
+            })?;
+            cfml_common::charset::encode(&get_str(&args, 0), cs)
+        }
+    };
+    let iterations = match args.get(3) {
+        Some(v) => get_int(&args, 3).map_err(|_| {
+            CfmlError::runtime(format!("hash: numIterations [{}] is not a number", v.as_string()))
+        })?,
+        None => 1,
+    }
+    .max(1);
+    // A bound so one call cannot pin a request thread for minutes.
+    const MAX_HASH_ITERATIONS: i64 = 10_000_000;
+    if iterations > MAX_HASH_ITERATIONS {
+        return Err(CfmlError::runtime(format!(
+            "hash: numIterations [{iterations}] exceeds the maximum of {MAX_HASH_ITERATIONS}"
+        )));
+    }
+    fn digest_n<D: Digest>(mut data: Vec<u8>, n: i64) -> String {
+        for _ in 0..n {
+            data = D::digest(&data).to_vec();
+        }
+        data.iter().map(|b| format!("{:02X}", b)).collect()
+    }
     let algorithm = if args.len() >= 2 { get_str(&args, 1).to_uppercase() } else { "MD5".to_string() };
     let hex = match algorithm.as_str() {
-        "MD5" => {
-            let mut hasher = Md5::new();
-            hasher.update(&input);
-            format!("{:X}", hasher.finalize())
-        }
-        "SHA-1" | "SHA1" => {
-            let mut hasher = Sha1::new();
-            hasher.update(&input);
-            format!("{:X}", hasher.finalize())
-        }
-        "SHA-256" | "SHA256" => {
-            let mut hasher = Sha256::new();
-            hasher.update(&input);
-            format!("{:X}", hasher.finalize())
-        }
-        "SHA-384" | "SHA384" => {
-            let mut hasher = Sha384::new();
-            hasher.update(&input);
-            format!("{:X}", hasher.finalize())
-        }
-        "SHA-512" | "SHA512" => {
-            let mut hasher = Sha512::new();
-            hasher.update(&input);
-            format!("{:X}", hasher.finalize())
-        }
+        "MD5" => digest_n::<Md5>(input, iterations),
+        "SHA-1" | "SHA1" => digest_n::<Sha1>(input, iterations),
+        "SHA-256" | "SHA256" => digest_n::<Sha256>(input, iterations),
+        "SHA-384" | "SHA384" => digest_n::<Sha384>(input, iterations),
+        "SHA-512" | "SHA512" => digest_n::<Sha512>(input, iterations),
         _ => {
             // Lucee throws java.security.NoSuchAlgorithmException here
             // ("bogus-alg MessageDigest not available", verified on 7.0.4). This
@@ -9970,21 +9986,26 @@ fn fn_encode_for_css(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(result))
 }
 
+/// OWASP ESAPI's `JavaScriptCodec`, which Lucee's `encodeForJavaScript` uses:
+/// letters, digits and `,._` pass through; every other UTF-16 code unit below
+/// 256 becomes `\xHH`, the rest `\uHHHH` (uppercase hex). The old short list
+/// left `&`, backtick and `$`/`{` alone, so `&#39;` broke out of an event-handler
+/// attribute (the browser decodes it before the script runs) and `${...}`
+/// executed inside a template literal.
 fn fn_encode_for_javascript(args: Vec<CfmlValue>) -> CfmlResult {
+    use std::fmt::Write as _;
     let s = get_str(&args, 0);
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            '\\' => result.push_str("\\\\"),
-            '\'' => result.push_str("\\'"),
-            '"' => result.push_str("\\\""),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            '/' => result.push_str("\\/"),
-            '<' => result.push_str("\\u003C"),
-            '>' => result.push_str("\\u003E"),
-            _ => result.push(c),
+    let mut result = String::with_capacity(s.len() * 2);
+    for unit in s.encode_utf16() {
+        let c = unit as u32;
+        let passthrough = c < 128
+            && ((c as u8).is_ascii_alphanumeric() || matches!(c as u8, b',' | b'.' | b'_'));
+        if passthrough {
+            result.push(c as u8 as char);
+        } else if c < 256 {
+            let _ = write!(result, "\\x{:02X}", c);
+        } else {
+            let _ = write!(result, "\\u{:04X}", c);
         }
     }
     Ok(CfmlValue::string(result))
