@@ -45,11 +45,12 @@ pub trait SessionStore: Send + Sync + 'static {
     /// - an id the server never issued (planted by an attacker for session
     ///   fixation): refused, a fresh id is minted.
     ///
-    /// The default answers `true` — keep honouring the id — for stores that
-    /// cannot look an id up across applications cheaply (memcached, cluster),
-    /// which therefore keep CF/Lucee's behaviour.
+    /// The default answers `false` — refuse — so a store that does not
+    /// implement this is safe against fixation rather than open to it (it may
+    /// cost a cross-application cookie its shared id). Every built-in store
+    /// implements it.
     fn id_issued(&self, _id: &str) -> bool {
-        true
+        false
     }
 
     /// Whether `get` is an in-process lookup a caller may repeat freely.
@@ -140,6 +141,21 @@ pub struct MemoryStore {
 /// lowercase the app portion for consistent lookups.
 pub fn composite_key(app: &str, id: &str) -> String {
     format!("{}\u{1f}{}", app.to_lowercase(), id)
+}
+
+/// Is `id` shaped like a session id this engine mints (a hyphenated UUID)?
+///
+/// The `CFID` cookie is client input. Unvalidated it became a memcached key
+/// (where a space in it is a text-protocol injection) and a cluster document
+/// key. A cookie that fails this is treated as absent, so a fresh id is
+/// minted — exactly what happens for a client with no cookie at all.
+pub fn is_valid_session_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 /// Recover the bare session id from a composite key (everything after the
@@ -419,5 +435,27 @@ mod tests {
         store.set("x", "b", session("x", base, 30)); // expires at base+30  (earliest)
         store.set("x", "c", session("x", base, 900)); // expires at base+900
         assert_eq!(store.next_expiry(base), Some(base + 30));
+    }
+}
+
+#[cfg(test)]
+mod session_id_format_tests {
+    use super::is_valid_session_id;
+
+    #[test]
+    fn only_uuid_shaped_ids_are_accepted() {
+        assert!(is_valid_session_id(&uuid::Uuid::new_v4().to_string()));
+        assert!(is_valid_session_id("0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"));
+        for bad in [
+            "",
+            "abc",
+            "0f1e2d3c 4b5a 6978 8796 a5b4c3d2e1f0",
+            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0 ",
+            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1fg",
+            "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\r\nset x 0 0 1",
+            "../../../../etc/passwd-aaaaaaaaaaaaa",
+        ] {
+            assert!(!is_valid_session_id(bad), "{bad:?}");
+        }
     }
 }

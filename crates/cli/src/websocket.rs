@@ -201,6 +201,7 @@ pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
         let c = c.trim();
         c.strip_prefix("CFID=").map(|v| v.to_string())
     })
+    .filter(|id| cfml_vm::session_store::is_valid_session_id(id))
 }
 
 /// The HTTP handshake behind a connection, as CFML sees it: headers, cookies

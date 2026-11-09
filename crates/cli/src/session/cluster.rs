@@ -852,6 +852,20 @@ mod inner {
             Some(s)
         }
 
+        /// Session-fixation guard: only an id some live session already uses
+        /// may be adopted under another application. Every node holds the full
+        /// replicated set, so this is a local scan (on the miss path only).
+        fn id_issued(&self, id: &str) -> bool {
+            let now = now_unix_secs();
+            let Ok(docs) = self.shared.docs.lock() else { return false };
+            docs.iter().any(|(k, doc)| {
+                id_from_key(k) == id
+                    && read_session(doc).is_some_and(|s| {
+                        now.saturating_sub(s.last_accessed_secs) <= s.timeout_secs
+                    })
+            })
+        }
+
         /// Every node holds the full replicated set, so the count is local
         /// and exact; expired records (not yet reaped) are skipped.
         fn session_count(&self) -> Option<usize> {

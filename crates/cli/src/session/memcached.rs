@@ -52,6 +52,13 @@ mod inner {
         fn key(&self, app: &str, id: &str) -> String {
             format!("{}{}\u{1f}{}", self.key_prefix, app.to_lowercase(), id)
         }
+
+        /// A marker that this server issued `id`, written beside every
+        /// session record. Memcached cannot be scanned by id across
+        /// applications, so `id_issued` reads this instead.
+        fn issued_key(&self, id: &str) -> String {
+            format!("{}\u{1f}issued\u{1f}{}", self.key_prefix, id)
+        }
     }
 
     impl SessionStore for MemcachedStore {
@@ -75,7 +82,14 @@ mod inner {
             if let Ok(json) = serde_json::to_string(&data) {
                 let ttl = data.timeout_secs as u32;
                 let _ = self.client.set(&self.key(app, id), json, ttl);
+                let _ = self.client.set(&self.issued_key(id), "1", ttl);
             }
+        }
+
+        /// Session-fixation guard: adopt an unknown id under another
+        /// application only if this server issued it (see `issued_key`).
+        fn id_issued(&self, id: &str) -> bool {
+            matches!(self.client.get::<String>(&self.issued_key(id)), Ok(Some(_)))
         }
 
         fn remove(&self, app: &str, id: &str) {

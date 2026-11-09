@@ -4501,6 +4501,9 @@ async fn handle_request_inner(
                             None
                         }
                     })
+                    // Client input: anything that is not an id we could have
+                    // minted is treated as no cookie at all.
+                    .filter(|id| cfml_vm::session_store::is_valid_session_id(id))
             };
             let session_id_clone = existing_sid.clone();
 

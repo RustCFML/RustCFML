@@ -216,3 +216,28 @@ fn debug_output_reaches_whitelisted_viewer() {
     let err = get(server.port, "/err.cfm");
     assert!(err.contains("boom-secret-detail"), "whitelisted viewer lost error detail:\n{err}");
 }
+
+/// The `CFID` cookie is client input: a value that is not an id this engine
+/// could have minted (here, one carrying a space — a memcached text-protocol
+/// injection) must be ignored and a fresh id issued.
+#[test]
+fn a_malformed_cfid_cookie_is_not_adopted() {
+    let server = start(
+        "cfid",
+        "{}",
+        &[
+            ("Application.cfc", "component { this.name = \"cfidprobe\"; this.sessionManagement = true; }"),
+            ("s.cfm", "<cfset session.touched = true><cfoutput>sid=#session.sessionid#</cfoutput>"),
+        ],
+        &[],
+    );
+    let planted = "evil value";
+    let resp = get_with(server.port, "/s.cfm", &format!("Cookie: CFID={planted}\r\n"));
+    assert!(!resp.contains(planted), "planted CFID was adopted:\n{resp}");
+    let set_cookie = resp
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie: cfid="))
+        .unwrap_or_else(|| panic!("no fresh CFID issued:\n{resp}"));
+    let fresh = set_cookie["set-cookie: cfid=".len()..].split(';').next().unwrap();
+    assert_eq!(fresh.len(), 36, "fresh id is not a UUID: {fresh}");
+}
