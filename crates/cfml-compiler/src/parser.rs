@@ -96,8 +96,21 @@ const UNSUPPORTED_TAG_STATEMENTS: &[&str] = &[
 
 impl Parser {
     pub fn new(source: String) -> Self {
-        let mut lexer = Lexer::new(source);
-        let tokens = lexer.tokenize();
+        // Tag islands are lowered to script first; a malformed one becomes
+        // an error token so the parse fails with its message.
+        let (expanded, error) = if !source.contains(crate::tag_parser::FENCE) {
+            (source, None)
+        } else {
+            match crate::tag_parser::script_islands_checked(&source) {
+                Ok(script) => (script, None),
+                Err(message) => (String::new(), Some(message)),
+            }
+        };
+        let mut lexer = Lexer::new(expanded);
+        let mut tokens = lexer.tokenize();
+        if let Some(message) = error {
+            tokens.insert(0, TokenWithLoc { token: Token::Error(message), location: SourceLocation::default() });
+        }
         let doc_comments = lexer.doc_comments().iter().cloned().collect();
         let raw_spellings = lexer.take_raw_spellings();
         Self {

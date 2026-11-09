@@ -17,6 +17,7 @@ include "harness.cfm";
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm" />
 <cf_runtest file="core/test_recursion_and_depth_limits.cfm" />
+<cf_runtest file="core/test_tag_islands.cfm" />
 <cf_runtest file="core/test_script_tag_statement_refusals.cfm" rustcfmlOnly="true" />
 <cf_runtest file="core/test_numeric_string_equality.cfm" />
 <cf_runtest file="core/test_closure_var_shadows_captured_after_nested_call.cfm" />
