@@ -160,6 +160,14 @@ pub(crate) fn decide(
     // unreachable, which is the honest outcome of having configured no way to
     // identify anyone.
     if cfg.auth_tokens.is_empty() && !has_hook(cfg) {
+        // Anonymous access rests entirely on the address check, and that check
+        // reads the socket peer. Behind a reverse proxy on the same host the
+        // peer is always 127.0.0.1, so the loopback default would admit the
+        // whole internet. A request that a proxy forwarded is therefore never
+        // anonymous: configure a token (or a hook) to serve one.
+        if forwarded_by_proxy(headers) {
+            return Err(Denied::Address);
+        }
         return Ok(Decision::Done(Caller { authorization, ..Caller::anonymous(cfg) }));
     }
 
@@ -172,6 +180,15 @@ pub(crate) fn decide(
         None if has_hook(cfg) => Ok(Decision::Resolve(presented)),
         None => Err(Denied::Token),
     }
+}
+
+/// Did a proxy forward this request? Any of the de-facto and standard
+/// forwarding headers counts. A client can add these itself too, which only
+/// gets it refused — never admitted.
+pub(crate) fn forwarded_by_proxy(headers: &HeaderMap) -> bool {
+    ["x-forwarded-for", "forwarded", "x-real-ip", "x-forwarded-host", "x-original-url"]
+        .iter()
+        .any(|h| headers.contains_key(*h))
 }
 
 /// Is an `authenticate` hook configured?
@@ -709,6 +726,25 @@ mod tests {
         }
         // No token at all is still a 401, hook or not.
         assert_eq!(decide(&cfg, local(), &HeaderMap::new()).unwrap_err(), Denied::Token);
+    }
+
+    /// Behind a same-host reverse proxy every peer is 127.0.0.1, so the
+    /// loopback default must not make a proxied request anonymous-admissible.
+    #[test]
+    fn a_proxied_request_is_never_anonymous() {
+        let cfg = cfg();
+        assert!(matches!(decide(&cfg, local(), &HeaderMap::new()), Ok(Decision::Done(_))));
+        for h in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+            assert_eq!(
+                decide(&cfg, local(), &headers(&[(h, "203.0.113.9")])).unwrap_err(),
+                Denied::Address,
+                "{h}"
+            );
+        }
+        // With a token configured, a proxied caller that presents it is fine.
+        let cfg = with_token("static", &["admin"]);
+        let h = headers(&[("x-forwarded-for", "203.0.113.9"), ("authorization", "Bearer static")]);
+        assert!(matches!(decide(&cfg, local(), &h), Ok(Decision::Done(_))));
     }
 
     #[test]
