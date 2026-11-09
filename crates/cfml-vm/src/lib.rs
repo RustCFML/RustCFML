@@ -1004,6 +1004,72 @@ pub(crate) fn cfconfig_to_cfml(cfg: &cfml_config::RustCfmlConfig) -> CfmlValue {
     }
 }
 
+/// [`cfconfig_to_cfml`] with credentials masked — what `server.cfconfig`
+/// shows to CFML. It used to be the whole configuration, so
+/// `#server.cfconfig.datasources.main.password#` printed the database
+/// password to any template (and to anything that dumped the server scope).
+/// Engine code that needs the real values (`mcpClient`, extension drivers)
+/// reads the configuration itself, not this tree.
+pub(crate) fn cfconfig_to_cfml_redacted(cfg: &cfml_config::RustCfmlConfig) -> CfmlValue {
+    match serde_json::to_value(cfg) {
+        Ok(mut v) => {
+            redact_credentials(&mut v);
+            let tree = json_value_to_cfml(v);
+            mark_tree_read_only(&tree);
+            tree
+        }
+        Err(_) => CfmlValue::strukt(ValueMap::default()),
+    }
+}
+
+/// The mask a redacted credential shows.
+pub(crate) const REDACTED: &str = "********";
+
+/// Does a configuration key name hold a credential? Case-insensitive:
+/// `password`, `*secret*`, `*token*`, `authorization`, and names ending in
+/// `key` (`secretKey`, `apiKey`, `secretAccessKey`, `privateKey`).
+pub(crate) fn is_credential_key(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("password")
+        || n.contains("secret")
+        || n.contains("token")
+        || n == "authorization"
+        || n.ends_with("key")
+}
+
+fn redact_credentials(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map.iter_mut() {
+                let scalar_secret = is_credential_key(k)
+                    && !matches!(child, serde_json::Value::Object(_) | serde_json::Value::Array(_));
+                if scalar_secret {
+                    let empty = child.is_null() || child.as_str().is_some_and(str::is_empty);
+                    if !empty {
+                        *child = serde_json::Value::String(REDACTED.to_string());
+                    }
+                } else if is_credential_key(k) {
+                    // A list or object of credentials (`authToken: ["a","b"]`).
+                    mask_all_scalars(child);
+                } else {
+                    redact_credentials(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_credentials),
+        _ => {}
+    }
+}
+
+fn mask_all_scalars(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => map.values_mut().for_each(mask_all_scalars),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_all_scalars),
+        serde_json::Value::Null => {}
+        other => *other = serde_json::Value::String(REDACTED.to_string()),
+    }
+}
+
 /// Mark every struct in a CFML tree read-only. The `server.cfconfig` tree is
 /// shared server-wide (one instance for every request), so a write through it
 /// must be refused rather than silently become visible to every other request.
@@ -26843,7 +26909,7 @@ impl CfmlVirtualMachine {
     /// built, as before.
     fn cfconfig_scope_tree(&self, cfg: &Arc<cfml_config::RustCfmlConfig>) -> CfmlValue {
         let Some(ss) = self.server_state.as_ref() else {
-            return cfconfig_to_cfml(cfg);
+            return cfconfig_to_cfml_redacted(cfg);
         };
         let ptr = Arc::as_ptr(cfg) as usize;
         let mut guard = ss.cfconfig_scope_cache.lock();
@@ -26856,12 +26922,12 @@ impl CfmlVirtualMachine {
                 e.ptr = ptr;
                 return e.tree.clone();
             }
-            let tree = cfconfig_to_cfml(cfg);
+            let tree = cfconfig_to_cfml_redacted(cfg);
             *e = CfconfigScopeEntry { ptr, json, tree: tree.clone() };
             return tree;
         }
         let json = serde_json::to_string(&**cfg).unwrap_or_default();
-        let tree = cfconfig_to_cfml(cfg);
+        let tree = cfconfig_to_cfml_redacted(cfg);
         *guard = Some(CfconfigScopeEntry { ptr, json, tree: tree.clone() });
         tree
     }
@@ -48685,6 +48751,34 @@ mod debug_footer_gate_tests {
         vm.globals
             .insert("cgi", scope(&[("remote_addr", "203.0.113.5")]));
         assert!(!vm.footer_activation_allowed());
+    }
+
+    #[test]
+    fn server_cfconfig_masks_credentials() {
+        let cfg: cfml_config::RustCfmlConfig = serde_json::from_str(
+            r#"{"datasources":{"main":{"host":"db","password":"hunter2","username":"app"}},
+                "caches":{"c":{"provider":"cluster","properties":{"secretKey":"c2VjcmV0","keyPrefix":"p:"}}}}"#,
+        )
+        .unwrap();
+        let tree = cfconfig_to_cfml_redacted(&cfg);
+        let get = |path: &[&str]| {
+            let mut cur = tree.clone();
+            for p in path {
+                cur = cur.get_ci(p).unwrap_or(CfmlValue::Null);
+            }
+            cur.as_string()
+        };
+        assert_eq!(get(&["datasources", "main", "password"]), REDACTED);
+        assert_eq!(get(&["datasources", "main", "username"]), "app");
+        assert_eq!(get(&["datasources", "main", "host"]), "db");
+        assert_eq!(get(&["caches", "c", "properties", "secretKey"]), REDACTED);
+        assert_eq!(get(&["caches", "c", "properties", "keyPrefix"]), "p:");
+        let full = cfconfig_to_cfml(&cfg);
+        assert_eq!(
+            full.get_ci("datasources").unwrap().get_ci("main").unwrap().get_ci("password").unwrap().as_string(),
+            "hunter2",
+            "engine-internal tree keeps the real value"
+        );
     }
 
     /// The out-of-the-box config must not let an outsider open the footer
