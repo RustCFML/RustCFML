@@ -127,6 +127,12 @@ pub(crate) fn build_layer(state: Arc<AppState>) -> SocketIoLayer {
 /// run the `onConnect` reject gate (+ auto-join + resumability replay), then
 /// wire up the per-event handlers and the disconnect teardown.
 async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
+    // Same cross-site guard as the raw WebSocket route: refuse before any
+    // CFML (and the application start it may trigger) runs.
+    if !crate::websocket::websocket_origin_allowed(&state, &socket.req_parts().headers) {
+        let _ = socket.disconnect();
+        return;
+    }
     let ns = socket.ns().to_string();
     // Start the application before routing. `is_imperative_ns` can only answer
     // correctly once `onApplicationStart` has registered its namespaces, and on

@@ -454,10 +454,26 @@ pub(crate) fn origin_allowed(cfg: &McpCfg, origin: &str) -> bool {
         .any(|allowed| allowed == "*" || glob_match(allowed, origin))
 }
 
-fn origin_is_local(origin: &str) -> bool {
-    let authority = origin.split("//").nth(1).unwrap_or(origin);
-    let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority);
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+pub(crate) fn origin_is_local(origin: &str) -> bool {
+    matches!(origin_host(origin).as_str(), "localhost" | "127.0.0.1" | "[::1]")
+}
+
+/// The host part of an `Origin` (`scheme://host[:port]`) or a `Host` header
+/// (`host[:port]`), lowercased. A bracketed IPv6 literal keeps its brackets;
+/// its colons are not mistaken for a port separator (`http://[::1]` used to
+/// parse as host `[:`).
+pub(crate) fn origin_host(value: &str) -> String {
+    let authority = value.split("//").nth(1).unwrap_or(value);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    let host = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(end) => &authority[..=end],
+            None => authority,
+        }
+    } else {
+        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+    };
+    host.to_ascii_lowercase()
 }
 
 /// Shell-style glob with `*` (any run, including none) and `?` (one
@@ -745,6 +761,16 @@ mod tests {
         let cfg = with_token("static", &["admin"]);
         let h = headers(&[("x-forwarded-for", "203.0.113.9"), ("authorization", "Bearer static")]);
         assert!(matches!(decide(&cfg, local(), &h), Ok(Decision::Done(_))));
+    }
+
+    #[test]
+    fn origin_hosts_parse_ipv6_literals() {
+        assert_eq!(origin_host("http://[::1]"), "[::1]");
+        assert_eq!(origin_host("http://[::1]:8080"), "[::1]");
+        assert_eq!(origin_host("https://App.Example:443"), "app.example");
+        assert_eq!(origin_host("app.example:8500"), "app.example");
+        assert!(origin_is_local("http://[::1]"));
+        assert!(!origin_is_local("http://[::2]"));
     }
 
     #[test]

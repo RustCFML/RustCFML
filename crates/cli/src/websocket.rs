@@ -250,6 +250,33 @@ pub(crate) fn handshake_map(
     m
 }
 
+/// Cross-site WebSocket hijacking guard. A browser always sends `Origin` on
+/// a WebSocket upgrade, and the connection rides the visitor's `CFID` cookie,
+/// so a page on another site could otherwise open a socket that runs channel
+/// handlers as the victim. Allowed: no `Origin` (not a browser), the server's
+/// own host (`Origin` host == `Host` host), localhost, and
+/// `server.websocketAllowedOrigins`.
+pub(crate) fn websocket_origin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    if crate::mcp::auth::origin_is_local(origin) {
+        return true;
+    }
+    let origin_host = crate::mcp::auth::origin_host(origin);
+    if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
+        if crate::mcp::auth::origin_host(host) == origin_host {
+            return true;
+        }
+    }
+    state
+        .cfconfig
+        .server
+        .websocket_allowed_origins
+        .iter()
+        .any(|allowed| allowed == "*" || crate::mcp::auth::glob_match(allowed, origin))
+}
+
 /// axum handler for `GET /ws/{channel}`. Upgrades the connection and hands it
 /// to the driver. A 404 is returned for an unknown channel (no CFC).
 pub async fn ws_handler(
@@ -259,6 +286,9 @@ pub async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if !websocket_origin_allowed(&state, &headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    }
     let info = match resolve_channel(&state, &name) {
         Some(i) => i,
         None => return (axum::http::StatusCode::NOT_FOUND, "Unknown channel").into_response(),

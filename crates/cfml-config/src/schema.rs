@@ -275,6 +275,13 @@ pub struct ServerCfg {
     #[serde(rename = "maxConcurrentRequests")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub max_concurrent_requests: u32,
+    /// Browser origins (globs, e.g. `https://*.example.com`) allowed to open a
+    /// WebSocket or socket.io connection besides the server's own origin and
+    /// localhost. A connection carries the visitor's session cookie, so a
+    /// foreign page must not be able to open one (cross-site WebSocket
+    /// hijacking). Clients that send no `Origin` (non-browser) are unaffected.
+    #[serde(rename = "websocketAllowedOrigins")]
+    pub websocket_allowed_origins: Vec<String>,
     /// Bytes. `0` = unlimited. Defaults to 200 MB to match the Lucee/CommandBox
     /// reference (its default post-entity limit), which real uploaders assume:
     /// Preside's chunked asset uploader slices at exactly 10 MiB per request, so
@@ -335,6 +342,7 @@ impl Default for ServerCfg {
             welcome_files: vec!["index.cfm".into(), "index.htm".into(), "index.html".into()],
             cfml_extensions: vec!["cfm".into(), "cfc".into()],
             max_concurrent_requests: 0,
+            websocket_allowed_origins: Vec::new(),
             max_request_body_size: 200 * 1024 * 1024,
             max_multipart_parts: 1000,
             request_timeout: 0,

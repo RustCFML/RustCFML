@@ -264,3 +264,43 @@ fn client_x_original_url_is_dropped() {
     assert!(resp.contains("hdr=[]"), "getHttpRequestData saw it:\n{resp}");
     assert!(resp.contains("rw=[]"), "X-Rewrite-URL passed through:\n{resp}");
 }
+
+/// Cross-site WebSocket hijacking: a foreign page's upgrade (it carries the
+/// visitor's cookie) is refused before any channel is resolved; the server's
+/// own origin, localhost and a client with no `Origin` are not.
+#[test]
+fn websocket_upgrade_from_a_foreign_origin_is_refused() {
+    let server = start(
+        "wsorigin",
+        r#"{"server":{"websocketAllowedOrigins":["https://*.partner.example"]}}"#,
+        &[("index.cfm", "ok")],
+        &[],
+    );
+    // Read only the status line: the connection is kept alive, so reading to
+    // the end would wait for the server's idle timeout.
+    let status_line = |raw: &str| {
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        line
+    };
+    let upgrade = |origin: Option<&str>| {
+        let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        status_line(
+            &format!(
+                "GET /ws/nosuchchannel HTTP/1.1\r\nHost: app.example\r\n{origin}Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            ),
+        )
+    };
+    let status = |r: String| r.split_whitespace().nth(1).unwrap_or("").to_string();
+    assert_eq!(status(upgrade(Some("https://evil.example"))), "403");
+    // Allowed origins get past the guard and reach channel resolution (404 here).
+    assert_eq!(status(upgrade(Some("https://app.example"))), "404");
+    assert_eq!(status(upgrade(Some("http://localhost:3000"))), "404");
+    assert_eq!(status(upgrade(Some("https://chat.partner.example"))), "404");
+    assert_eq!(status(upgrade(None)), "404");
+}
