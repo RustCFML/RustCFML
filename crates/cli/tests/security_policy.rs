@@ -333,3 +333,14 @@ fn application_cfc_above_the_webroot_is_ignored() {
     assert!(resp.contains("page"), "page did not render:\n{resp}");
     assert!(!resp.contains("OUTSIDE-APP-RAN"), "Application.cfc above the webroot ran:\n{resp}");
 }
+
+/// Static files carry `X-Content-Type-Options: nosniff`.
+#[test]
+fn static_files_are_not_content_sniffed() {
+    let server = start("nosniff", "{}", &[("u.txt", "<script>alert(1)</script>")], &[]);
+    let resp = get(server.port, "/u.txt");
+    assert!(
+        resp.lines().any(|l| l.eq_ignore_ascii_case("x-content-type-options: nosniff")),
+        "no nosniff header:\n{resp}"
+    );
+}

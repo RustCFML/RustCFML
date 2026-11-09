@@ -4666,6 +4666,9 @@ async fn handle_request_inner(
                 false
             };
             let with_validators = |mut b: axum::http::response::Builder| {
+                // The type is decided by the extension; a browser must not
+                // sniff an uploaded `.txt`/`.jpg` into HTML and run it.
+                b = b.header("X-Content-Type-Options", "nosniff");
                 if let Some(t) = mtime {
                     b = b.header("Last-Modified", httpdate::fmt_http_date(t));
                 }
