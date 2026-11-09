@@ -4636,14 +4636,25 @@ mod component_backing_render {
 /// driver-dependent: PostgreSQL rejected the serialised form outright, while
 /// Query-of-Queries silently matched zero rows, so a search screen just looked
 /// empty. Only strings are split; array elements are already the values.
+///
+/// Like Lucee (`ListUtil.listToArrayRemoveEmpty` in both `QueryParam.java` and
+/// `QueryParamConverter.java`), empty elements are dropped: Preside binds a
+/// page lineage `"/1/3/"` with `separator="/"` to an integer column, and the
+/// leading/trailing empties must not become `""` binds (PostgreSQL rejects
+/// `""` as `int4`). A wholly empty value still binds one `""`, as Lucee does.
 pub fn expand_list_param(value: &CfmlValue, separator: &str) -> Vec<CfmlValue> {
     match value {
         CfmlValue::Array(a) => a.snapshot(),
-        other => other
-            .as_string()
-            .split(separator)
-            .map(|part| CfmlValue::string(part.trim().to_string()))
-            .collect(),
+        other => {
+            let text = other.as_string();
+            if text.is_empty() {
+                return vec![CfmlValue::string(String::new())];
+            }
+            text.split(separator)
+                .filter(|part| !part.is_empty())
+                .map(|part| CfmlValue::string(part.trim().to_string()))
+                .collect()
+        }
     }
 }
 

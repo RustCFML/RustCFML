@@ -12863,9 +12863,15 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                             } else if is_list {
                                 // An ARRAY value is already one bind per
                                 // element; only a string gets split.
-                                for part in
-                                    cfml_common::dynamic::expand_list_param(&value, &separator)
-                                {
+                                let parts =
+                                    cfml_common::dynamic::expand_list_param(&value, &separator);
+                                if parts.is_empty() {
+                                    // get_list_placeholder_counts reserves one
+                                    // `?` for an empty list; bind NULL into it.
+                                    values.push(CfmlValue::Null);
+                                    type_hints.push(cfsqltype.clone());
+                                }
+                                for part in parts {
                                     values.push(coerce_by_sqltype_value(&part, &cfsqltype));
                                     type_hints.push(cfsqltype.clone());
                                 }
@@ -12912,9 +12918,7 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
                         // Must agree with the expansion in the builder below,
                         // or the `?` count and the bind count drift apart.
                         cfml_common::dynamic::expand_list_param(&value, &separator)
-                            .iter()
-                            .filter(|v| !v.as_string().trim().is_empty())
-                            .count()
+                            .len()
                             .max(1)
                     } else {
                         1
@@ -22640,6 +22644,39 @@ mod placeholder_comment_scan_tests {
             mssql_rewrite_placeholders("select ? as a, /* don't? */ ? as b"),
             "select @P1 as a, /* don't? */ @P2 as b"
         );
+    }
+}
+
+/// The `?` count reserved for a `list=true` param and the number of values
+/// bound into it must agree. When they drifted (`ids=1,` → one `?`, two binds)
+/// SQLite/MySQL/PG rejected the statement, but MSSQL's `sp_executesql` accepted
+/// it and every later parameter shifted one place under client control.
+#[cfg(all(test, any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+mod list_param_count_agreement_tests {
+    use super::{get_list_placeholder_counts, normalize_query_params};
+    use cfml_common::dynamic::{CfmlValue, ValueMap};
+
+    fn param(value: &str, list: bool) -> CfmlValue {
+        let mut m = ValueMap::default();
+        m.insert("value".to_string(), CfmlValue::string(value.to_string()));
+        m.insert("cfsqltype".to_string(), CfmlValue::string("cf_sql_varchar".to_string()));
+        if list {
+            m.insert("list".to_string(), CfmlValue::Bool(true));
+        }
+        CfmlValue::strukt(m)
+    }
+
+    #[test]
+    fn placeholder_count_equals_bind_count_for_awkward_lists() {
+        for list in ["1,", ",1", "1,,2,", ",", "", "a,b,c", " , "] {
+            let params = CfmlValue::array(vec![param(list, true), param("after", false)]);
+            let counts = get_list_placeholder_counts(&params);
+            let (values, hints) = normalize_query_params(&params);
+            assert_eq!(counts.iter().sum::<usize>(), values.len(), "list {list:?}");
+            assert_eq!(values.len(), hints.len());
+            // the parameter after the list must still be the last bind
+            assert_eq!(values.last().unwrap().as_string(), "after", "list {list:?}");
+        }
     }
 }
 

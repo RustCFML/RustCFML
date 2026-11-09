@@ -111,19 +111,35 @@ pub fn prepare_pg_statements(
         CfmlValue::Struct(map) => {
             let mut out = Vec::with_capacity(statements.len());
             for stmt in statements {
-                let (rewritten, names) = rewrite_named(&stmt);
-                let params = names
-                    .iter()
-                    .map(|name| {
-                        let raw = map.data_get(name).map(|v| v.query_column_scalar().clone())
-                            .unwrap_or(CfmlValue::Null);
-                        // Named param may be a cfqueryparam-style struct
-                        // ({value, cfsqltype, null, ...}); unwrap to the
-                        // bind value (or NULL when null=true) before
-                        // driver binding — matches Lucee semantics.
-                        crate::builtins::cfqueryparam_unwrap(&raw)
-                    })
-                    .collect();
+                // Each named param binds one or more values: a cfqueryparam
+                // struct with `list=true` expands to one bind per element, so
+                // `in (:ids)` becomes `in ($1,$2,$3)` — the same expansion the
+                // MySQL and SQLite named paths (and every positional path)
+                // already do. Values are resolved lazily, once per name.
+                let mut resolved: Vec<(String, Vec<CfmlValue>)> = Vec::new();
+                let (rewritten, names) = rewrite_named_with(&stmt, &mut |name: &str| {
+                    if let Some((_, vals)) =
+                        resolved.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    {
+                        return vals.len();
+                    }
+                    let raw = map
+                        .data_get(name)
+                        .map(|v| v.query_column_scalar().clone())
+                        .unwrap_or(CfmlValue::Null);
+                    let vals = named_param_bind_values(&raw);
+                    let width = vals.len();
+                    resolved.push((name.to_string(), vals));
+                    width
+                });
+                let mut params = Vec::new();
+                for name in &names {
+                    if let Some((_, vals)) =
+                        resolved.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    {
+                        params.extend(vals.iter().cloned());
+                    }
+                }
                 out.push(PgStatement {
                     sql: rewritten,
                     params,
@@ -184,9 +200,57 @@ fn rewrite_positional(stmt: &str) -> (String, usize) {
 /// be rewritten to a `$n` that consumes a parameter slot. Returns the
 /// rewritten SQL and the ordered list of distinct names in first-seen order (a
 /// name reused within the statement reuses its `$n`).
+#[cfg(test)]
 fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
+    rewrite_named_with(stmt, &mut |_: &str| 1)
+}
+
+/// The bind values one named parameter contributes. A cfqueryparam-style
+/// struct (`{value, cfsqltype, null, list, separator}`) is unwrapped to its
+/// bind value (or NULL when `null=true`) — matches Lucee semantics. With
+/// `list=true` the value expands to one bind per element (an array value is
+/// already one bind per element; a string is split on `separator`, default
+/// `,`). An empty list still binds one NULL so `IN ($n)` stays valid SQL and
+/// matches nothing, as the MySQL path does.
+fn named_param_bind_values(raw: &CfmlValue) -> Vec<CfmlValue> {
+    if let CfmlValue::Struct(s) = raw {
+        let flag = |key: &str| {
+            s.data_get(key)
+                .map(|v| match v {
+                    CfmlValue::Bool(b) => b,
+                    CfmlValue::String(st) => {
+                        st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes")
+                    }
+                    _ => false,
+                })
+                .unwrap_or(false)
+        };
+        if s.data_contains_key("value") && !flag("null") && flag("list") {
+            let value = s.data_get("value").unwrap_or(CfmlValue::Null);
+            let separator = s
+                .data_get("separator")
+                .map(|v| v.as_string())
+                .unwrap_or_else(|| ",".to_string());
+            let parts = cfml_common::dynamic::expand_list_param(&value, &separator);
+            return if parts.is_empty() { vec![CfmlValue::Null] } else { parts };
+        }
+    }
+    vec![crate::builtins::cfqueryparam_unwrap(raw)]
+}
+
+/// Like [`rewrite_named`], but `width(name)` says how many `$n` slots each
+/// name occupies: a list parameter of k values is written as `$a,$a+1,…`.
+/// A name reused within the statement reuses its whole slot range. Returns
+/// the rewritten SQL and the distinct names in slot order.
+fn rewrite_named_with(
+    stmt: &str,
+    width: &mut dyn FnMut(&str) -> usize,
+) -> (String, Vec<String>) {
     let mut out = String::with_capacity(stmt.len() + 8);
     let mut order: Vec<String> = Vec::new();
+    // (first slot, slot count) per entry of `order`
+    let mut slots: Vec<(usize, usize)> = Vec::new();
+    let mut next_slot = 1usize;
     let chars: Vec<char> = stmt.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -224,15 +288,24 @@ fn rewrite_named(stmt: &str) -> (String, Vec<String>) {
                 end += 1;
             }
             let name: String = chars[start..end].iter().collect();
-            let idx = match order.iter().position(|x| x.eq_ignore_ascii_case(&name)) {
-                Some(pos) => pos + 1,
+            let (first, count) = match order.iter().position(|x| x.eq_ignore_ascii_case(&name)) {
+                Some(pos) => slots[pos],
                 None => {
+                    let count = width(&name).max(1);
+                    let entry = (next_slot, count);
+                    next_slot += count;
                     order.push(name);
-                    order.len()
+                    slots.push(entry);
+                    entry
                 }
             };
-            out.push('$');
-            out.push_str(&idx.to_string());
+            for k in 0..count {
+                if k > 0 {
+                    out.push(',');
+                }
+                out.push('$');
+                out.push_str(&(first + k).to_string());
+            }
             i = end;
             continue;
         }
@@ -499,6 +572,78 @@ mod tests {
             "update t set name = $1 where id = $2 or parent = $2"
         );
         assert_eq!(params_str(&p[0]), vec!["bob", "5"]);
+    }
+
+    fn list_param(value: &str, separator: Option<&str>) -> CfmlValue {
+        let mut q = cfml_common::dynamic::ValueMap::default();
+        q.insert("value".to_string(), s(value));
+        q.insert("cfsqltype".to_string(), s("cf_sql_varchar"));
+        q.insert("list".to_string(), CfmlValue::Bool(true));
+        if let Some(sep) = separator {
+            q.insert("separator".to_string(), s(sep));
+        }
+        CfmlValue::strukt(q)
+    }
+
+    #[test]
+    fn named_list_param_expands_to_one_placeholder_per_element() {
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("trashed".to_string(), s("false"));
+        m.insert("types".to_string(), list_param("a,b,c", None));
+        m.insert("depth".to_string(), CfmlValue::Int(2));
+        let p = prepare_pg_statements(
+            "select * from page where trashed = :trashed and page_type in (:types) and depth <= :depth",
+            &CfmlValue::strukt(m),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            p[0].sql,
+            "select * from page where trashed = $1 and page_type in ($2,$3,$4) and depth <= $5"
+        );
+        assert_eq!(params_str(&p[0]), vec!["false", "a", "b", "c", "2"]);
+    }
+
+    #[test]
+    fn named_list_param_honours_custom_separator_and_reuse() {
+        // Preside passes list params with separator=chr(31)
+        let us = "\u{1f}";
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("ids".to_string(), list_param(&format!("x{us}y"), Some(us)));
+        let p = prepare_pg_statements(
+            "select * from t where id in (:ids) or parent in (:ids)",
+            &CfmlValue::strukt(m),
+            false,
+        )
+        .unwrap();
+        assert_eq!(p[0].sql, "select * from t where id in ($1,$2) or parent in ($1,$2)");
+        assert_eq!(params_str(&p[0]), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn named_list_param_drops_empty_elements_like_lucee() {
+        // Preside: _hierarchy_id in (:ids) with value=lineage "/1/3/", separator="/"
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("ids".to_string(), list_param("/1/3/", Some("/")));
+        let p = prepare_pg_statements("select * from t where hid in (:ids)", &CfmlValue::strukt(m), false)
+            .unwrap();
+        assert_eq!(p[0].sql, "select * from t where hid in ($1,$2)");
+        assert_eq!(params_str(&p[0]), vec!["1", "3"]);
+    }
+
+    #[test]
+    fn named_list_param_that_is_null_binds_one_null() {
+        let mut q = cfml_common::dynamic::ValueMap::default();
+        q.insert("value".to_string(), s(""));
+        q.insert("list".to_string(), CfmlValue::Bool(true));
+        q.insert("null".to_string(), CfmlValue::Bool(true));
+        let mut m = cfml_common::dynamic::ValueMap::default();
+        m.insert("ids".to_string(), CfmlValue::strukt(q));
+        let p = prepare_pg_statements("select * from t where id in (:ids)", &CfmlValue::strukt(m), false)
+            .unwrap();
+        assert_eq!(p[0].sql, "select * from t where id in ($1)");
+        assert_eq!(p[0].params.len(), 1);
+        assert!(matches!(p[0].params[0], CfmlValue::Null));
     }
 
     #[test]
