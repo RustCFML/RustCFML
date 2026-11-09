@@ -363,7 +363,12 @@ fn stage_cfml(rcx: &Path, into: &Path) -> Option<PathBuf> {
         // Reject anything that would escape the destination. A `.rcx` is
         // trusted code, but a path-traversal entry writing outside the cache is
         // still not something to hand it for free.
-        if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+        // A backslash is a separator on Windows, and a drive prefix (`C:`)
+        // replaces the base on join, so both are refused everywhere.
+        if rel.contains('\\')
+            || rel.contains(':')
+            || rel.split('/').any(|seg| seg == ".." || seg.is_empty())
+        {
             eprintln!("Warning: {} contains a suspicious cfml path [{}]; skipped", rcx.display(), name);
             continue;
         }

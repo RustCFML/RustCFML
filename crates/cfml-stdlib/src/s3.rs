@@ -72,13 +72,26 @@ pub struct S3Url {
     pub key: String,
 }
 
+/// `s3://key:secret@host/bucket` → `s3://***@host/bucket`.
+pub(crate) fn redact_s3_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else { return url.to_string() };
+    let rest = &url[scheme_end + 3..];
+    match rest.find('@') {
+        Some(at) if !rest[..at].contains('/') => format!("{}***{}", &url[..scheme_end + 3], &rest[at..]),
+        _ => url.to_string(),
+    }
+}
+
 impl S3Url {
     /// `s3://[key:secret@[host/]]bucket[/key]`
     pub fn parse(url: &str) -> Result<Self, CfmlError> {
+        // Error messages quote the URL with its credentials removed: it may
+        // carry `key:secret@`, and errors reach logs and error pages.
+        let shown = redact_s3_url(url);
         let rest = url
             .strip_prefix("s3://")
             .or_else(|| url.strip_prefix("S3://"))
-            .ok_or_else(|| err(format!("Not an s3:// URL: {}", url)))?;
+            .ok_or_else(|| err(format!("Not an s3:// URL: {}", shown)))?;
 
         let (creds, after_creds) = match rest.find('@') {
             Some(i) => {
@@ -108,7 +121,7 @@ impl S3Url {
         };
 
         if bucket.is_empty() {
-            return Err(err(format!("S3 URL has no bucket: {}", url)));
+            return Err(err(format!("S3 URL has no bucket: {}", shown)));
         }
 
         let (access_key, secret_key) = match creds {
@@ -324,6 +337,11 @@ impl S3Config {
     }
 }
 
+fn secret_fingerprint(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(secret.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 impl S3Config {
     fn cache_key(&self) -> String {
         format!(
@@ -331,9 +349,10 @@ impl S3Config {
             self.access_key,
             self.region,
             self.endpoint_url.as_deref().unwrap_or(""),
-            // include secret hash so different secrets get separate clients,
-            // and the addressing style so the two never share a cached client
-            format!("{}:{}", self.secret_key.len(), self.use_path_style)
+            // A digest of the secret, so two secrets for the same access key
+            // never share a cached client (this used to be the secret's LENGTH,
+            // so equal-length secrets collided), plus the addressing style.
+            format!("{}:{}", secret_fingerprint(&self.secret_key), self.use_path_style)
         )
     }
 }
