@@ -3985,6 +3985,15 @@ async fn handle_request_inner(
     let (parts, body) = req.into_parts();
     let method = parts.method.to_string();
     let remote_addr = addr.ip().to_string();
+    // Error detail (message, `Detail:`, stack trace with absolute paths) goes
+    // to the same viewers as the debug footer, never to every client.
+    let error_detail_allowed = state.cfconfig.debugging.enabled
+        && state
+            .cfconfig
+            .debugging
+            .show_from_ips
+            .iter()
+            .any(|a| a.trim().eq_ignore_ascii_case(remote_addr.trim()));
     let url = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
     // (`--max-memory` admission and the concurrency gate have already run in
     // `handle_request`, before this is called.)
@@ -4491,7 +4500,7 @@ async fn handle_request_inner(
             match flush_rx.recv().await {
                 None => match handle.await {
                     Ok(Ok(response)) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
-                    Ok(Err(e)) => render_error_response_off_worker(&state, e).await,
+                    Ok(Err(e)) => render_error_response_off_worker(&state, e, error_detail_allowed).await,
                     Err(join_err) => request_task_failed_response(&path, join_err),
                 },
                 Some(FlushEvent::Commit(commit, first_chunk)) => build_streaming_response(
@@ -4653,7 +4662,7 @@ async fn handle_request_inner(
                     // A throw inside onMissingTemplate (with no onError) surfaces as
                     // a normal 500 error page, like any other uncaught CFML error.
                     Err(e) => {
-                        return render_error_response_off_worker(&state, e).await;
+                        return render_error_response_off_worker(&state, e, error_detail_allowed).await;
                     }
                 }
             }
@@ -5028,17 +5037,25 @@ fn html_escape(s: &str) -> String {
 async fn render_error_response_off_worker(
     state: &Arc<AppState>,
     e: CfmlRunError,
+    show_detail: bool,
 ) -> axum::response::Response {
     if state.cfconfig.debugging.error_template.is_empty() {
-        return render_error_response(state, &e);
+        return render_error_response(state, &e, show_detail);
     }
     let st = state.clone();
-    tokio::task::spawn_blocking(move || render_error_response(&st, &e))
+    tokio::task::spawn_blocking(move || render_error_response(&st, &e, show_detail))
         .await
         .unwrap_or_else(|join_err| request_task_failed_response("errorTemplate", join_err))
 }
 
-fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::response::Response {
+/// `show_detail`: the client may see the error message and stack trace —
+/// `debugging.enabled` AND its address is in `debugging.showFromIPs`, the same
+/// viewer test as the debug footer. Everyone else gets the generic page.
+fn render_error_response(
+    state: &Arc<AppState>,
+    e: &CfmlRunError,
+    show_detail: bool,
+) -> axum::response::Response {
     let dbg = &state.cfconfig.debugging;
     let status: u16 = if dbg.error_status_code { 500 } else { 200 };
 
@@ -5101,7 +5118,7 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
     if !e.output.is_empty() {
         body.push_str(&e.output);
     }
-    if dbg.enabled {
+    if show_detail {
         body.push_str(&format!(
             "<html><body><h1>{} Internal Server Error</h1><pre>{}</pre></body></html>",
             status,
@@ -6012,13 +6029,24 @@ fn run_embedded_app(mut files: std::collections::HashMap<String, Vec<u8>>) {
 
     // FallbackFs: try embedded files first, then real filesystem.
     // This allows embedded apps to load external files (e.g. modules on disk).
-    // Sandbox mode is determined later per-invocation; default to non-sandboxed
-    // here — run_embedded_cli/serve will set it based on --sandbox flag.
-    let vfs: Arc<dyn Vfs> = Arc::new(FallbackFs {
-        embedded: EmbeddedFs::new(files, base_dir.clone()),
-        real: RealFs,
-        sandbox: false,
-    });
+    //
+    // Sandbox mode hides the host filesystem entirely. It is decided HERE, before
+    // any CFML runs, from `--sandbox` or `security.sandbox` in the binary's
+    // configuration — the VFS used to be built with sandbox off and nothing ever
+    // turned it on, so a `--sandbox` binary read any host file it was asked for.
+    let fallback = Arc::new(FallbackFs::new(
+        EmbeddedFs::new(files, base_dir.clone()),
+        RealFs,
+        false,
+    ));
+    let sandbox = std::env::args().skip(1).any(|a| a == "--sandbox")
+        || load_embedded_cfconfig(fallback.as_ref(), &base_dir).security.sandbox;
+    if sandbox {
+        fallback.enable_sandbox();
+        cfml_common::host_policy::enable_sandbox();
+        cfml_common::host_policy::confine_host_reads();
+    }
+    let vfs: Arc<dyn Vfs> = fallback;
 
     // `<app> mcp <name>` serves an embedded MCP server CFC over stdio — the
     // shape a client launches from its config. Dispatched here because the
@@ -6030,17 +6058,16 @@ fn run_embedded_app(mut files: std::collections::HashMap<String, Vec<u8>>) {
     }
 
     if mode == "cli" {
-        run_embedded_cli(vfs, &base_dir, &entry, file_count);
+        run_embedded_cli(vfs, &base_dir, &entry, file_count, sandbox);
     } else {
-        run_embedded_serve(vfs, &base_dir, file_count);
+        run_embedded_serve(vfs, &base_dir, file_count, sandbox);
     }
 }
 
 /// Run embedded app in CLI mode: execute entry point with command-line args.
-fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: usize) {
+fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: usize, sandbox: bool) {
     let cli_args: Vec<String> = std::env::args().collect();
 
-    let mut sandbox = false;
     // Check for --help / --version / --sandbox
     for arg in &cli_args[1..] {
         match arg.as_str() {
@@ -6054,7 +6081,6 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
                 print_licenses();
                 exit(0);
             }
-            "--sandbox" => { sandbox = true; }
             _ => {}
         }
     }
@@ -6149,14 +6175,13 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
 }
 
 /// Run embedded app in serve mode with start/stop/foreground support.
-fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
+fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize, sandbox: bool) {
     let cli_args: Vec<String> = std::env::args().collect();
 
     // Parse args
     let mut port: u16 = 8500;
     let mut socket: Option<PathBuf> = None;
     let mut single_threaded = false;
-    let mut sandbox = false;
     let mut command = ""; // "", "start", "stop", "status"
     let mut i = 1;
     while i < cli_args.len() {
@@ -6191,8 +6216,8 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 single_threaded = true;
                 i += 1;
             }
+            // Decided by the caller, before the VFS was handed out.
             "--sandbox" => {
-                sandbox = true;
                 i += 1;
             }
             "--version" => {

@@ -46,7 +46,7 @@ assert("datasources.testds.driver", cfg.datasources.testds.driver, "sqlite");
 
 // Security flags
 assert("security.csrfEnabled", cfg.security.csrfEnabled, true);
-assert("security.disallowedFunctions has __cfexecute", arrayLen(cfg.security.disallowedFunctions), 1);
+assert("security.disallowedFunctions has one entry", arrayLen(cfg.security.disallowedFunctions), 1);
 assert("disallowedFunctions[1]", cfg.security.disallowedFunctions[1], "cfconfigSecurityProbe");
 
 // Debugging

@@ -2028,8 +2028,14 @@ fn fn_reverse(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_repeat_string(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let count = get_int(&args, 1)?.max(0) as usize;
-    Ok(CfmlValue::string(s.repeat(count)))
+    let count = get_int(&args, 1)?.max(0) as u64;
+    cfml_common::container_size::check_string_bytes_per_call(
+        "repeatString",
+        "count",
+        s.len(),
+        count,
+    )?;
+    Ok(CfmlValue::string(s.repeat(count as usize)))
 }
 
 fn fn_insert(args: Vec<CfmlValue>) -> CfmlResult {

@@ -241,14 +241,32 @@ pub fn check_regular_file(path: &str) -> io::Result<()> {
     }
 }
 
+/// A sandboxed self-contained binary may not read the host filesystem: its
+/// application lives in the embedded archive, which `FallbackFs` serves
+/// without ever calling this. Every whole-file host read funnels through
+/// [`read_regular_file`] / [`read_regular_file_to_string`], so refusing here
+/// also covers the builtins and shims that read a path directly (images,
+/// spreadsheets, PDFs, `java.io.FileInputStream`, …).
+fn check_host_read_allowed(path: &str) -> io::Result<()> {
+    if crate::host_policy::host_reads_confined() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("[{path}]: host filesystem reads are disabled in sandbox mode"),
+        ));
+    }
+    Ok(())
+}
+
 /// `std::fs::read` guarded by [`check_regular_file`].
 pub fn read_regular_file(path: &str) -> io::Result<Vec<u8>> {
+    check_host_read_allowed(path)?;
     check_regular_file(path)?;
     std::fs::read(path)
 }
 
 /// `std::fs::read_to_string` guarded by [`check_regular_file`].
 pub fn read_regular_file_to_string(path: &str) -> io::Result<String> {
+    check_host_read_allowed(path)?;
     check_regular_file(path)?;
     std::fs::read_to_string(path)
 }
@@ -618,8 +636,26 @@ pub struct FallbackFs {
     pub embedded: EmbeddedFs,
     pub real: RealFs,
     /// When true, only the embedded FS is used (no disk fallback).
-    /// Set this in sandbox mode to prevent filesystem access.
-    pub sandbox: bool,
+    /// Set in sandbox mode to prevent host filesystem access. Atomic so the
+    /// embedded entry point can turn it on after reading its configuration
+    /// (`security.sandbox`) without rebuilding the VFS.
+    sandbox: std::sync::atomic::AtomicBool,
+}
+
+impl FallbackFs {
+    pub fn new(embedded: EmbeddedFs, real: RealFs, sandbox: bool) -> Self {
+        Self { embedded, real, sandbox: std::sync::atomic::AtomicBool::new(sandbox) }
+    }
+
+    /// Hide the host filesystem from now on. One-way: nothing turns it off.
+    pub fn enable_sandbox(&self) {
+        self.sandbox.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[inline]
+    fn sandboxed(&self) -> bool {
+        self.sandbox.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl std::fmt::Debug for FallbackFs {
@@ -633,7 +669,7 @@ impl std::fmt::Debug for FallbackFs {
 impl Vfs for FallbackFs {
     fn read_to_string(&self, path: &str) -> io::Result<String> {
         let result = self.embedded.read_to_string(path);
-        if result.is_ok() || self.sandbox { return result; }
+        if result.is_ok() || self.sandboxed() { return result; }
         self.real.read_to_string(path)
     }
     /// Forwarded, not defaulted — the whole point of a `--build` binary reading
@@ -645,25 +681,25 @@ impl Vfs for FallbackFs {
         opts: FileCursorOpts,
     ) -> io::Result<Box<dyn VfsFileChunks>> {
         let result = self.embedded.open_chunks(path, opts);
-        if result.is_ok() || self.sandbox { return result; }
+        if result.is_ok() || self.sandboxed() { return result; }
         self.real.open_chunks(path, opts)
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         let result = self.embedded.read(path);
-        if result.is_ok() || self.sandbox { return result; }
+        if result.is_ok() || self.sandboxed() { return result; }
         self.real.read(path)
     }
     fn exists(&self, path: &str) -> bool {
-        self.embedded.exists(path) || (!self.sandbox && self.real.exists(path))
+        self.embedded.exists(path) || (!self.sandboxed() && self.real.exists(path))
     }
     fn is_file(&self, path: &str) -> bool {
-        self.embedded.is_file(path) || (!self.sandbox && self.real.is_file(path))
+        self.embedded.is_file(path) || (!self.sandboxed() && self.real.is_file(path))
     }
     fn is_dir(&self, path: &str) -> bool {
-        self.embedded.is_dir(path) || (!self.sandbox && self.real.is_dir(path))
+        self.embedded.is_dir(path) || (!self.sandboxed() && self.real.is_dir(path))
     }
     fn read_dir(&self, path: &str) -> io::Result<Vec<VfsDirEntry>> {
-        if self.sandbox { return self.embedded.read_dir(path); }
+        if self.sandboxed() { return self.embedded.read_dir(path); }
         // Merge real FS and embedded FS listings so embedded files (e.g.
         // Application.cfc) remain visible even when the real directory also
         // exists (e.g. the compiled binary's own CWD contains real files
@@ -690,12 +726,12 @@ impl Vfs for FallbackFs {
     }
     fn modified(&self, path: &str) -> io::Result<SystemTime> {
         let result = self.embedded.modified(path);
-        if result.is_ok() || self.sandbox { return result; }
+        if result.is_ok() || self.sandboxed() { return result; }
         self.real.modified(path)
     }
     fn canonicalize(&self, path: &str) -> io::Result<String> {
         let result = self.embedded.canonicalize(path);
-        if result.is_ok() || self.sandbox { return result; }
+        if result.is_ok() || self.sandboxed() { return result; }
         self.real.canonicalize(path)
     }
 }
@@ -879,11 +915,7 @@ mod tests {
         for (path, body) in embedded_files {
             files.insert(path.to_string(), body.as_bytes().to_vec());
         }
-        FallbackFs {
-            embedded: EmbeddedFs::new(files, real_dir.to_string()),
-            real: RealFs,
-            sandbox: false,
-        }
+        FallbackFs::new(EmbeddedFs::new(files, real_dir.to_string()), RealFs, false)
     }
 
     /// The compiled-binary regression: the real CWD exists and holds unrelated
@@ -953,8 +985,8 @@ mod tests {
         dir.write("myapp", "binary");
         dir.write("notes.txt", "todo");
 
-        let mut fs = fallback_for(dir.str(), &[("index.cfm", "hi")]);
-        fs.sandbox = true;
+        let fs = fallback_for(dir.str(), &[("index.cfm", "hi")]);
+        fs.enable_sandbox();
 
         let names = entry_names_lower(&fs.read_dir(dir.str()).expect("read_dir"));
         assert_eq!(names, vec!["index.cfm".to_string()], "sandbox must hide real FS: {names:?}");

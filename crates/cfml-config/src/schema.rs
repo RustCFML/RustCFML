@@ -1107,9 +1107,14 @@ pub struct UrlTriggerCfg {
 }
 
 impl Default for UrlTriggerCfg {
+    /// OFF by default. It used to be on with the guessable `?debug=true`, and
+    /// gate 2 is "IP allowed OR trigger matched" — so on any server with
+    /// `debugging.enabled`, every visitor could open the footer (template
+    /// paths, scopes, SQL) whatever `showFromIPs` said. Turning it on is now a
+    /// deliberate act, and production additionally refuses the default value.
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             param: "debug".into(),
             value: "true".into(),
         }

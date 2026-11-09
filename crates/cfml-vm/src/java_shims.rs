@@ -2842,6 +2842,12 @@ pub fn handle_java_stringbuilder(
                     if n <= len {
                         chars[..n as usize].iter().collect()
                     } else {
+                        cfml_common::container_size::check_string_bytes_per_call(
+                            "StringBuilder.setLength",
+                            "newLength",
+                            1,
+                            (n - len) as u64,
+                        )?;
                         // Java pads with NUL to the requested length.
                         chars.iter().collect::<String>()
                             + &"\0".repeat((n - len) as usize)

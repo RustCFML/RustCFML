@@ -171,3 +171,31 @@ pub fn set_db_pool_connections(f: fn() -> (usize, u32, u32)) {
 pub fn db_pool_connections() -> (usize, u32, u32) {
     DB_POOL_CONNECTIONS.get().map_or((0, 0, 0), |f| f())
 }
+
+/// Refuse a call that would produce a string of more than
+/// [`MAX_GROW_PER_CALL`] bytes in one go. `repeatString("a", 4e12)` asked the
+/// allocator for 4 TB in a single request, and a failed allocation ABORTS the
+/// process (it is not a panic the request task can catch), taking every other
+/// request down with it. `count * unit` is computed without overflow.
+pub fn check_string_bytes_per_call(
+    fn_name: &str,
+    arg_name: &str,
+    unit_bytes: usize,
+    count: u64,
+) -> Result<(), crate::vm::CfmlError> {
+    let total = (unit_bytes as u128).saturating_mul(count as u128);
+    if total > MAX_GROW_PER_CALL as u128 {
+        return Err(crate::vm::CfmlError::expression(format!(
+            "Invalid call of the function [{}], Argument [{}] is invalid, the result would be \
+             [{}] bytes; the maximum is [{}]",
+            fn_name, arg_name, total, MAX_GROW_PER_CALL
+        )));
+    }
+    Ok(())
+}
+
+/// The most pixels one image may have. Same reasoning as
+/// [`MAX_GROW_PER_CALL`]: `imageNew("", 46000, 46000)` passed the old
+/// `w*h <= i32::MAX` test and asked for ~8 GB of RGBA in one allocation.
+/// 100 megapixels is 400 MB of RGBA — beyond any legitimate canvas.
+pub const MAX_IMAGE_PIXELS: i64 = 100_000_000;

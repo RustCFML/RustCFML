@@ -165,6 +165,7 @@ impl CfmlVirtualMachine {
                     .as_deref()
                     .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("browser"))
                 {
+                    self.host_write_guard("writeDump(output=)")?;
                     let resolved = self.resolve_template_relative(path, false);
                     let target = std::path::Path::new(&resolved);
                     match target.parent() {

@@ -141,6 +141,13 @@ impl CfmlVirtualMachine {
                 options.insert(k.as_str().to_string(), v.clone());
             }
         }
+        // The stdio transport launches `command` as a child process.
+        let launches_process = !kind.to_ascii_lowercase().starts_with("http")
+            && !kind.eq_ignore_ascii_case("sse")
+            && (kind.eq_ignore_ascii_case("stdio") || options.iter().any(|(k, _)| k.as_str().eq_ignore_ascii_case("command")));
+        if launches_process {
+            self.host_exec_guard("mcpConnect(stdio)").map_err(|e| self.wrap_error(e))?;
+        }
         let client = mcp::client::connect_from_options(&kind, &options)
             .map_err(|e| self.wrap_error(CfmlError::runtime(e)))?;
         Ok(CfmlValue::NativeObject(std::sync::Arc::new(std::sync::RwLock::new(client))))

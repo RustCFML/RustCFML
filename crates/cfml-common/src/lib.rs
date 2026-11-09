@@ -13,6 +13,7 @@ pub mod cycle_gc;
 pub mod datetime;
 pub mod dirlist;
 pub mod container_size;
+pub mod host_policy;
 pub mod dynamic;
 pub mod encodings;
 pub mod equality;

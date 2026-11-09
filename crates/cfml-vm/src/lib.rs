@@ -40,6 +40,7 @@ mod intercepts_varpath;
 mod intercepts_output;
 mod intercepts_realtime;
 mod intercepts_mcp;
+mod host_policy;
 pub mod application_store;
 pub mod disk_cache;
 /// Host side of the dynamic native-extension ABI (`.rcx`).
@@ -6110,7 +6111,7 @@ impl CfmlVirtualMachine {
             .security
             .disallowed_functions
             .iter()
-            .map(|n| n.to_lowercase())
+            .map(|n| host_policy::policy_name(n))
             .collect();
         // security.disallowedImports: compile each regex. Invalid patterns
         // are logged and skipped — a typo shouldn't take down the VM. Routed
@@ -6311,6 +6312,7 @@ impl CfmlVirtualMachine {
     /// (empty-value) trigger so a bare `?debug` can never unlock a live site.
     #[cfg(feature = "observability")]
     fn url_trigger_matches(&self) -> bool {
+        const DEFAULT_URL_TRIGGER_VALUE: &str = "true";
         let t = &self.debug_config.url_trigger;
         if !t.enabled || t.param.is_empty() {
             return false;
@@ -6329,6 +6331,13 @@ impl CfmlVirtualMachine {
                         if !production {
                             return true;
                         }
+                    } else if production
+                        && t.value.eq_ignore_ascii_case(DEFAULT_URL_TRIGGER_VALUE)
+                    {
+                        // The shipped default is public knowledge; a live site
+                        // must choose its own secret for this gate to mean
+                        // anything.
+                        continue;
                     } else if val.eq_ignore_ascii_case(&t.value) {
                         return true;
                     }
@@ -7881,6 +7890,20 @@ impl CfmlVirtualMachine {
             args.push(stack.pop().unwrap_or(CfmlValue::Null));
         }
         args.reverse();
+        // Sandbox / disallowedFunctions: take the generic path, which applies
+        // both (and serves sandboxed reads from the virtual filesystem).
+        // Codegen binds a call at compile time without knowing either policy,
+        // so this op must not be a way around them.
+        if self.builtin_policy_active() {
+            let callee = self
+                .globals
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_else(|| Self::builtin_fn_value(name.as_str()));
+            let out = self.call_function(&callee, args, &ValueMap::default())?;
+            stack.push(out);
+            return Ok(());
+        }
         // A compiled-in builtin resolves once per NAME, not once per call: the
         // entry point is cached on the interned operand. Guarded so a native
         // module or an extension that took over a compiled-in name still wins
@@ -8041,6 +8064,11 @@ impl CfmlVirtualMachine {
     /// clear "not available in this build" error rather than a wrong answer.
     fn call_bif(&self, name: &str, args: Vec<CfmlValue>) -> Option<CfmlResult> {
         let lower = name.to_ascii_lowercase();
+        if self.builtin_policy_active() {
+            if let Some(e) = self.builtin_policy_refusal(&lower, &args) {
+                return Some(Err(e));
+            }
+        }
         self.builtin_lookup_ci(name, &lower).map(|(_, f)| f(args))
     }
 
@@ -18757,13 +18785,14 @@ impl CfmlVirtualMachine {
             // security.disallowedFunctions: enforced at the very top so the
             // user-defined fast path below can't bypass it. Checked once per
             // call; the HashSet lookup is cheap.
-            if !self.disallowed_functions.is_empty() {
-                let name_lower_dis = func.name.to_lowercase();
-                if self.disallowed_functions.contains(&name_lower_dis) {
-                    return Err(CfmlError::runtime(format!(
-                        "Function '{}' is disallowed by security policy",
-                        func.name
-                    )));
+            //
+            // The sandbox's name-level refusals sit here too, ahead of every
+            // VM intercept: `cfexecute`, `writeDump(output=)`, `cfhttp file=`
+            // and the upload BIFs are all intercepted and so never reached the
+            // generic arm where the sandbox used to be checked.
+            if self.builtin_policy_active() {
+                if let Some(e) = self.builtin_policy_refusal(&func.name, &args) {
+                    return Err(e);
                 }
             }
             // Fast path: if the function carries a stored global_id, dispatch
@@ -21985,7 +22014,8 @@ impl CfmlVirtualMachine {
                         // paths whose argument matches any compiled pattern.
                         if !self.disallowed_imports.is_empty()
                             && (obj_type.eq_ignore_ascii_case("component")
-                                || obj_type.eq_ignore_ascii_case("rust"))
+                                || obj_type.eq_ignore_ascii_case("rust")
+                                || obj_type.eq_ignore_ascii_case("java"))
                         {
                             let target = args[1].as_string();
                             if self
@@ -23591,6 +23621,7 @@ impl CfmlVirtualMachine {
                             .get_ci("fileContent")
                             .unwrap_or_else(|| CfmlValue::string(String::new()));
                         if let Some((dir, leaf)) = write_target {
+                            self.host_write_guard("cfhttp(file=)")?;
                             cfml_common::cfhttp::cfhttp_write_body_to_file(&dir, &leaf, &body)?;
                         }
                         if let Some(target) = name_attr {
@@ -24810,6 +24841,7 @@ impl CfmlVirtualMachine {
                         // breaks every conventionally-quoted call site.
                         let cmd_args: Vec<String> = cmdline::tokenize_arguments(&arguments);
 
+                        self.host_exec_guard("cfexecute()")?;
                         let mut command = std::process::Command::new(&cmd_name);
                         command.args(&cmd_args);
                         if body.is_some() {
@@ -27268,6 +27300,12 @@ impl CfmlVirtualMachine {
         method_lower: &str,
         args: &mut Vec<CfmlValue>,
     ) -> Option<CfmlResult> {
+        // security.disallowedFunctions names BIFs (`arrayLen`), which these
+        // member forms answer without consulting; the generic member path
+        // applies the policy.
+        if !self.disallowed_functions.is_empty() {
+            return None;
+        }
         match object {
             CfmlValue::Array(a) => match (method_lower, args.len()) {
                 ("append", 1) => {
@@ -28116,6 +28154,11 @@ impl CfmlVirtualMachine {
 
     fn call_named_builtin(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         let nl = name.to_lowercase();
+        if self.builtin_policy_active() {
+            if let Some(e) = self.builtin_policy_refusal(&nl, &args) {
+                return Err(e);
+            }
+        }
         if let Some((_, b)) = self.builtin_lookup_ci(name, &nl) {
             #[cfg(feature = "bif-census")]
             cfml_common::perf_counters::bif_census::record(&nl, &args);
@@ -31112,6 +31155,9 @@ impl CfmlVirtualMachine {
         let mut args = std::mem::take(extra);
         args.insert(pos.min(args.len()), CfmlValue::DateTime(d));
         let lower = bif.to_lowercase();
+        if let Some(e) = self.disallowed_refusal(&lower) {
+            return Err(e);
+        }
         match self.builtin_lookup_ci(bif, &lower) {
             Some((_, f)) => f(args),
             None => Err(CfmlError::runtime(format!("Function [{}] is not available", bif))),
@@ -31430,6 +31476,11 @@ impl CfmlVirtualMachine {
                     return Ok(element);
                 }
 
+                if let Some(r) =
+                    self.java_shim_sandbox_refusal(java_class.as_str(), method_lower, object)
+                {
+                    return r.map_err(|e| self.wrap_error(e));
+                }
                 let all_args: Vec<CfmlValue> = std::mem::take(extra_args);
                 let m = method_lower.to_string();
                 // Keep a copy so a fall-through (the shim handler returns Null =
@@ -33591,6 +33642,11 @@ impl CfmlVirtualMachine {
                     &name_lower_owned
                 }
             };
+            if self.builtin_policy_active() {
+                if let Some(e) = self.builtin_policy_refusal(name_lower, &args) {
+                    return Err(e);
+                }
+            }
             if let Some((_, builtin)) = self.builtin_lookup_ci(name, name_lower) {
                 #[cfg(feature = "bif-census")]
                 cfml_common::perf_counters::bif_census::record(&name_lower, &args);
@@ -48631,12 +48687,31 @@ mod debug_footer_gate_tests {
         assert!(!vm.footer_activation_allowed());
     }
 
+    /// The out-of-the-box config must not let an outsider open the footer
+    /// with the well-known `?debug=true`.
+    #[test]
+    fn default_url_trigger_does_not_bypass_ip_whitelist() {
+        let mut vm = vm();
+        vm.web_context = true;
+        vm.debug_config.enabled = true;
+        vm.debug_config.show_from_ips = vec!["10.0.0.5".into()];
+        vm.globals
+            .insert("cgi", scope(&[("remote_addr", "203.0.113.5")]));
+        vm.globals.insert("url", scope(&[("debug", "true")]));
+        assert!(!vm.footer_activation_allowed(), "default config");
+        // Even switched on, the published default value is no secret in production.
+        vm.debug_config.url_trigger.enabled = true;
+        vm.server_state = Some(ServerState::with_production(true));
+        assert!(!vm.footer_activation_allowed(), "production, default value");
+    }
+
     #[test]
     fn url_trigger_custom_param_and_value() {
         let mut vm = vm();
         vm.web_context = true;
         vm.debug_config.enabled = true;
         vm.debug_config.show_from_ips = vec![]; // IP gate closed
+        vm.debug_config.url_trigger.enabled = true;
         vm.debug_config.url_trigger.param = "myhiddenvar".into();
         vm.debug_config.url_trigger.value = "s3cr3t".into();
         vm.globals

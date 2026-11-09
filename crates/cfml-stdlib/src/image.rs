@@ -738,6 +738,7 @@ impl CfmlImage {
         let (w, h) = fill_aspect(w, h, cur_w, cur_h)?;
         let filter = interpolation(&arg_str(a, 2, "highestQuality"));
         check_blur_factor(a.get(3))?;
+        check_canvas(w as i64, h as i64)?;
         self.img = self.img.resize_exact(w, h, filter);
         Ok(())
     }
@@ -754,6 +755,11 @@ impl CfmlImage {
         }
         let filter = interpolation(&arg_str(a, 2, "highestQuality"));
         check_blur_factor(a.get(3))?;
+        // The aspect-preserving target, as `DynamicImage::resize` computes it,
+        // must fit the pixel budget before anything is allocated.
+        let (cur_w, cur_h) = (self.img.width().max(1) as f64, self.img.height().max(1) as f64);
+        let ratio = (fit_w as f64 / cur_w).min(fit_h as f64 / cur_h);
+        check_canvas((cur_w * ratio).round() as i64, (cur_h * ratio).round() as i64)?;
         self.img = self.img.resize(fit_w, fit_h, filter);
         Ok(())
     }
@@ -1862,7 +1868,7 @@ fn sat_u32(v: i64) -> u32 {
 /// wrapped or huge size reached the allocator and took the process down.
 fn check_canvas(w: i64, h: i64) -> Result<(u32, u32), CfmlError> {
     let (w, h) = (w.clamp(0, i32::MAX as i64), h.clamp(0, i32::MAX as i64));
-    if w.saturating_mul(h) > i32::MAX as i64 {
+    if w.saturating_mul(h) > cfml_common::container_size::MAX_IMAGE_PIXELS {
         return Err(CfmlError::new(
             format!("Dimensions (width={w} height={h}) are too large"),
             CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
