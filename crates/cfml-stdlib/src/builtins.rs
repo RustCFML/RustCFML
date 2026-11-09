@@ -21866,6 +21866,32 @@ fn fn_csrf_verify_token(args: Vec<CfmlValue>) -> CfmlResult {
 
 // ---- cfzip ----
 
+/// Most bytes one `cfzip action="unzip"` may write (all entries together).
+#[cfg(feature = "zip_support")]
+#[cfg(not(target_arch = "wasm32"))]
+const CFZIP_MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Most bytes `cfzip action="read"/"readBinary"` may inflate into memory.
+#[cfg(feature = "zip_support")]
+#[cfg(not(target_arch = "wasm32"))]
+const CFZIP_MAX_ENTRY_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read one archive entry into memory, refusing one that inflates past
+/// [`CFZIP_MAX_ENTRY_READ_BYTES`] (a few KB of deflate can claim gigabytes).
+#[cfg(feature = "zip_support")]
+#[cfg(not(target_arch = "wasm32"))]
+fn cfzip_read_entry_capped(entry: &mut impl std::io::Read, name: &str) -> Result<Vec<u8>, CfmlError> {
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(entry, CFZIP_MAX_ENTRY_READ_BYTES + 1), &mut buf)
+        .map_err(|e| CfmlError::runtime(e.to_string()))?;
+    if buf.len() as u64 > CFZIP_MAX_ENTRY_READ_BYTES {
+        return Err(CfmlError::runtime(format!(
+            "cfzip: entry [{}] expands to more than {} bytes",
+            name, CFZIP_MAX_ENTRY_READ_BYTES
+        )));
+    }
+    Ok(buf)
+}
+
 #[cfg(feature = "zip_support")]
 #[cfg(not(target_arch = "wasm32"))]
 fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
@@ -22021,6 +22047,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
             let dest = std::path::Path::new(&destination);
             std::fs::create_dir_all(dest).map_err(|e| CfmlError::runtime(e.to_string()))?;
+            let mut extracted: u64 = 0;
 
             for i in 0..archive.len() {
                 let mut entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
@@ -22064,9 +22091,22 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                     if out_path.exists() && !overwrite {
                         continue;
                     }
-                    let mut buf = Vec::new();
-                    std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                    std::fs::write(&out_path, &buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    // Streamed to disk, against a running total for the
+                    // whole archive: a zip bomb used to be inflated into one
+                    // `Vec` per entry with no limit at all.
+                    let budget = CFZIP_MAX_EXTRACTED_BYTES - extracted;
+                    let mut out = std::fs::File::create(&out_path).map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    let written = std::io::copy(&mut std::io::Read::take(&mut entry, budget + 1), &mut out)
+                        .map_err(|e| CfmlError::runtime(e.to_string()))?;
+                    if written > budget {
+                        drop(out);
+                        let _ = std::fs::remove_file(&out_path);
+                        return Err(CfmlError::runtime(format!(
+                            "cfzip: [{}] expands to more than {} bytes; extraction stopped",
+                            file_path, CFZIP_MAX_EXTRACTED_BYTES
+                        )));
+                    }
+                    extracted += written;
                 }
             }
             Ok(CfmlValue::Null)
@@ -22119,8 +22159,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 .map_err(|e| CfmlError::runtime(format!("cfzip: invalid zip '{}': {}", file_path, e)))?;
             let mut entry = archive.by_name(&entry_path)
                 .map_err(|e| CfmlError::runtime(format!("cfzip: entry '{}' not found: {}", entry_path, e)))?;
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+            let buf = cfzip_read_entry_capped(&mut entry, &entry_path)?;
             let text = if charset.to_lowercase() == "utf-8" {
                 String::from_utf8_lossy(&buf).to_string()
             } else {
@@ -22138,8 +22177,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 .map_err(|e| CfmlError::runtime(format!("cfzip: invalid zip '{}': {}", file_path, e)))?;
             let mut entry = archive.by_name(&entry_path)
                 .map_err(|e| CfmlError::runtime(format!("cfzip: entry '{}' not found: {}", entry_path, e)))?;
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| CfmlError::runtime(e.to_string()))?;
+            let buf = cfzip_read_entry_capped(&mut entry, &entry_path)?;
             Ok(CfmlValue::binary(buf))
         }
         "delete" => {

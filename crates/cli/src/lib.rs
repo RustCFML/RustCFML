@@ -1596,7 +1596,11 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let completion_handle = seed.completion_handle.clone();
     let registry = seed.request_thread_registry.clone();
     let thread_name = seed.cfml_thread_name.clone();
-    let join = std::thread::Builder::new()
+    // Kept for the spawn-failure path below, where the body's own guard never
+    // ran: waiters and `threadData()` must still see the thread finish.
+    let (fail_completion, fail_registry, fail_name) =
+        (completion_handle.clone(), registry.clone(), thread_name.clone());
+    let spawned = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
             // B1 fix: Drop guard ensures completion is signaled on ALL exit paths
@@ -1668,13 +1672,41 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             // Receiver may be gone if the parent never joined; ignore.
             let _ = tx.send(result);
             // guard drops here, signaling completion
-        })
-        .expect("cfthread: failed to spawn OS thread");
+        });
+    // The OS can refuse a thread (thread or memory limits — each body asks for
+    // a 64 MB stack). That used to be an `expect`, i.e. a panic in the
+    // request; now the thread is reported as TERMINATED with the reason, the
+    // same shape as a body that threw.
+    let join = match spawned {
+        Ok(join) => Some(join),
+        Err(e) => {
+            let message = format!("cfthread: the operating system refused a new thread: {e}");
+            let mut err = cfml_common::dynamic::ValueMap::default();
+            err.insert("message".to_string(), CfmlValue::string(message.clone()));
+            err.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+            let result = cfml_vm::ThreadResult {
+                status: "TERMINATED".to_string(),
+                output: String::new(),
+                error: message,
+                error_struct: Some(CfmlValue::strukt(err)),
+                mem_allocated: 0,
+                elapsed: 0,
+                thread_vars: cfml_common::dynamic::ValueMap::default(),
+                return_value: None,
+            };
+            let mut guard = CompletionGuard::new(fail_completion, Some(fail_registry), fail_name);
+            guard.set_result(result.clone());
+            drop(guard);
+            let (tx, rx_fail) = std::sync::mpsc::channel();
+            let _ = tx.send(result);
+            return ThreadHandle { name: String::new(), rx: rx_fail, cancel, join: None, result: None };
+        }
+    };
     ThreadHandle {
         name: String::new(),
         rx,
         cancel,
-        join: Some(join),
+        join,
         result: None,
     }
 }
