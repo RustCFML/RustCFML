@@ -241,3 +241,26 @@ fn a_malformed_cfid_cookie_is_not_adopted() {
     let fresh = set_cookie["set-cookie: cfid=".len()..].split(';').next().unwrap();
     assert_eq!(fresh.len(), 36, "fresh id is not a UUID: {fresh}");
 }
+
+/// A client's own `X-Original-URL` must never reach the application — it is
+/// the header Preside's router trusts first for the requested path.
+#[test]
+fn client_x_original_url_is_dropped() {
+    let server = start(
+        "xorig",
+        "{}",
+        &[(
+            "hdr.cfm",
+            "<cfoutput>cgi=[#cgi.http_x_original_url#] hdr=[#getHttpRequestData().headers[\"X-Original-URL\"] ?: \"\"#] rw=[#cgi.http_x_rewrite_url#]</cfoutput>",
+        )],
+        &[],
+    );
+    let resp = get_with(
+        server.port,
+        "/hdr.cfm",
+        "X-Original-URL: /admin/\r\nX-Rewrite-URL: /admin/\r\n",
+    );
+    assert!(resp.contains("cgi=[]"), "cgi saw the client header:\n{resp}");
+    assert!(resp.contains("hdr=[]"), "getHttpRequestData saw it:\n{resp}");
+    assert!(resp.contains("rw=[]"), "X-Rewrite-URL passed through:\n{resp}");
+}

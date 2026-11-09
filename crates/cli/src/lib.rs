@@ -4042,6 +4042,15 @@ async fn handle_request_inner(
     // Extract headers as Vec<(String, String)>
     let mut headers: Vec<(String, String)> = parts.headers.iter()
         .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or("").to_string()))
+        // `X-Original-URL` / `X-Rewrite-URL` are how a front controller learns
+        // the URL a rewrite forwarded from (Preside's pathInfoProvider reads
+        // the first one before anything else). Only this server may set them —
+        // below, when one of its own Forward rules fired. A client-supplied
+        // value used to reach the application whenever no rule matched, letting
+        // any visitor choose the route the router saw.
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("x-original-url") && !name.eq_ignore_ascii_case("x-rewrite-url")
+        })
         .collect();
 
     // Read body bytes. `server.maxRequestBodySize` from cfconfig caps the
@@ -4350,10 +4359,9 @@ async fn handle_request_inner(
         let _ = REWRITE_STATUS.try_with(|c| c.set(Some(code)));
     }
 
-    // Surface the pre-rewrite URI as `X-Original-URL` (see note above). Replace
-    // any client-supplied value so it cannot spoof the router's view of the URL.
+    // Surface the pre-rewrite URI as `X-Original-URL` (see note above). Any
+    // client-supplied value was already dropped when the headers were read.
     if let Some(ref original_uri) = forward_original_uri {
-        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-original-url"));
         headers.push(("X-Original-URL".to_string(), original_uri.clone()));
     }
 
