@@ -2196,8 +2196,25 @@ fn compile_and_run(
 // Web server
 // ---------------------------------------------------------------------------
 
+/// `server.cfmlExtensions` with the core CFML extensions always included.
+fn effective_cfml_extensions(configured: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = ["cfm", "cfc", "cfml"].iter().map(|s| s.to_string()).collect();
+    for ext in configured {
+        let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        if !ext.is_empty() && !out.contains(&ext) {
+            out.push(ext);
+        }
+    }
+    out
+}
+
 struct AppState {
     doc_root: PathBuf,
+    /// Extensions executed as CFML: `server.cfmlExtensions` plus the fixed
+    /// core `cfm`, `cfc`, `cfml`. The core is not optional — a config that
+    /// listed only `["cfm"]` (to add nothing, or by mistake) used to make
+    /// every `.cfc` a static file, serving component SOURCE to any client.
+    cfml_extensions: Vec<String>,
     port: u16,
     debug: bool,
     server_state: ServerState,
@@ -3162,6 +3179,7 @@ async fn async_run_server(
 
     let app_state = Arc::new(AppState {
         doc_root: doc_root.to_path_buf(),
+        cfml_extensions: effective_cfml_extensions(&cfconfig.server.cfml_extensions),
         port,
         debug,
         server_state,
@@ -4367,7 +4385,7 @@ async fn handle_request_inner(
 
     // Resolve file path from URL (memoized in production mode)
     let welcome_files = &state.cfconfig.server.welcome_files;
-    let cfml_exts = &state.cfconfig.server.cfml_extensions;
+    let cfml_exts = &state.cfml_extensions;
     let resolved = if state.server_state.production_mode {
         let cached = state.resolved_file_cache.read().unwrap().get(&path).cloned();
         match cached {

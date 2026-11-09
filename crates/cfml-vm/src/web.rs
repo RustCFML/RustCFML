@@ -25,8 +25,18 @@ pub struct ResolvedFile {
 /// truncate the OS path), no backslash (a second separator on Windows that the
 /// segment split below would not see). `.` segments and empty segments
 /// (`//`) are harmless and left alone.
+///
+/// On Windows a `:` is refused too. `doc_root.join("C:/Windows/win.ini")`
+/// REPLACES the base there (a drive-qualified path is absolute), so
+/// `/C:/Windows/win.ini` would be served from outside the webroot, and
+/// `index.cfm::$DATA` names an NTFS stream of a file whose source would then be
+/// served as static content. A colon is an ordinary filename character on Unix
+/// and stays allowed there.
 pub fn url_path_is_contained(url_path: &str) -> bool {
     if url_path.contains('\0') || url_path.contains('\\') {
+        return false;
+    }
+    if cfg!(windows) && url_path.contains(':') {
         return false;
     }
     !url_path.split('/').any(|seg| seg == "..")
@@ -1367,6 +1377,14 @@ mod docroot_containment_tests {
 
     /// The real bug: `GET /../outside/secret.txt` resolved to a file ABOVE the
     /// document root and was served (dev and --production alike).
+    #[test]
+    fn windows_drive_and_stream_paths_are_not_contained() {
+        // A colon is only dangerous where it can name a drive or an NTFS stream.
+        assert_eq!(url_path_is_contained("/C:/Windows/win.ini"), !cfg!(windows));
+        assert_eq!(url_path_is_contained("/index.cfm::$DATA"), !cfg!(windows));
+        assert!(url_path_is_contained("/plain/path.cfm"));
+    }
+
     #[test]
     fn resolve_file_never_climbs_out_of_doc_root() {
         let tmp = std::env::temp_dir().join(format!("rustcfml_trav_{}", std::process::id()));

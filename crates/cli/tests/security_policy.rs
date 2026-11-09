@@ -304,3 +304,17 @@ fn websocket_upgrade_from_a_foreign_origin_is_refused() {
     assert_eq!(status(upgrade(Some("https://chat.partner.example"))), "404");
     assert_eq!(status(upgrade(None)), "404");
 }
+
+/// `server.cfmlExtensions` adds to the CFML set; it cannot remove `.cfc`. A
+/// list without `cfc` used to serve component source as a static file.
+#[test]
+fn cfc_source_is_never_served_as_static() {
+    let server = start(
+        "cfcsrc",
+        r#"{"server":{"cfmlExtensions":["cfm"]}}"#,
+        &[("Secret.cfc", "component { /* SOURCE-MARKER */ remote string function hi() { return \"x\"; } }")],
+        &[],
+    );
+    let resp = get(server.port, "/Secret.cfc");
+    assert!(!resp.contains("SOURCE-MARKER"), "component source served:\n{resp}");
+}
