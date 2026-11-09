@@ -5353,16 +5353,21 @@ fn populate_default_mail_server(cfg: &RustCfmlConfig) {
 /// Return true if the URL path points at a file the web server must not serve
 /// directly. Covers `.cfconfig*` / `.env` / `*.lex` unconditionally, then
 /// applies the glob patterns from `security.blockedPaths`.
+/// Every path SEGMENT is tested, not only the last one: `/.git/config` is
+/// blocked by its `.git` directory, and `/Application.cfc/x` — which the
+/// path-info walk resolves to `Application.cfc` with path info `/x` and used
+/// to EXECUTE as a page — by its `Application.cfc` segment.
 fn is_blocked_path(url_path: &str, cfconfig: &RustCfmlConfig) -> bool {
-    let basename = url_path.rsplit('/').next().unwrap_or(url_path);
-    if cfml_config::resolve::is_protected_filename(basename) {
+    let url_lower = url_path.to_ascii_lowercase();
+    let segments: Vec<&str> = url_lower.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|seg| cfml_config::resolve::is_protected_filename(seg)) {
         return true;
     }
-    let url_lower = url_path.to_ascii_lowercase();
-    let base_lower = basename.to_ascii_lowercase();
     for pat in &cfconfig.security.blocked_paths {
         let pat_lower = pat.to_ascii_lowercase();
-        if glob_matches(&pat_lower, &base_lower) || glob_matches(&pat_lower, &url_lower) {
+        if glob_matches(&pat_lower, &url_lower)
+            || segments.iter().any(|seg| glob_matches(&pat_lower, seg))
+        {
             return true;
         }
     }
@@ -5441,6 +5446,15 @@ mod cfconfig_block_tests {
         let cfg = RustCfmlConfig::default();
         assert!(is_blocked_path("/Application.cfc", &cfg));
         assert!(is_blocked_path("/sub/foo.cfm.bak", &cfg));
+        // Any segment, not just the last.
+        assert!(is_blocked_path("/Application.cfc/x", &cfg));
+        assert!(is_blocked_path("/Application.cfc/", &cfg));
+        assert!(is_blocked_path("/.git/config", &cfg));
+        assert!(is_blocked_path("/sub/.git/HEAD", &cfg));
+        assert!(is_blocked_path("/.htaccess", &cfg));
+        assert!(is_blocked_path("/.env.production", &cfg));
+        assert!(!is_blocked_path("/.well-known/acme-challenge/x", &cfg));
+        assert!(!is_blocked_path("/application.cfm", &cfg));
     }
 }
 

@@ -35,11 +35,23 @@ pub fn resolve_config_path(dirs: &[PathBuf]) -> Option<PathBuf> {
 
 /// Glob-like check used by the HTTP-block list. Matches `.cfconfig.json`,
 /// `.CFConfig.json`, `.cfconfig.local.json`, etc.
+///
+/// Also the dot-names that commonly carry secrets or source history and must
+/// never be served from a web root: VCS metadata (`.git`, `.svn`, `.hg`),
+/// `.env.*` variants, Apache auth files and macOS `.DS_Store`. Matched per
+/// path SEGMENT by the caller, so `/.git/config` is caught by its `.git`
+/// directory. `.well-known` is deliberately not on the list (ACME, security.txt).
 pub fn is_protected_filename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == ".env"
+        || lower.starts_with(".env.")
         || lower.starts_with(".cfconfig")
         || lower.ends_with(".lex")
+        || matches!(
+            lower.as_str(),
+            ".git" | ".gitignore" | ".gitmodules" | ".svn" | ".hg" | ".htaccess" | ".htpasswd"
+                | ".ds_store" | ".npmrc" | ".pgpass" | ".netrc"
+        )
 }
 
 /// Convenience for callers: exe-directory candidate, with errors swallowed.
