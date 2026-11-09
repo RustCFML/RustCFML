@@ -655,10 +655,13 @@ impl DatasourceCfg {
     /// Returns `None` for an unsupported / unrecognised driver.
     pub fn connection_url(&self) -> Option<String> {
         let driver = self.canonical_driver();
-        // MySQL and PostgreSQL URLs are percent-decoded by their drivers, so a
-        // credential containing `@`, `:`, `/`, `#` or `%` must be encoded. The
-        // SQL Server URL is split as-is and is left raw.
-        let encode = matches!(driver.as_str(), "mysql" | "mariadb" | "postgresql" | "postgres");
+        // Every network driver's URL is percent-decoded when parsed (the SQL
+        // Server one by the stdlib), so a credential containing `@`, `:`, `/`,
+        // `?`, `#` or `%` must be encoded.
+        let encode = matches!(
+            driver.as_str(),
+            "mysql" | "mariadb" | "postgresql" | "postgres" | "mssql" | "sqlserver"
+        );
         let enc = |v: &str| if encode { percent_encode_userinfo(v) } else { v.to_string() };
         let creds = if self.username.is_empty() && self.password.is_empty() {
             String::new()

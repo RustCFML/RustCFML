@@ -12728,29 +12728,37 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
     use tiberius::{Config, AuthMethod};
 
     let clean_url = url.replace("mssql://", "").replace("sqlserver://", "");
+    // Format: user:pass@host:port/database?options. The credentials are split
+    // off FIRST, at the last `@`: splitting the query string off first meant a
+    // `?` in a password turned the rest of the password into options.
+    let (auth_part, rest) = clean_url.rsplit_once('@')
+        .ok_or_else(|| CfmlError::database("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
     // Split off an optional query string before parsing the path components, so
     // the database name isn't polluted by `?trustServerCertificate=...` etc.
-    let (clean_url, query) = match clean_url.split_once('?') {
-        Some((b, q)) => (b.to_string(), Some(q.to_string())),
-        None => (clean_url, None),
+    let (host_db, query) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q.to_string())),
+        None => (rest, None),
     };
-    // Format: user:pass@host:port/database
-    let (auth_part, host_db) = clean_url.split_once('@')
-        .ok_or_else(|| CfmlError::database("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
     let (user, pass) = auth_part.split_once(':')
         .ok_or_else(|| CfmlError::database("queryExecute: MSSQL URL must include user:password".to_string()))?;
+    // Percent-encoded like the MySQL/PostgreSQL URLs (`connection_url` encodes
+    // them), so a credential may contain `:`, `@`, `/`, `?`, `#` or `%`.
+    let user = url_decode_string_opt(user, false);
+    let pass = url_decode_string_opt(pass, false);
+    let (user, pass) = (user.as_str(), pass.as_str());
     let (host_port, database) = host_db.split_once('/')
         .unwrap_or((host_db, "master"));
     let (host, port_str) = host_port.split_once(':')
         .unwrap_or((host_port, "1433"));
     let port: u16 = port_str.parse().unwrap_or(1433);
 
-    // TLS: tiberius (rustls feature) negotiates encryption by default. By
-    // default we trust the server certificate (works with Azure SQL and any
-    // managed instance out of the box). Set `trustServerCertificate=false`
-    // (or `encrypt=strict`) in the URL to instead validate the certificate
-    // against the platform trust store.
-    let mut trust_cert = true;
+    // TLS: tiberius (rustls feature) negotiates encryption by default, and
+    // the server certificate is VALIDATED against the platform trust store —
+    // mssql-jdbc's default since 10.2. Trusting any certificate made the
+    // encryption worthless against an attacker in the path. A development
+    // server with a self-signed certificate opts out with
+    // `trustServerCertificate=true` in the URL.
+    let mut trust_cert = false;
     if let Some(q) = &query {
         for pair in q.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -12964,7 +12972,7 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
 /// Expand SQL ? placeholders for list params: if param N generates 3 values, replace its ? with ?,?,?
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn expand_sql_placeholders(sql: &str, counts: &[usize]) -> String {
-    let mut result = String::with_capacity(sql.len() + counts.len() * 4);
+    let mut result: Vec<u8> = Vec::with_capacity(sql.len() + counts.len() * 4);
     let mut param_idx = 0;
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -12973,44 +12981,47 @@ fn expand_sql_placeholders(sql: &str, counts: &[usize]) -> String {
         if bytes[i] == b'?' && param_idx < counts.len() {
             let count = counts[param_idx];
             for j in 0..count {
-                if j > 0 { result.push(','); }
-                result.push('?');
+                if j > 0 { result.push(b','); }
+                result.push(b'?');
             }
             param_idx += 1;
         } else if bytes[i] == b'\'' {
-            result.push('\'');
+            result.push(b'\'');
             i += 1;
             while i < len && bytes[i] != b'\'' {
-                result.push(bytes[i] as char);
+                result.push(bytes[i]);
                 i += 1;
             }
-            if i < len { result.push('\''); }
+            if i < len { result.push(b'\''); }
         } else if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
             // A `--` comment is opaque: an apostrophe in it would open a
             // phantom string, and a `?` in it must not consume a list slot.
             while i < len && bytes[i] != b'\n' {
-                result.push(bytes[i] as char);
+                result.push(bytes[i]);
                 i += 1;
             }
             continue;
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            result.push_str("/*");
+            result.extend_from_slice("/*".as_bytes());
             i += 2;
             while i < len && !(bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/') {
-                result.push(bytes[i] as char);
+                result.push(bytes[i]);
                 i += 1;
             }
             if i < len {
-                result.push_str("*/");
+                result.extend_from_slice("*/".as_bytes());
                 i += 2;
             }
             continue;
         } else {
-            result.push(bytes[i] as char);
+            result.push(bytes[i]);
         }
         i += 1;
     }
-    result
+    // Only ASCII bytes were inserted, and only at ASCII positions, so the
+    // input's UTF-8 sequences are copied through intact. (These used to push
+    // each byte `as char`, turning `N'café'` into `N'cafÃ©'`.)
+    String::from_utf8(result).expect("byte-preserving rewrite of a UTF-8 string")
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -15752,7 +15763,7 @@ fn mssql_bind_params(params: &[CfmlValue]) -> Vec<MssqlParam> {
 /// parameter vector.
 #[cfg(feature = "mssql_db")]
 fn mssql_rewrite_placeholders(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len() + 8);
+    let mut result: Vec<u8> = Vec::with_capacity(sql.len() + 8);
     let mut param_idx = 0usize;
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -15760,40 +15771,43 @@ fn mssql_rewrite_placeholders(sql: &str) -> String {
     while i < len {
         if bytes[i] == b'?' {
             param_idx += 1;
-            result.push_str("@P");
-            result.push_str(&param_idx.to_string());
+            result.extend_from_slice("@P".as_bytes());
+            result.extend_from_slice(param_idx.to_string().as_bytes());
         } else if bytes[i] == b'\'' {
-            result.push('\'');
+            result.push(b'\'');
             i += 1;
             while i < len && bytes[i] != b'\'' {
-                result.push(bytes[i] as char);
+                result.push(bytes[i]);
                 i += 1;
             }
-            if i < len { result.push('\''); }
+            if i < len { result.push(b'\''); }
         } else if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
             while i < len && bytes[i] != b'\n' {
-                result.push(bytes[i] as char);
+                result.push(bytes[i]);
                 i += 1;
             }
             continue;
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            result.push_str("/*");
+            result.extend_from_slice("/*".as_bytes());
             i += 2;
             while i < len && !(bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/') {
-                result.push(bytes[i] as char);
+                result.push(bytes[i]);
                 i += 1;
             }
             if i < len {
-                result.push_str("*/");
+                result.extend_from_slice("*/".as_bytes());
                 i += 2;
             }
             continue;
         } else {
-            result.push(bytes[i] as char);
+            result.push(bytes[i]);
         }
         i += 1;
     }
-    result
+    // Only ASCII bytes were inserted, and only at ASCII positions, so the
+    // input's UTF-8 sequences are copied through intact. (These used to push
+    // each byte `as char`, turning `N'café'` into `N'cafÃ©'`.)
+    String::from_utf8(result).expect("byte-preserving rewrite of a UTF-8 string")
 }
 
 /// A failed MSSQL statement run, carrying enough context for the caller to
@@ -22632,6 +22646,38 @@ mod placeholder_comment_scan_tests {
         assert_eq!(
             expand_sql_placeholders("select * from t /* eh? */ where id in (?)", &[2]),
             "select * from t /* eh? */ where id in (?,?)"
+        );
+    }
+
+    #[test]
+    fn list_expansion_preserves_non_ascii_text() {
+        assert_eq!(
+            expand_sql_placeholders("select N'café — ✓' as a, x from t where id in (?) -- é", &[2]),
+            "select N'café — ✓' as a, x from t where id in (?,?) -- é"
+        );
+    }
+
+    #[cfg(feature = "mssql_db")]
+    #[test]
+    fn mssql_url_credentials_may_hold_url_metacharacters() {
+        use super::mssql_config_from_url;
+        // Encoded (what `connection_url` now produces) and a raw `?` in the
+        // password both leave host, port and database intact.
+        let (_, addr) =
+            mssql_config_from_url("mssql://sa:p%3Fw%40d%3A@db:1444/app?trustServerCertificate=true")
+                .unwrap();
+        assert_eq!(addr, "db:1444");
+        let (_, addr) = mssql_config_from_url("sqlserver://sa:p?w@db:1445/app").unwrap();
+        assert_eq!(addr, "db:1445");
+    }
+
+    #[cfg(feature = "mssql_db")]
+    #[test]
+    fn mssql_rewrite_preserves_non_ascii_text() {
+        use super::mssql_rewrite_placeholders;
+        assert_eq!(
+            mssql_rewrite_placeholders("select N'café' as a, ? as b /* ü */"),
+            "select N'café' as a, @P1 as b /* ü */"
         );
     }
 
