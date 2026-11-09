@@ -85,7 +85,7 @@ memcache = { version = "0.17", optional = true }
 # needs no system OpenSSL — required for the Windows MSVC release runner, and it
 # makes the distributed binaries self-contained on every platform.
 openssl = { version = "0.10", features = ["vendored"], optional = true }
-memberlist = { version = "0.8", optional = true, default-features = false, features = ["tokio", "tcp", "serde"] }
+memberlist = { version = "0.8", optional = true, default-features = false, features = ["tokio", "tcp", "serde", "encryption"] }
 automerge = { version = "0.9", optional = true }
 bincode = { version = "2", optional = true, features = ["serde"] }
 socket2 = { version = "0.5", optional = true, features = ["all"] }

@@ -442,6 +442,7 @@ mod inner {
             discovery: crate::session::discovery::Discovery,
             node_name: String,
             ws_registry: Option<Arc<WebSocketRegistry>>,
+            secret_key: Option<memberlist::proto::SecretKey>,
         ) -> Result<Self, String> {
             let bind: SocketAddr = listen_addr
                 .parse()
@@ -489,8 +490,20 @@ mod inner {
                 })
                 .with_event_delegate(ev_delegate);
 
+            // With a key, every packet and stream is AES-GCM encrypted and
+            // authenticated, and unencrypted input is rejected in both
+            // directions. Without one (loopback-only clusters, see the
+            // caller) memberlist runs in the clear.
+            let mut opts = Options::lan();
+            if let Some(key) = secret_key {
+                opts = opts
+                    .with_primary_key(key)
+                    .with_encryption_algo(memberlist::proto::EncryptionAlgorithm::NoPadding)
+                    .with_gossip_verify_incoming(true)
+                    .with_gossip_verify_outgoing(true);
+            }
             let memberlist =
-                TokioTcpMemberlist::with_delegate(delegate, net_opts, Options::lan())
+                TokioTcpMemberlist::with_delegate(delegate, net_opts, opts)
                     .await
                     .map_err(|e| format!("memberlist init failed: {}", e))?;
 
@@ -977,6 +990,68 @@ mod inner {
             // path) — a dropped WS frame is a missed realtime message, not state
             // corruption, and history/replay covers reconnects.
             let _ = self.shared.tx.try_send(ClusterMsg::Ws(json));
+        }
+    }
+
+    /// The cluster bus carries every session document, so membership must
+    /// require the shared key: same key → the nodes converge; a node with a
+    /// different key is never admitted.
+    #[cfg(test)]
+    mod encryption_tests {
+        use super::*;
+        use crate::session::discovery::{Discovery, StaticSeeds};
+
+        fn free_port() -> u16 {
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        }
+
+        async fn node(
+            name: &str,
+            port: u16,
+            seed: Option<u16>,
+            key: &str,
+        ) -> ClusterNode {
+            let seeds: Vec<String> = seed.map(|p| format!("127.0.0.1:{p}")).into_iter().collect();
+            ClusterNode::start(
+                &format!("127.0.0.1:{port}"),
+                Discovery::Static(StaticSeeds::new(&seeds)),
+                name.to_string(),
+                None,
+                Some(key.parse().unwrap()),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn members_after(n: &ClusterNode, want: usize) -> usize {
+            let t = n.app_transport();
+            for _ in 0..60 {
+                if t.members().len() >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            t.members().len()
+        }
+
+        const KEY_A: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        const KEY_B: &str = "HxwdHhscGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn members_with_the_same_key_converge() {
+            let (pa, pb) = (free_port(), free_port());
+            let a = node("enc-a", pa, None, KEY_A).await;
+            let _b = node("enc-b", pb, Some(pa), KEY_A).await;
+            assert_eq!(members_after(&a, 2).await, 2, "same-key nodes did not converge");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_with_another_key_is_not_admitted() {
+            let (pa, pb) = (free_port(), free_port());
+            let a = node("key-a", pa, None, KEY_A).await;
+            let _intruder = node("key-b", pb, Some(pa), KEY_B).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert_eq!(a.app_transport().members().len(), 1, "a wrong-key node joined");
         }
     }
 }

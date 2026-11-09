@@ -862,6 +862,14 @@ pub struct CacheProperties {
     /// Stable human-readable node name. Defaults to hostname:listenPort.
     #[serde(rename = "nodeName")]
     pub node_name: String,
+    /// Shared cluster key: base64 of 16, 24 or 32 random bytes (AES-128/192/
+    /// 256-GCM). Every member must have the same key. Gossip, state sync and
+    /// application messages are encrypted and authenticated with it; a peer
+    /// without it can neither read the session documents nor inject any.
+    /// REQUIRED unless `listenAddr` is a loopback address — without it the
+    /// cluster refuses to start. Generate one with `openssl rand -base64 32`.
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
     /// Peer discovery strategy. When absent, falls back to static seeds
     /// (see `seeds`) for backwards compatibility.
     pub discovery: Discovery,
@@ -942,6 +950,7 @@ impl Default for CacheProperties {
             advertise_addr: String::new(),
             seeds: Vec::new(),
             node_name: String::new(),
+            secret_key: String::new(),
             discovery: Discovery::default(),
         }
     }
@@ -1479,6 +1488,7 @@ impl RustCfmlConfig {
             expand(&mut p.listen_addr);
             expand(&mut p.advertise_addr);
             expand(&mut p.node_name);
+            expand(&mut p.secret_key);
             for seed in p.seeds.iter_mut() {
                 expand(seed);
             }

@@ -2574,6 +2574,33 @@ async fn ensure_cluster_node(
             } else {
                 format!("{}-{}", listen_addr, uuid::Uuid::new_v4().simple())
             };
+            // The cluster bus carries every session document and accepts
+            // writes to them, so it must not be open to whoever can reach the
+            // port. A key is required unless the node only listens on loopback.
+            let secret_key = match parse_cluster_secret_key(&props.secret_key) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[cluster] refusing to start: {e}");
+                    return None;
+                }
+            };
+            if secret_key.is_none() {
+                let loopback = listen_addr
+                    .parse::<std::net::SocketAddr>()
+                    .map(|a| a.ip().is_loopback())
+                    .unwrap_or(false);
+                if !loopback {
+                    eprintln!(
+                        "[cluster] refusing to start: listenAddr {listen_addr} is reachable from \
+                         other hosts but no `secretKey` is configured. Without one any host that \
+                         can reach the port can read and forge every session. Set `secretKey` \
+                         (base64 of 16, 24 or 32 random bytes, e.g. `openssl rand -base64 32`) \
+                         on every member, or bind listenAddr to 127.0.0.1."
+                    );
+                    return None;
+                }
+                eprintln!("[cluster] no secretKey: gossip is unencrypted (loopback only)");
+            }
             let discovery = build_discovery(props, &listen_addr);
             let label = discovery.label();
             // Unify the WebSocket registry's node id with the cluster node name
@@ -2585,6 +2612,7 @@ async fn ensure_cluster_node(
                 discovery,
                 node_name.clone(),
                 Some(ws_registry.clone()),
+                secret_key,
             )
             .await
             {
@@ -2605,6 +2633,19 @@ async fn ensure_cluster_node(
         })
         .await
         .as_ref()
+}
+
+/// `secretKey` from the cluster properties: empty = none; otherwise base64 of
+/// exactly 16, 24 or 32 bytes.
+#[cfg(feature = "cluster")]
+fn parse_cluster_secret_key(raw: &str) -> Result<Option<memberlist::proto::SecretKey>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<memberlist::proto::SecretKey>().map(Some).map_err(|e| {
+        format!("secretKey must be base64 of 16, 24 or 32 bytes (AES-128/192/256): {e}")
+    })
 }
 
 async fn build_session_store(
