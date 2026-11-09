@@ -3983,7 +3983,33 @@ pub fn report_live_bodies() {
 ///
 /// `expires` accepts Lucee's words as well as a number of days: "never" is far
 /// future, "now" is the epoch (which is how a cookie is deleted).
-fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> String {
+///
+/// Returns `None` for a name that cannot be a cookie name. Unlike `cfcookie`,
+/// these values never went through `web::validate_cookie_attr`, so a `;` in
+/// `path`, `domain`, `samesite` or `expires` appended attributes of the
+/// caller's choosing (`path="/;Domain=evil.example"`). A value's `;`, `,` and
+/// control characters are percent-encoded; an attribute carrying one is
+/// dropped.
+fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> Option<String> {
+    if web::validate_cookie_attr("name", name).is_err() {
+        return None;
+    }
+    // An attribute value spliced after `;Name=` must not contain a separator.
+    let attr_ok = |v: &str| !v.chars().any(|c| c == ';' || c.is_control());
+    let encode_value = |v: &str| -> String {
+        let mut out = String::with_capacity(v.len());
+        for c in v.chars() {
+            if c == ';' || c == ',' || c.is_control() {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
     let fmt_expiry = |secs_from_now: i64| -> String {
         let when = chrono::Utc::now() + chrono::Duration::seconds(secs_from_now);
         when.format("%a, %d-%b-%Y %H:%M:%S GMT").to_string()
@@ -3991,7 +4017,7 @@ fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> String {
     let opts = match value {
         CfmlValue::Struct(s) => s.snapshot(),
         other => {
-            return format!("{}={};Path=/", name, other.as_string());
+            return Some(format!("{}={};Path=/", name, encode_value(&other.as_string())));
         }
     };
     let get = |k: &str| -> Option<CfmlValue> {
@@ -4007,15 +4033,14 @@ fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> String {
     let mut out = format!(
         "{}={}",
         name,
-        get("value").map(|v| v.as_string()).unwrap_or_default()
+        encode_value(&get("value").map(|v| v.as_string()).unwrap_or_default())
     );
-    out.push_str(&format!(
-        ";Path={}",
-        get("path").map(|v| v.as_string()).unwrap_or_else(|| "/".to_string())
-    ));
+    let path = get("path").map(|v| v.as_string()).filter(|p| attr_ok(p)).unwrap_or_else(|| "/".to_string());
+    out.push_str(&format!(";Path={}", path));
     if let Some(d) = get("domain") {
-        if !d.as_string().is_empty() {
-            out.push_str(&format!(";Domain={}", d.as_string()));
+        let d = d.as_string();
+        if !d.is_empty() && attr_ok(&d) {
+            out.push_str(&format!(";Domain={}", d));
         }
     }
     if let Some(e) = get("expires") {
@@ -4029,7 +4054,7 @@ fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> String {
             out.push_str(";Expires=Thu, 01-Jan-1970 00:00:00 GMT");
         } else if let Ok(days) = raw.parse::<f64>() {
             out.push_str(&format!(";Expires={}", fmt_expiry((days * 86400.0) as i64)));
-        } else if !raw.is_empty() {
+        } else if !raw.is_empty() && attr_ok(&raw) {
             out.push_str(&format!(";Expires={}", raw));
         }
     }
@@ -4040,11 +4065,12 @@ fn render_cookie_scope_entry(name: &str, value: &CfmlValue) -> String {
         out.push_str(";HttpOnly");
     }
     if let Some(ss) = get("samesite") {
-        if !ss.as_string().is_empty() {
-            out.push_str(&format!(";SameSite={}", ss.as_string()));
+        let ss = ss.as_string();
+        if !ss.is_empty() && attr_ok(&ss) {
+            out.push_str(&format!(";SameSite={}", ss));
         }
     }
-    out
+    Some(out)
 }
 
 impl CfmlVirtualMachine {
@@ -42281,8 +42307,10 @@ impl CfmlVirtualMachine {
                 Some(a) => render_cookie_scope_entry(key, a),
                 None => render_cookie_scope_entry(key, value),
             };
-            self.response_headers
-                .push(("Set-Cookie".to_string(), rendered));
+            if let Some(rendered) = rendered {
+                self.response_headers
+                    .push(("Set-Cookie".to_string(), rendered));
+            }
         }
     }
 
@@ -48784,6 +48812,22 @@ mod debug_footer_gate_tests {
         vm.globals
             .insert("cgi", scope(&[("remote_addr", "203.0.113.5")]));
         assert!(!vm.footer_activation_allowed());
+    }
+
+    #[test]
+    fn cookie_scope_struct_cannot_inject_attributes() {
+        let mut m = ValueMap::default();
+        m.insert("value".to_string(), CfmlValue::string("a;Domain=evil.example".to_string()));
+        m.insert("path".to_string(), CfmlValue::string("/;Domain=evil.example".to_string()));
+        m.insert("domain".to_string(), CfmlValue::string("x.example;HttpOnly=0".to_string()));
+        m.insert("samesite".to_string(), CfmlValue::string("Lax;Secure".to_string()));
+        let out = render_cookie_scope_entry("sid", &CfmlValue::strukt(m)).unwrap();
+        assert_eq!(out, "sid=a%3BDomain=evil.example;Path=/");
+        assert!(render_cookie_scope_entry("bad;name", &CfmlValue::string("v".to_string())).is_none());
+        assert_eq!(
+            render_cookie_scope_entry("plain", &CfmlValue::string("v1".to_string())).unwrap(),
+            "plain=v1;Path=/"
+        );
     }
 
     #[test]
