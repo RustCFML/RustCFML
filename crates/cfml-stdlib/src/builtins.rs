@@ -13245,9 +13245,44 @@ fn mssql_returns_rows(sql: &str) -> bool {
         return true;
     }
 
-    matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
-        && sql_has_top_level_keyword(trimmed, "OUTPUT")
-        && !sql_has_top_level_keyword(trimmed, "INTO")
+    if matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
+        return sql_has_top_level_keyword(trimmed, "OUTPUT")
+            && !sql_has_top_level_keyword(trimmed, "INTO");
+    }
+
+    // A batch that starts with setup and then selects — `DECLARE @now DATE =
+    // GETDATE(); SELECT …`, `SET NOCOUNT ON; SELECT …`, `IF … SELECT …` —
+    // returns the first result set, as on Lucee. Run it on the row path, which
+    // skips statements that produce no result set. (`INSERT … SELECT` stays a
+    // mutation above; a SELECT inside parentheses is a subquery, not a result.)
+    sql_has_top_level_keyword(trimmed, "SELECT")
+}
+
+#[cfg(all(test, feature = "mssql_db"))]
+mod mssql_returns_rows_tests {
+    use super::mssql_returns_rows;
+
+    #[test]
+    fn plain_reads_and_writes() {
+        assert!(mssql_returns_rows("SELECT 1"));
+        assert!(mssql_returns_rows("  WITH x AS (SELECT 1 a) SELECT a FROM x"));
+        assert!(!mssql_returns_rows("UPDATE t SET a = 1"));
+        assert!(!mssql_returns_rows("INSERT INTO t (a) SELECT a FROM s"));
+    }
+
+    #[test]
+    fn setup_then_select_batches_return_rows() {
+        assert!(mssql_returns_rows("DECLARE @now DATE = GETDATE();\nSELECT name FROM t WHERE d <= @now;"));
+        assert!(mssql_returns_rows("SET NOCOUNT ON; SELECT 1"));
+        assert!(mssql_returns_rows("IF OBJECT_ID('t') IS NOT NULL SELECT 1"));
+    }
+
+    #[test]
+    fn subqueries_and_strings_are_not_results() {
+        assert!(!mssql_returns_rows("DECLARE @x INT = (SELECT MAX(id) FROM t); UPDATE t SET a = @x"));
+        assert!(!mssql_returns_rows("SET @msg = 'select me'"));
+        assert!(!mssql_returns_rows("IF EXISTS (SELECT 1 FROM t) UPDATE t SET a = 1"));
+    }
 }
 
 /// MariaDB (10.5+) returns rows from `INSERT ... RETURNING` and
