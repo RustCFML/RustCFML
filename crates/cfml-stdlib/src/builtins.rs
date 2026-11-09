@@ -10540,20 +10540,43 @@ fn cfhttp_collect_headers(
     (headers, raw)
 }
 
-/// Read a response body either as decoded text or as raw bytes. Decoding bytes
-/// through `into_string()` would corrupt non-UTF-8 payloads (images, etc.).
+/// The largest response body `cfhttp` will hold in memory (256 MiB). Lucee
+/// has no limit beyond the JVM heap; without one here a hostile or broken
+/// server could stream until the process aborted. A download larger than this
+/// belongs in `cfhttp file=`.
 #[cfg(feature = "http")]
-fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> CfmlValue {
-    if !get_as_binary {
-        return CfmlValue::string(resp.into_string().unwrap_or_default());
-    }
+const CFHTTP_MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
-    let mut reader = resp.into_reader();
+/// Read a response body either as text or as raw bytes, never more than
+/// [`CFHTTP_MAX_RESPONSE_BYTES`].
+///
+/// The text path used `ureq`'s `into_string()`, which refuses any body over
+/// 10 MiB or that is not valid UTF-8 — and the error was swallowed into
+/// `fileContent = ""` with a `200` status, so a large or Latin-1 response just
+/// looked empty. Text is now decoded lossily, and an over-size body is an
+/// error rather than a silent empty success.
+#[cfg(feature = "http")]
+fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> Result<CfmlValue, CfmlError> {
+    let mut reader = std::io::Read::take(resp.into_reader(), CFHTTP_MAX_RESPONSE_BYTES + 1);
     let mut body = Vec::new();
-    if std::io::Read::read_to_end(&mut reader, &mut body).is_err() {
-        body.clear();
+    std::io::Read::read_to_end(&mut reader, &mut body).map_err(|e| {
+        CfmlError::runtime(format!("cfhttp: reading the response body failed: {e}"))
+    })?;
+    if body.len() as u64 > CFHTTP_MAX_RESPONSE_BYTES {
+        return Err(CfmlError::runtime(format!(
+            "cfhttp: the response body is larger than {} bytes; use the file attribute to \
+             save a large download to disk",
+            CFHTTP_MAX_RESPONSE_BYTES
+        )));
     }
-    CfmlValue::binary(body)
+    Ok(if get_as_binary {
+        CfmlValue::binary(body)
+    } else {
+        match String::from_utf8(body) {
+            Ok(text) => CfmlValue::string(text),
+            Err(e) => CfmlValue::string(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        }
+    })
 }
 
 #[cfg(feature = "http")]
@@ -10917,7 +10940,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             resp_headers.insert("status_code".to_string(), CfmlValue::Int(status as i64));
             resp_headers.insert("explanation".to_string(), CfmlValue::string(status_text.clone()));
 
-            let file_content = cfhttp_file_content(resp, get_as_binary);
+            let file_content = cfhttp_file_content(resp, get_as_binary)?;
 
             let (mime, charset) = parse_content_type(&content_type);
 
@@ -10970,7 +10993,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             resp_headers.insert("status_code".to_string(), CfmlValue::Int(code as i64));
             resp_headers.insert("explanation".to_string(), CfmlValue::string(status_text.clone()));
 
-            let file_content = cfhttp_file_content(resp, get_as_binary);
+            let file_content = cfhttp_file_content(resp, get_as_binary)?;
             let (mime, charset) = parse_content_type(&content_type);
 
             result_struct.insert("statusCode".to_string(), CfmlValue::string(format!("{} {}", code, status_text)));
@@ -20488,11 +20511,9 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
         .map(|v| as_bool(&v))
         .unwrap_or_else(|| cfg_default.as_ref().map(|d| d.tls).unwrap_or(false));
 
-    // Log to stderr for debugging visibility
-    eprintln!("[CFMAIL] To: {} | From: {} | Subject: {} | Type: {}", to, from, subject, mail_type);
-    if !body_text.is_empty() {
-        eprintln!("[CFMAIL] Body: {}", body_text);
-    }
+    // Envelope only, at debug level: message bodies (password resets, personal
+    // data) used to be written to stderr unconditionally.
+    log::debug!(target: "cfmail", "To: {} | From: {} | Subject: {} | Type: {}", to, from, subject, mail_type);
 
     // Lucee/ACF require a server to be configured. Fail loudly rather than
     // silently dropping mail — silent success would mislead developers into
@@ -20655,7 +20676,7 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                             let attachment = Attachment::new(filename)
                                 .body(data, ContentType::parse("application/octet-stream").unwrap());
                             multipart = multipart.singlepart(attachment);
-                            eprintln!("[CFMAIL] Attachment: {}", file_path);
+                            log::debug!(target: "cfmail", "Attachment: {}", file_path);
                         }
                         Err(e) => {
                             eprintln!("[CFMAIL] Warning: could not read attachment '{}': {}", file_path, e);
@@ -20701,7 +20722,7 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                         let attachment = Attachment::new(filename)
                             .body(data, ContentType::parse("application/octet-stream").unwrap());
                         multipart = multipart.singlepart(attachment);
-                        eprintln!("[CFMAIL] Attachment: {}", file_path);
+                        log::debug!(target: "cfmail", "Attachment: {}", file_path);
                     }
                     Err(e) => {
                         eprintln!("[CFMAIL] Warning: could not read attachment '{}': {}", file_path, e);
