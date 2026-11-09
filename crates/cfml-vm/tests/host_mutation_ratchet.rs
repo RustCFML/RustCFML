@@ -29,7 +29,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("cfml-vm/src/upload_temp.rs", 10),
     ("cfml-vm/src/web.rs", 10),
     ("cfml-vm/src/mcp/client.rs", 1),
-    ("cfml-stdlib/src/builtins.rs", 33),
+    ("cfml-stdlib/src/builtins.rs", 34), // +1: cfzip removes a partial file past its cap (cfzip is sandbox-refused)
     ("cfml-stdlib/src/file_handles.rs", 2),
     ("cfml-stdlib/src/image.rs", 2),
     ("cfml-stdlib/src/s3_builtins.rs", 1),
