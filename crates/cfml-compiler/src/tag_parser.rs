@@ -2187,7 +2187,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 }
                 _ => {
                     // "begin" (default) — wraps body in try/catch
-                    if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cftransaction") {
+                    if let Some(end_tag_pos) = find_transaction_close(chars, tag_end, len) {
                         let body: String = chars[tag_end..end_tag_pos].iter().collect();
                         let close_end = find_tag_end(chars, end_tag_pos, len);
                         let body_script = tags_to_script_impl(&body, imports);
@@ -3796,6 +3796,61 @@ fn strip_hashes(s: &str) -> String {
         i += 1;
     }
     result
+}
+
+/// `find_closing_tag` for `<cftransaction>`. A nested `<cftransaction
+/// action="commit|rollback|setsavepoint">` is a statement, not a block — with
+/// or without a trailing `/` — so it must not raise the nesting depth. Counting
+/// it made every block that commits or rolls back explicitly look unclosed.
+fn find_transaction_close(chars: &[char], start: usize, len: usize) -> Option<usize> {
+    const OPEN: &str = "<cftransaction";
+    const CLOSE: &str = "</cftransaction";
+    let starts = |i: usize, pat: &str| {
+        let n = pat.chars().count();
+        i + n <= len && chars[i..i + n].iter().zip(pat.chars()).all(|(c, p)| c.eq_ignore_ascii_case(&p))
+    };
+    let mut depth = 0;
+    let mut i = start;
+    while i < len {
+        if chars[i] == '<' {
+            if starts(i, CLOSE) {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+                i += CLOSE.len();
+                continue;
+            }
+            let after = chars.get(i + OPEN.len()).copied();
+            if starts(i, OPEN) && matches!(after, Some(' ' | '>' | '/' | '\t' | '\n' | '\r') | None) {
+                // Read the tag to its `>`, stepping over quoted attribute values.
+                let mut j = i + OPEN.len();
+                let mut quote: Option<char> = None;
+                while j < len {
+                    match (quote, chars[j]) {
+                        (Some(q), c) if c == q => quote = None,
+                        (None, c @ ('"' | '\'')) => quote = Some(c),
+                        (None, '>') => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let tag: String = chars[i..j.min(len)].iter().collect::<String>().to_lowercase();
+                let compact: String = tag.chars().filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'').collect();
+                let statement = tag.trim_end().ends_with('/')
+                    || ["action=commit", "action=rollback", "action=setsavepoint"]
+                        .iter()
+                        .any(|a| compact.contains(a));
+                if !statement {
+                    depth += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) -> Option<usize> {
