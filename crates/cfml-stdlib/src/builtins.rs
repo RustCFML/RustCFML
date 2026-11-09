@@ -21315,6 +21315,30 @@ fn fn_generate_pbkdf_key(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 /// generateBCryptHash(password [, rounds])
+#[cfg(feature = "security")]
+/// Work-factor ceilings for password hashing. A verify function reads its
+/// cost from the stored hash string, which in a login form or an API is often
+/// attacker-supplied: bcrypt cost 31 is ~2^31 rounds (hours of CPU), scrypt
+/// `ln=30` asks for ~128 GB. One request could pin a core or abort the
+/// process. These ceilings sit well above any recommended setting.
+const BCRYPT_MAX_COST: u32 = 20;
+#[cfg(feature = "security")]
+const SCRYPT_MAX_MEMORY_BYTES: u64 = 1 << 30;
+#[cfg(feature = "security")]
+const SCRYPT_MAX_P: u64 = 16;
+#[cfg(feature = "security")]
+const ARGON2_MAX_MEMORY_KIB: u64 = 1 << 20;
+#[cfg(feature = "security")]
+const ARGON2_MAX_T: u64 = 64;
+#[cfg(feature = "security")]
+const ARGON2_MAX_P: u64 = 16;
+
+/// The cost field of a `$2a$NN$…` / `$2b$` / `$2y$` bcrypt hash.
+#[cfg(feature = "security")]
+fn bcrypt_cost_of(hash: &str) -> Option<u32> {
+    hash.split('$').nth(2)?.parse().ok()
+}
+
 /// Generate a bcrypt hash. Rounds default to 10. Returns the bcrypt hash string.
 #[cfg(feature = "security")]
 fn fn_generate_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
@@ -21325,9 +21349,9 @@ fn fn_generate_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
     let password = get_str(&args, 0);
     let rounds = if args.len() >= 2 { get_int(&args, 1)? as u32 } else { 10 };
 
-    if rounds < 4 || rounds > 31 {
+    if !(4..=BCRYPT_MAX_COST).contains(&rounds) {
         return Err(CfmlError::runtime(format!(
-            "generateBCryptHash: rounds must be between 4 and 31, got {}", rounds
+            "generateBCryptHash: rounds must be between 4 and {}, got {}", BCRYPT_MAX_COST, rounds
         )));
     }
 
@@ -21347,6 +21371,11 @@ fn fn_verify_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
 
     let password = get_str(&args, 0);
     let hash = get_str(&args, 1);
+    if bcrypt_cost_of(&hash).is_some_and(|c| c > BCRYPT_MAX_COST) {
+        return Err(CfmlError::runtime(format!(
+            "verifyBCryptHash: the hash's cost exceeds the maximum of {}", BCRYPT_MAX_COST
+        )));
+    }
 
     let result = bcrypt::verify(password.as_bytes(), &hash)
         .unwrap_or(false);
@@ -21366,10 +21395,10 @@ fn fn_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
     }
     let input = get_str(&args, 0);
     let cost = if args.len() >= 2 { get_int(&args, 1)? as u32 } else { 10 };
-    if !(4..=31).contains(&cost) {
+    if !(4..=BCRYPT_MAX_COST).contains(&cost) {
         return Err(CfmlError::runtime(format!(
-            "BCryptHash: cost must be between 4 and 31, got {}",
-            cost
+            "BCryptHash: cost must be between 4 and {}, got {}",
+            BCRYPT_MAX_COST, cost
         )));
     }
     // Emit the `$2a$` variant (jBCrypt-compatible) so hashes are interchangeable
@@ -21765,6 +21794,15 @@ fn fn_verify_scrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
 
     let parsed_hash = PasswordHash::new(&hash_str)
         .map_err(|e| CfmlError::runtime(format!("verifySCryptHash: invalid hash format: {}", e)))?;
+    // scrypt memory is 128 * r * 2^ln bytes.
+    let param = |k: &str| parsed_hash.params.get_decimal(k).map(u64::from);
+    let (ln, r, p) = (param("ln").unwrap_or(0), param("r").unwrap_or(8), param("p").unwrap_or(1));
+    let memory = if ln >= 63 { u64::MAX } else { 128u64.saturating_mul(r).saturating_mul(1u64 << ln) };
+    if memory > SCRYPT_MAX_MEMORY_BYTES || p > SCRYPT_MAX_P {
+        return Err(CfmlError::runtime(
+            "verifySCryptHash: the hash's cost parameters exceed the allowed maximum".to_string(),
+        ));
+    }
 
     let result = scrypt::Scrypt.verify_password(password.as_bytes(), &parsed_hash).is_ok();
 
@@ -21810,6 +21848,12 @@ fn fn_argon2_check_hash(args: Vec<CfmlValue>) -> CfmlResult {
 
     let parsed_hash = PasswordHash::new(&hash_str)
         .map_err(|e| CfmlError::runtime(format!("argon2CheckHash: invalid hash format: {}", e)))?;
+    let param = |k: &str| parsed_hash.params.get_decimal(k).map(u64::from).unwrap_or(0);
+    if param("m") > ARGON2_MAX_MEMORY_KIB || param("t") > ARGON2_MAX_T || param("p") > ARGON2_MAX_P {
+        return Err(CfmlError::runtime(
+            "argon2CheckHash: the hash's cost parameters exceed the allowed maximum".to_string(),
+        ));
+    }
 
     let result = argon2::Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)

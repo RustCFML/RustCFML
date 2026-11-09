@@ -34,3 +34,21 @@ assert("an ordinary resize still works", imageGetWidth(small), 128);
 
 suiteEnd();
 </cfscript>
+<cfscript>
+suiteBegin("Password-hash verification refuses absurd cost parameters from the hash");
+// A stored hash is often attacker-supplied; its cost must not decide how long
+// (or how much memory) one request spends.
+assertThrows("bcrypt cost 31 in the hash", function() {
+	verifyBCryptHash("pw", "$2a$31$abcdefghijklmnopqrstuuJmQbIbkVpvdmuKWGhCRJOvEfiNM4xWW");
+});
+assertThrows("BCryptHash cost above the ceiling", function() { generateBCryptHash("pw", 25); });
+assertThrows("scrypt ln=30", function() {
+	verifySCryptHash("pw", "$scrypt$ln=30,r=8,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g");
+});
+assertThrows("argon2 m=4194304", function() {
+	argon2CheckHash("$argon2id$v=19$m=4194304,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g", "pw");
+});
+h = generateBCryptHash("pw", 4);
+assertTrue("an ordinary bcrypt round-trip still works", verifyBCryptHash("pw", h));
+suiteEnd();
+</cfscript>
