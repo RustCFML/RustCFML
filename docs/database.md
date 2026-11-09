@@ -269,6 +269,12 @@ queryExecute("select 1", [], { datasource =
 > self-signed server need `trustServerCertificate=true` added when upgrading.
 > `encrypt=strict` is still accepted and still validates.
 
+JDBC connection strings from Lucee/ACF/BoxLang datasources work as declared —
+both `jdbc:sqlserver://host:1433;databaseName=db;…` and jTDS's
+`jdbc:jtds:sqlserver://host:1433/db;…` — with the datasource's `username` /
+`password`. `databaseName`, `encrypt` and `trustServerCertificate` carry over;
+other JDBC properties (timeouts, `applicationIntent`, …) are ignored.
+
 Credentials in the URL are percent-decoded, like MySQL and PostgreSQL URLs, so
 a password containing `@`, `:`, `/`, `?`, `#` or `%` must be percent-encoded
 (`p%40ss`). A datasource declared with separate `username` / `password` keys in
