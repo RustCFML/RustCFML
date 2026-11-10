@@ -14295,8 +14295,12 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec
                     }
                     if end > start {
                         let param_name: String = String::from_utf8_lossy(&bytes[start..end]).to_string();
-                        let raw = map.data_get(&param_name)
-                            .unwrap_or(CfmlValue::Null);
+                        // Lucee (`QueryParamConverter.get`) refuses a name the
+                        // struct does not carry; binding NULL silently turned a
+                        // typo into a query that matched nothing.
+                        let raw = map.data_get(&param_name).ok_or_else(|| {
+                            CfmlError::database(format!("param [{}] not found", param_name))
+                        })?;
                         // Named params may carry a cfqueryparam-style struct
                         // ({value, cfsqltype, null, list, ...}). Expand honouring
                         // `list=true` (split on `separator`, default `,`) so
@@ -14328,12 +14332,14 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec
                         continue;
                     }
                 }
-                if bytes[i] == b'\'' {
-                    // Skip a single-quoted string literal so a `:` inside it is
-                    // not treated as a placeholder. The literal stays part of the
+                if matches!(bytes[i], b'\'' | b'"' | b'`') {
+                    // Skip a quoted string literal or quoted identifier
+                    // (`"col:x"`, `` `col:x` ``) so a `:` inside it is not
+                    // treated as a placeholder. The text stays part of the
                     // current unflushed segment and is copied verbatim.
+                    let quote = bytes[i];
                     i += 1;
-                    while i < len && bytes[i] != b'\'' {
+                    while i < len && bytes[i] != quote {
                         i += 1;
                     }
                     i += 1;
@@ -14480,7 +14486,7 @@ fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
 /// placeholder. `list=true` params expand to `?,?,…` (one per element). Mirrors
 /// build_sqlite_params' rewrite.
 #[cfg(feature = "mysql_db")]
-fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlValue>) {
+fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> Result<(String, Vec<CfmlValue>), CfmlError> {
     let mut result = Vec::new();
     let mut out_sql = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -14496,8 +14502,10 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
             }
             if end > start {
                 let param_name: String = String::from_utf8_lossy(&bytes[start..end]).to_string();
-                let raw = map.data_get(&param_name)
-                    .unwrap_or(CfmlValue::Null);
+                // Lucee refuses a name the struct does not carry (see SQLite).
+                let raw = map.data_get(&param_name).ok_or_else(|| {
+                    CfmlError::database(format!("param [{}] not found", param_name))
+                })?;
                 let expanded = expand_cfqueryparam_values(&raw);
                 out_sql.push_str(&sql[seg_start..i]);
                 if expanded.is_empty() {
@@ -14519,9 +14527,11 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
                 continue;
             }
         }
-        if bytes[i] == b'\'' {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            // Quoted string or identifier: a `:` inside is not a placeholder.
+            let quote = bytes[i];
             i += 1;
-            while i < len && bytes[i] != b'\'' {
+            while i < len && bytes[i] != quote {
                 i += 1;
             }
             i += 1;
@@ -14547,7 +14557,7 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
         i += 1;
     }
     out_sql.push_str(&sql[seg_start..]);
-    (out_sql, result)
+    Ok((out_sql, result))
 }
 
 #[cfg(feature = "mysql_db")]
@@ -14694,7 +14704,7 @@ fn execute_mysql_on_conn(
         // placeholder-free SQL). Lucee treats empty params as no params.
         CfmlValue::Struct(map) if map.is_empty() => (std::borrow::Cow::Borrowed(sql), Params::Empty),
         CfmlValue::Struct(map) => {
-            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map);
+            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map)?;
             let vals: Vec<mysql::Value> =
                 vals_cfml.iter().map(|v| cfml_to_mysql_value(v)).collect();
             let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
@@ -16595,7 +16605,7 @@ fn execute_mysql_with_conn(conn: &mut MysqlPooledConn, sql: &str, params_arg: &C
         // placeholder-free SQL). Lucee treats empty params as no params.
         CfmlValue::Struct(map) if map.is_empty() => (std::borrow::Cow::Borrowed(sql), Params::Empty),
         CfmlValue::Struct(map) => {
-            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map);
+            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map)?;
             let vals: Vec<mysql::Value> =
                 vals_cfml.iter().map(|v| cfml_to_mysql_value(v)).collect();
             let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
@@ -22575,7 +22585,7 @@ mod mysql_named_param_tests {
         let (sql, vals) = mysql_named_to_positional(
             "insert into t ( datecreated ) values ( :dateCreated )",
             &map,
-        );
+        ).unwrap();
         // No stray `Created` left in the SQL; placeholder became a single `?`.
         assert_eq!(sql, "insert into t ( datecreated ) values ( ? )");
         assert!(!sql.contains("Created"), "camelCase name must not leak into SQL: {sql}");
@@ -22589,7 +22599,7 @@ mod mysql_named_param_tests {
         let (sql, vals) = mysql_named_to_positional(
             "update t set parent = :id where id = :id",
             &map,
-        );
+        ).unwrap();
         assert_eq!(sql, "update t set parent = ? where id = ?");
         assert_eq!(vals.len(), 2, "one bound value per textual occurrence");
         assert_eq!(vals[0].as_string(), "7");
@@ -22599,7 +22609,7 @@ mod mysql_named_param_tests {
     #[test]
     fn name_is_matched_case_insensitively() {
         let map = struct_of(&[("DateCreated", CfmlValue::string("x"))]);
-        let (sql, vals) = mysql_named_to_positional("select :datecreated", &map);
+        let (sql, vals) = mysql_named_to_positional("select :datecreated", &map).unwrap();
         assert_eq!(sql, "select ?");
         assert_eq!(vals.len(), 1);
         assert_eq!(vals[0].as_string(), "x");
@@ -22611,18 +22621,26 @@ mod mysql_named_param_tests {
         let (sql, vals) = mysql_named_to_positional(
             "select ':notAParam', :x",
             &map,
-        );
+        ).unwrap();
         assert_eq!(sql, "select ':notAParam', ?");
         assert_eq!(vals.len(), 1);
     }
 
+    /// Lucee parity (`QueryParamConverter`: "param [x] not found").
     #[test]
-    fn missing_named_param_binds_null() {
+    fn missing_named_param_is_an_error() {
         let map = struct_of(&[("present", CfmlValue::Int(1))]);
-        let (sql, vals) = mysql_named_to_positional("select :missing", &map);
-        assert_eq!(sql, "select ?");
+        let err = mysql_named_to_positional("select :missing", &map).unwrap_err();
+        assert!(err.message.contains("param [missing] not found"), "{}", err.message);
+    }
+
+    #[test]
+    fn colon_inside_double_quotes_or_backticks_is_not_a_param() {
+        let map = struct_of(&[("a", CfmlValue::Int(1))]);
+        let (sql, vals) =
+            mysql_named_to_positional("select \"x:y\" as `c:d`, :a", &map).unwrap();
+        assert_eq!(sql, "select \"x:y\" as `c:d`, ?");
         assert_eq!(vals.len(), 1);
-        assert!(matches!(vals[0], CfmlValue::Null));
     }
 
     #[test]
@@ -22642,7 +22660,7 @@ mod mysql_named_param_tests {
                 ("separator", CfmlValue::string("\u{1f}")),
             ])),
         )]);
-        let (sql, vals) = mysql_named_to_positional("select * from t where id in (:ids)", &map);
+        let (sql, vals) = mysql_named_to_positional("select * from t where id in (:ids)", &map).unwrap();
         assert_eq!(sql, "select * from t where id in (?,?,?)");
         assert_eq!(vals.len(), 3);
         assert!(matches!(vals[0], CfmlValue::Int(1)));
@@ -22660,7 +22678,7 @@ mod mysql_named_param_tests {
                 ("list", CfmlValue::Bool(true)),
             ])),
         )]);
-        let (sql, vals) = mysql_named_to_positional("where x in (:vals)", &map);
+        let (sql, vals) = mysql_named_to_positional("where x in (:vals)", &map).unwrap();
         assert_eq!(sql, "where x in (?,?,?)");
         assert_eq!(vals.len(), 3);
         assert_eq!(vals[0].as_string(), "a");
@@ -22675,7 +22693,7 @@ mod mysql_named_param_tests {
         let (sql, vals) = mysql_named_to_positional(
             "select * from t where id = :id -- see :note for details",
             &map,
-        );
+        ).unwrap();
         assert_eq!(sql, "select * from t where id = ? -- see :note for details");
         assert_eq!(vals.len(), 1);
     }
@@ -22686,7 +22704,7 @@ mod mysql_named_param_tests {
         let (sql, vals) = mysql_named_to_positional(
             "select :a as a -- it's a comment\n, :b as b",
             &map,
-        );
+        ).unwrap();
         assert_eq!(sql, "select ? as a -- it's a comment\n, ? as b");
         assert_eq!(vals.len(), 2);
     }
@@ -22697,7 +22715,7 @@ mod mysql_named_param_tests {
         let (sql, vals) = mysql_named_to_positional(
             "select :a as a, /* don't panic */ :b as b",
             &map,
-        );
+        ).unwrap();
         assert_eq!(sql, "select ? as a, /* don't panic */ ? as b");
         assert_eq!(vals.len(), 2);
     }
