@@ -20460,6 +20460,12 @@ fn fn_smtp_connection_test(args: Vec<CfmlValue>) -> CfmlResult {
         SmtpTransport::relay(&host)
     } else if use_tls {
         SmtpTransport::starttls_relay(&host)
+    } else if !username.is_empty() {
+        // As <cfmail>: with credentials, upgrade whenever STARTTLS is offered.
+        lettre::transport::smtp::client::TlsParameters::new(host.clone()).map(|tls| {
+            SmtpTransport::builder_dangerous(&host)
+                .tls(lettre::transport::smtp::client::Tls::Opportunistic(tls))
+        })
     } else {
         Ok(SmtpTransport::builder_dangerous(&host))
     };
@@ -20670,8 +20676,12 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
         // CC
         if let Some(ref cc_addrs) = cc {
             for addr in split_addrs(cc_addrs) {
-                if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
-                    email_builder = email_builder.cc(mbox);
+                // An invalid address is an error, as for `to`: dropping it
+                // silently sent the message without a recipient the caller
+                // asked for (an auditor's copy, a compliance bcc).
+                match addr.parse::<lettre::message::Mailbox>() {
+                    Ok(mbox) => { email_builder = email_builder.cc(mbox); }
+                    Err(e) => return Err(CfmlError::runtime(format!("cfmail: invalid cc address '{}': {}", addr, e))),
                 }
             }
         }
@@ -20679,8 +20689,12 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
         // BCC
         if let Some(ref bcc_addrs) = bcc {
             for addr in split_addrs(bcc_addrs) {
-                if let Ok(mbox) = addr.parse::<lettre::message::Mailbox>() {
-                    email_builder = email_builder.bcc(mbox);
+                // An invalid address is an error, as for `to`: dropping it
+                // silently sent the message without a recipient the caller
+                // asked for (an auditor's copy, a compliance bcc).
+                match addr.parse::<lettre::message::Mailbox>() {
+                    Ok(mbox) => { email_builder = email_builder.bcc(mbox); }
+                    Err(e) => return Err(CfmlError::runtime(format!("cfmail: invalid bcc address '{}': {}", addr, e))),
                 }
             }
         }
@@ -20839,6 +20853,15 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                     smtp_server, e
                 ))
             })?
+        } else if username.is_some() && password.is_some() {
+            // Credentials but neither useSSL nor useTLS: upgrade with STARTTLS
+            // whenever the server offers it, so the password is not sent in
+            // clear text to a server that could have protected it. A server
+            // that offers no STARTTLS still gets a plain connection, as before.
+            let tls = lettre::transport::smtp::client::TlsParameters::new(smtp_server.to_string())
+                .map_err(|e| CfmlError::runtime(format!("cfmail: TLS setup for {}: {}", smtp_server, e)))?;
+            SmtpTransport::builder_dangerous(smtp_server)
+                .tls(lettre::transport::smtp::client::Tls::Opportunistic(tls))
         } else {
             SmtpTransport::builder_dangerous(smtp_server)
         }
