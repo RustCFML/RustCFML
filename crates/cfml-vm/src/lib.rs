@@ -3992,6 +3992,28 @@ fn constant_time_str_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+impl CfmlVirtualMachine {
+    /// `sessionRotate()`: move the session to a new id. Flushes pending
+    /// live-scope writes to the old record first so the rotate migrates the
+    /// current data, then re-attaches the live scope from the new id.
+    fn rotate_session_id(&mut self) -> Result<(), CfmlError> {
+        self.sync_session_scope_to_store()?;
+        if let (Some(ref state), Some(ref old_sid)) = (&self.server_state, &self.session_id) {
+            let new_sid = uuid::Uuid::new_v4().to_string();
+            state.sessions.rotate(
+                self.current_application_name.as_deref().unwrap_or(""),
+                old_sid,
+                &new_sid,
+            );
+            self.session_id = Some(new_sid);
+        }
+        self.invalidate_session_record_cache();
+        self.session_scope = None;
+        self.attach_session_scope();
+        Ok(())
+    }
+}
+
 /// Render one `cookie` scope entry as a `Set-Cookie` value (GH #423).
 ///
 /// A scalar is `name=value;Path=/`. A struct is Lucee's long form, whose keys
@@ -24158,20 +24180,7 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "sessionrotate" => {
-                    // Flush any pending live-scope writes to the old record first
-                    // so rotate migrates the current data, then migrate + re-attach
-                    // the live scope from the new id.
-                    self.sync_session_scope_to_store()?;
-                    if let (Some(ref state), Some(ref old_sid)) =
-                        (&self.server_state, &self.session_id)
-                    {
-                        let new_sid = uuid::Uuid::new_v4().to_string();
-                        state.sessions.rotate(self.current_application_name.as_deref().unwrap_or(""), old_sid, &new_sid);
-                        self.session_id = Some(new_sid);
-                    }
-                    self.invalidate_session_record_cache();
-                    self.session_scope = None;
-                    self.attach_session_scope();
+                    self.rotate_session_id()?;
                     return Ok(CfmlValue::Null);
                 }
                 "sessioncommit" => {
@@ -24381,6 +24390,16 @@ impl CfmlVirtualMachine {
                         session.auth_user = Some(name);
                         session.auth_roles = roles;
                         self.store_session_record(session);
+                        // `security.rotateSessionOnLogin`: give the now
+                        // authenticated session a fresh id, so an id known
+                        // before login (fixation) is worthless after it.
+                        let rotate = self
+                            .server_state
+                            .as_ref()
+                            .is_some_and(|ss| ss.cfconfig.security.rotate_session_on_login);
+                        if rotate {
+                            self.rotate_session_id()?;
+                        }
                     }
                     return Ok(CfmlValue::Null);
                 }

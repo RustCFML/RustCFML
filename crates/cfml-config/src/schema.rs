@@ -1451,6 +1451,12 @@ pub struct SecurityCfg {
     pub secure_json: bool,
     #[serde(rename = "secureJSONPrefix")]
     pub secure_json_prefix: String,
+    /// Give the session a new id when `<cfloginuser>` authenticates it (the
+    /// `sessionRotate()` an application would otherwise call itself). Off by
+    /// default, as on Lucee.
+    #[serde(rename = "rotateSessionOnLogin")]
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub rotate_session_on_login: bool,
 }
 
 impl Default for SecurityCfg {
@@ -1468,6 +1474,7 @@ impl Default for SecurityCfg {
             csrf_enabled: true,
             secure_json: false,
             secure_json_prefix: "//".into(),
+            rotate_session_on_login: false,
         }
     }
 }

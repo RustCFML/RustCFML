@@ -442,3 +442,30 @@ fn opt_in_request_timeout_stops_a_spinning_loop() {
     assert!(started.elapsed() < Duration::from_secs(20), "loop was not stopped");
     assert!(r.contains("Internal Server Error") || r.contains("timeout"), "{r}");
 }
+
+/// Opt-in `security.rotateSessionOnLogin`: `<cfloginuser>` moves the session
+/// to a fresh id (sent as a new CFID) and keeps the login on it.
+#[test]
+fn cfloginuser_rotates_the_session_id_when_configured() {
+    let server = start(
+        "rotate",
+        r#"{"security":{"rotateSessionOnLogin":true}}"#,
+        &[
+            ("Application.cfc", "component { this.name = \"rotateprobe\"; this.sessionManagement = true; this.loginStorage = \"session\"; }"),
+            ("start.cfm", "<cfset session.x = 1><cfoutput>ok</cfoutput>"),
+            ("login.cfm", "<cfloginuser name=\"bob\" password=\"pw\" roles=\"admin\"><cfoutput>user=[#getAuthUser()#]</cfoutput>"),
+        ],
+        &[],
+    );
+    let cfid = |r: &str| {
+        r.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("set-cookie: cfid="))
+            .map(|l| l["set-cookie: cfid=".len()..].split(';').next().unwrap().to_string())
+    };
+    let first = get(server.port, "/start.cfm");
+    let before = cfid(&first).expect("no session cookie issued");
+    let login = get_with(server.port, "/login.cfm", &format!("Cookie: CFID={before}\r\n"));
+    assert!(login.contains("user=[bob]"), "login failed:\n{login}");
+    let after = cfid(&login).expect("no new CFID after login");
+    assert_ne!(before, after, "session id was not rotated");
+}
