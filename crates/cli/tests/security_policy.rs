@@ -425,3 +425,20 @@ fn websocket_connections_per_address_are_capped() {
     let (_second, l2) = open();
     assert!(l2.contains(" 503 "), "second upgrade from the same address allowed: {l2}");
 }
+
+/// Opt-in `server.requestTimeoutStopsLoops`: a CPU-bound loop is stopped at
+/// `requestTimeout` instead of running on (the default keeps Lucee's
+/// behaviour, pinned in request_timeout.rs).
+#[test]
+fn opt_in_request_timeout_stops_a_spinning_loop() {
+    let server = start(
+        "loopto",
+        r#"{"server":{"requestTimeout":1,"requestTimeoutStopsLoops":true}}"#,
+        &[("spin.cfm", "<cfscript>i = 0; while (true) { i++; }</cfscript>")],
+        &[],
+    );
+    let started = std::time::Instant::now();
+    let r = get(server.port, "/spin.cfm");
+    assert!(started.elapsed() < Duration::from_secs(20), "loop was not stopped");
+    assert!(r.contains("Internal Server Error") || r.contains("timeout"), "{r}");
+}

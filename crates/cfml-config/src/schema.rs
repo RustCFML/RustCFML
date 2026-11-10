@@ -316,6 +316,13 @@ pub struct ServerCfg {
     pub max_websocket_connections_per_ip: u32,
     /// Largest WebSocket message (and frame) accepted, in bytes. The
     /// transport's own default was 64 MiB per message.
+    /// Also stop a request that overruns `requestTimeout` while it is in a
+    /// CPU-bound loop (checked at loop back-edges). Off by default: Lucee only
+    /// interrupts at blocking calls, so a spinning loop runs to completion
+    /// there. Turn on to stop a runaway or hostile loop from holding a worker.
+    #[serde(rename = "requestTimeoutStopsLoops")]
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub request_timeout_stops_loops: bool,
     #[serde(rename = "maxWebSocketMessageSize")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub max_websocket_message_size: u64,
@@ -393,6 +400,7 @@ impl Default for ServerCfg {
             max_websocket_connections: 10_000,
             max_websocket_connections_per_ip: 256,
             max_websocket_message_size: 4 * 1024 * 1024,
+            request_timeout_stops_loops: false,
             max_request_body_size: 200 * 1024 * 1024,
             max_multipart_parts: 1000,
             request_timeout: 0,

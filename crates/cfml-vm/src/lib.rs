@@ -3291,6 +3291,13 @@ pub struct CfmlVirtualMachine {
     /// cfsetting requesttimeout (seconds), stored as milliseconds. 0 = unset.
     /// getPageContext().getRequestTimeout() reads it back (in ms, Lucee-style).
     pub request_timeout_ms: i64,
+    /// `server.requestTimeoutStopsLoops`: also enforce `requestTimeout` at loop
+    /// back-edges (every 1024th), so a CPU-bound loop stops too. Off by
+    /// default — Lucee lets such a loop run to completion (see
+    /// `check_request_timeout`).
+    pub request_timeout_stops_loops: bool,
+    /// Back-edge counter for `request_timeout_stops_loops`.
+    loop_tick: u32,
     /// `<cfsetting showDebugOutput="false">` — page-level suppression of the
     /// classic debug footer (gate 3). Can only turn the footer OFF, never bypass
     /// the IP/trigger gates. Defaults true.
@@ -5796,6 +5803,8 @@ impl CfmlVirtualMachine {
             request_start_ms: 0,
             request_timed_out: false,
             request_timeout_ms: 0,
+            request_timeout_stops_loops: false,
+            loop_tick: 0,
             #[cfg(feature = "observability")]
             show_debug_output: true,
             sandbox: false,
@@ -8818,6 +8827,10 @@ impl CfmlVirtualMachine {
     fn begin_request_timeout_clock(&mut self) {
         self.request_timed_out = false;
         self.request_start_ms = cfml_common::clock::now_unix_millis() as i64;
+        self.request_timeout_stops_loops = self
+            .server_state
+            .as_ref()
+            .is_some_and(|ss| ss.cfconfig.server.request_timeout_stops_loops);
         let configured = self
             .server_state
             .as_ref()
@@ -29909,7 +29922,16 @@ impl CfmlVirtualMachine {
     /// `cancel_flag` is `None` on the main VM, so this is one predictable
     /// branch; the whole check vanishes without the `real-threads` feature.
     #[inline(always)]
-    fn poll_cancel(&self) -> Result<(), CfmlError> {
+    fn poll_cancel(&mut self) -> Result<(), CfmlError> {
+        // Opt-in: a CPU-bound loop honours `requestTimeout` too. The clock is
+        // read on every 1024th back-edge only; when the switch is off this is a
+        // single bool test.
+        if self.request_timeout_stops_loops {
+            self.loop_tick = self.loop_tick.wrapping_add(1);
+            if self.loop_tick & 1023 == 0 {
+                self.check_request_timeout()?;
+            }
+        }
         #[cfg(feature = "real-threads")]
         if let Some(flag) = &self.cancel_flag {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
