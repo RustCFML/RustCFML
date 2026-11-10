@@ -60,11 +60,15 @@ pub struct OtelRuntime {
 /// carrying the per-request knobs the observer needs. Returns `None` when the
 /// OTLP exporter can't be built (bad endpoint) — the server still runs, just
 /// without traces.
+/// `otel.captureSql`, fixed at `init`.
+static CAPTURE_SQL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn init(
     cfg: &cfml_config::OtelCfg,
     metrics_path: &str,
     jvm_compat: bool,
 ) -> Option<(SdkTracerProvider, OtelRuntime)> {
+    CAPTURE_SQL.store(cfg.capture_sql, std::sync::atomic::Ordering::Relaxed);
     // Only the `http-proto` (protobuf) transport is compiled in; `http/json`
     // would need the `http-json` feature. Config may still name a protocol for
     // forward-compat, but we always export protobuf.
@@ -594,13 +598,18 @@ impl VmObserver for OtelObserver {
             .span_builder(format!("{op} {}", q.datasource))
             .with_kind(SpanKind::Client)
             .with_start_time(start)
-            .with_attributes(vec![
-                KeyValue::new("db.system.name", "sql"),
-                KeyValue::new("db.query.text", truncate(q.sql, 2000)),
-                KeyValue::new("db.operation.name", op.to_string()),
-                KeyValue::new("db.namespace", q.datasource.to_string()),
-                KeyValue::new("db.response.returned_rows", q.rowcount),
-            ])
+            .with_attributes({
+                let mut attrs = vec![
+                    KeyValue::new("db.system.name", "sql"),
+                    KeyValue::new("db.operation.name", op.to_string()),
+                    KeyValue::new("db.namespace", q.datasource.to_string()),
+                    KeyValue::new("db.response.returned_rows", q.rowcount),
+                ];
+                if CAPTURE_SQL.load(std::sync::atomic::Ordering::Relaxed) {
+                    attrs.push(KeyValue::new("db.query.text", truncate(q.sql, 2000)));
+                }
+                attrs
+            })
             .start_with_context(&tracer, &parent);
         parent.with_span(span).span().end_with_timestamp(now);
     }

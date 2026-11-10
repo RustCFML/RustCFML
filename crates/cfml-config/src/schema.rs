@@ -1338,6 +1338,13 @@ pub struct OtelCfg {
     pub timeout_ms: u64,
     /// RED metrics settings.
     pub metrics: OtelMetricsCfg,
+    /// Put each query's SQL text on its span (`db.query.text`). SQL built by
+    /// `#…#` interpolation carries its literal values — personal data,
+    /// tokens — into the trace backend; turn this off to send only the
+    /// operation, datasource and row count.
+    #[serde(rename = "captureSql")]
+    #[serde(deserialize_with = "de_lenient_bool")]
+    pub capture_sql: bool,
 }
 
 impl Default for OtelCfg {
@@ -1352,6 +1359,7 @@ impl Default for OtelCfg {
             span_allow_list: vec!["*".into()],
             timeout_ms: 30000,
             metrics: OtelMetricsCfg::default(),
+            capture_sql: true,
         }
     }
 }
