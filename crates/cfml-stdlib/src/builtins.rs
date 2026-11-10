@@ -18344,14 +18344,23 @@ fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
         "DES" => 8,
         "DESEDE" | "DESEDE3" => 24,
         "BLOWFISH" => {
+            // JCE's rule: a multiple of 8 from 32 to 448. A size below 8 used
+            // to yield an EMPTY key (and other sizes a truncated one).
             let bits = if key_size > 0 { key_size } else { 128 };
+            if bits % 8 != 0 || !(32..=448).contains(&bits) {
+                return Err(CfmlError::runtime(format!(
+                    "Invalid Blowfish key size: {}. Must be a multiple of 8 from 32 to 448",
+                    bits
+                )));
+            }
             bits / 8
         }
         _ => return Err(CfmlError::runtime(format!("Unsupported algorithm: {}", algorithm)))
     };
 
+    // Key material straight from the OS CSPRNG, as IVs and salts already are.
     let mut key_bytes = vec![0u8; num_bytes];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
     Ok(CfmlValue::string(base64_encode_bytes(&key_bytes)))
 }
 

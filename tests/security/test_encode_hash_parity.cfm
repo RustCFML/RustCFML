@@ -28,3 +28,12 @@ assert("zero iterations is treated as one", hash("abc", "MD5", "UTF-8", 0), hash
 
 suiteEnd();
 </cfscript>
+<cfscript>
+suiteBegin("generateSecretKey validates Blowfish key sizes like the JCE");
+assertThrows("Blowfish size below 32", function() { generateSecretKey("BLOWFISH", 4); });
+assertThrows("Blowfish size not a multiple of 8", function() { generateSecretKey("BLOWFISH", 100); });
+assertThrows("Blowfish size above 448", function() { generateSecretKey("BLOWFISH", 512); });
+assert("Blowfish 128 is 16 bytes", len(binaryDecode(generateSecretKey("BLOWFISH", 128), "base64")), 16);
+assert("AES default is 16 bytes", len(binaryDecode(generateSecretKey("AES"), "base64")), 16);
+suiteEnd();
+</cfscript>
