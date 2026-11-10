@@ -13286,7 +13286,7 @@ fn mssql_call_to_exec(sql: &str) -> std::borrow::Cow<'_, str> {
 /// What follows the `CALL` keyword of a stored-procedure call, plain
 /// (`CALL p(?)`) or in the ODBC escape (`{call p(?)}`), trimmed; `None` for
 /// any other statement.
-#[cfg(feature = "mssql_db")]
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn strip_call_keyword(sql: &str) -> Option<&str> {
     const CALL: &str = "call ";
     let body = sql.trim();
@@ -14082,6 +14082,15 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     let raw_params = args.get(1).cloned().unwrap_or(CfmlValue::Null);
     let options_arg = args.get(2).cloned().unwrap_or(CfmlValue::Null);
 
+    // A cfstoredproc with OUT parameters: take them out of the bound list
+    // before the params are reduced to plain values (see `run_proc_with_outputs`).
+    let proc_mode = options_return_type(&options_arg).as_deref() == Some(PROC_RESULT_RETURN_TYPE);
+    let (raw_params, proc_outs, proc_total) = if proc_mode {
+        split_proc_params(&raw_params)
+    } else {
+        (raw_params, Vec::new(), 0)
+    };
+
     // Normalize structured params (cfqueryparam-style array of structs) to plain values
     // Also expand SQL for list params (single ? → multiple ?,?,?)
     let (sql, params_arg) = normalize_positional_params(sql, &raw_params);
@@ -14180,25 +14189,45 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     sql_trace(&sql, &params_arg, &datasource_label);
 
     if let Some(driver) = dynamic_driver {
+        if proc_mode {
+            let mut exec = |s: &str, p: &CfmlValue, rt: &str| driver.execute(s, p, rt);
+            return run_proc_with_outputs(ProcDialect::Other, &sql, proc_total, &proc_outs, &params_arg, &mut exec);
+        }
         let r = driver.execute(&sql, &params_arg, &return_type)?;
         return Ok(apply_query_maxrows(r, max_rows));
     }
 
-    let result = match parse_datasource(&datasource) {
-        #[cfg(feature = "sqlite")]
-        DbDriver::Sqlite(path) => execute_sqlite(&path, &sql, &params_arg, &return_type),
-        #[cfg(feature = "mysql_db")]
-        DbDriver::Mysql(url) => execute_mysql(&url, &sql, &params_arg, &return_type, query_timeout),
-        #[cfg(feature = "postgres_db")]
-        DbDriver::Postgres(url) => execute_postgres(&url, &sql, &params_arg, &return_type),
+    let driver = parse_datasource(&datasource);
+    let dialect = match &driver {
         #[cfg(feature = "mssql_db")]
-        DbDriver::Mssql(url) => execute_mssql(&url, &sql, &params_arg, &return_type),
-        DbDriver::Unsupported(sub) => Err(unsupported_jdbc_driver_error(&sub)),
+        DbDriver::Mssql(_) => ProcDialect::Mssql,
+        #[cfg(feature = "mysql_db")]
+        DbDriver::Mysql(_) => ProcDialect::Mysql,
         #[allow(unreachable_patterns)]
-        _ => Err(CfmlError::runtime(format!(
-            "queryExecute: database driver not available for datasource '{}'. Enable the appropriate feature (sqlite, mysql_db, postgres_db, mssql_db).",
-            datasource
-        ))),
+        _ => ProcDialect::Other,
+    };
+    let mut exec = |sql: &str, params_arg: &CfmlValue, return_type: &str| -> CfmlResult {
+        match &driver {
+            #[cfg(feature = "sqlite")]
+            DbDriver::Sqlite(path) => execute_sqlite(path, sql, params_arg, return_type),
+            #[cfg(feature = "mysql_db")]
+            DbDriver::Mysql(url) => execute_mysql(url, sql, params_arg, return_type, query_timeout),
+            #[cfg(feature = "postgres_db")]
+            DbDriver::Postgres(url) => execute_postgres(url, sql, params_arg, return_type),
+            #[cfg(feature = "mssql_db")]
+            DbDriver::Mssql(url) => execute_mssql(url, sql, params_arg, return_type),
+            DbDriver::Unsupported(sub) => Err(unsupported_jdbc_driver_error(sub)),
+            #[allow(unreachable_patterns)]
+            _ => Err(CfmlError::runtime(format!(
+                "queryExecute: database driver not available for datasource '{}'. Enable the appropriate feature (sqlite, mysql_db, postgres_db, mssql_db).",
+                datasource
+            ))),
+        }
+    };
+    let result = if proc_mode {
+        run_proc_with_outputs(dialect, &sql, proc_total, &proc_outs, &params_arg, &mut exec)
+    } else {
+        exec(&sql, &params_arg, &return_type)
     }
     // GitHub #295: attach the statement and datasource to any database error on
     // its way out, so `catch( database e )` sees `e.sql` / `e.datasource` the
@@ -14213,10 +14242,247 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         };
         decorate_db_error(e, &sql, &label, &datasource)
     })?;
+    if proc_mode {
+        return Ok(result);
+    }
     Ok(apply_query_maxrows(result, max_rows))
 }
 
-pub use cfml_common::query_options::RESULT_SETS_RETURN_TYPE;
+pub use cfml_common::query_options::{PROC_RESULT_RETURN_TYPE, RESULT_SETS_RETURN_TYPE};
+
+/// The `returnType` option, lower-cased.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn options_return_type(options: &CfmlValue) -> Option<String> {
+    match options {
+        CfmlValue::Struct(opts) => opts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
+            .map(|(_, v)| v.as_string().to_lowercase()),
+        _ => None,
+    }
+}
+
+/// Whether an output parameter also sends a value in.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcParamMode {
+    Out,
+    /// Its `value` is sent in, and stays in the bound parameter list.
+    InOut,
+}
+
+/// A `<cfprocparam type="out|inout" variable="…">`.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+#[derive(Clone, Debug)]
+struct ProcOut {
+    /// Position in the procedure's argument list (0-based).
+    index: usize,
+    mode: ProcParamMode,
+    cfsqltype: String,
+    variable: String,
+}
+
+/// Split cfstoredproc params into the ones bound as values (IN and INOUT, in
+/// order) and the OUT/INOUT declarations, plus the total argument count.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn split_proc_params(raw: &CfmlValue) -> (CfmlValue, Vec<ProcOut>, usize) {
+    let CfmlValue::Array(arr) = raw else { return (raw.clone(), Vec::new(), 0) };
+    let items = arr.snapshot();
+    let mut bound = Vec::with_capacity(items.len());
+    let mut outs = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let mode = match item {
+            CfmlValue::Struct(s) => s.data_get("type").map(|v| v.as_string().to_lowercase()),
+            _ => None,
+        };
+        match (mode.as_deref(), item) {
+            (Some(m @ ("out" | "inout")), CfmlValue::Struct(s)) => {
+                outs.push(ProcOut {
+                    index,
+                    mode: if m == "inout" { ProcParamMode::InOut } else { ProcParamMode::Out },
+                    cfsqltype: s.data_get("cfsqltype").map(|v| v.as_string()).unwrap_or_default(),
+                    variable: s.data_get("variable").map(|v| v.as_string()).unwrap_or_default(),
+                });
+                if m == "inout" {
+                    bound.push(item.clone());
+                }
+            }
+            _ => bound.push(item.clone()),
+        }
+    }
+    (CfmlValue::array(bound), outs, items.len())
+}
+
+/// Which way OUT parameters are fetched.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcDialect {
+    Mssql,
+    Mysql,
+    Other,
+}
+
+/// The session variable (`@` + this) and result column that carry OUT
+/// parameter `slot` back from the procedure.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn out_column(slot: usize) -> String {
+    format!("__o{slot}")
+}
+
+/// The procedure name of the `CALL name(…)` every cfstoredproc lowering emits.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn proc_call_name(sql: &str) -> Option<String> {
+    let name = strip_call_keyword(sql)?.split('(').next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The T-SQL type to DECLARE an OUT parameter's variable as.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn mssql_out_type(cfsqltype: &str) -> &'static str {
+    let t = cfsqltype.to_lowercase();
+    match t.trim_start_matches("cf_sql_") {
+        "bit" | "boolean" => "BIT",
+        "tinyint" => "TINYINT",
+        "smallint" => "SMALLINT",
+        "integer" | "int" => "INT",
+        "bigint" => "BIGINT",
+        "float" | "double" => "FLOAT",
+        "real" => "REAL",
+        "decimal" | "numeric" => "DECIMAL(38,10)",
+        "money" | "money4" => "MONEY",
+        "date" => "DATE",
+        "time" => "TIME",
+        "timestamp" | "datetime" => "DATETIME2",
+        "idstamp" | "uniqueidentifier" => "UNIQUEIDENTIFIER",
+        "binary" | "varbinary" | "longvarbinary" | "blob" => "VARBINARY(MAX)",
+        _ => "NVARCHAR(MAX)",
+    }
+}
+
+/// Run a stored procedure with OUT parameters and collect them.
+///
+/// SQL Server runs one batch: DECLARE a variable per OUT/INOUT parameter (an
+/// INOUT one initialised from its value), EXEC the procedure with them marked
+/// OUTPUT, then SELECT them; that last result set holds the values. MySQL runs
+/// on the request's connection: SET the INOUT session variables, CALL the
+/// procedure with them, SELECT them. Either way the procedure's own result sets
+/// come back too.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn run_proc_with_outputs(
+    dialect: ProcDialect,
+    sql: &str,
+    total: usize,
+    outs: &[ProcOut],
+    values: &CfmlValue,
+    exec: &mut dyn FnMut(&str, &CfmlValue, &str) -> CfmlResult,
+) -> CfmlResult {
+    let as_sets = |v: CfmlValue| -> Vec<CfmlValue> {
+        match v {
+            CfmlValue::Array(a) => a.snapshot().to_vec(),
+            CfmlValue::Query(_) => vec![v],
+            _ => Vec::new(),
+        }
+    };
+    let finish = |sets: Vec<CfmlValue>, outputs: ValueMap| -> CfmlResult {
+        let mut m = ValueMap::default();
+        m.insert("resultSets".to_string(), CfmlValue::array(sets));
+        m.insert("outputs".to_string(), CfmlValue::strukt(outputs));
+        Ok(CfmlValue::strukt(m))
+    };
+    if outs.is_empty() {
+        let sets = as_sets(exec(sql, values, RESULT_SETS_RETURN_TYPE)?);
+        return finish(sets, ValueMap::default());
+    }
+    if dialect == ProcDialect::Other {
+        return Err(CfmlError::database(
+            "cfstoredproc: OUT parameters (cfprocparam type=\"out\"/\"inout\") are supported on SQL Server and MySQL".to_string(),
+        ));
+    }
+    let name = proc_call_name(sql).ok_or_else(|| {
+        CfmlError::database("cfstoredproc: OUT parameters need a CALL statement".to_string())
+    })?;
+    let values: Vec<CfmlValue> = match values {
+        CfmlValue::Array(a) => a.snapshot().to_vec(),
+        _ => Vec::new(),
+    };
+    let mut next = values.into_iter();
+    let mut init: Vec<(usize, CfmlValue)> = Vec::new(); // INOUT initial values, by out slot
+    let mut args: Vec<String> = Vec::with_capacity(total);
+    let mut in_values: Vec<CfmlValue> = Vec::new();
+    for index in 0..total {
+        match outs.iter().position(|o| o.index == index) {
+            Some(slot) => {
+                if outs[slot].mode == ProcParamMode::InOut {
+                    init.push((slot, next.next().unwrap_or(CfmlValue::Null)));
+                }
+                args.push(match dialect {
+                    ProcDialect::Mssql => format!("@{} OUTPUT", out_column(slot)),
+                    _ => format!("@{}", out_column(slot)),
+                });
+            }
+            None => {
+                in_values.push(next.next().unwrap_or(CfmlValue::Null));
+                args.push("?".to_string());
+            }
+        }
+    }
+    let mut outputs = ValueMap::default();
+    let read_outputs = |row: &CfmlValue, outputs: &mut ValueMap| {
+        if let CfmlValue::Query(q) = row {
+            for (slot, o) in outs.iter().enumerate() {
+                let v = q
+                    .column_values_ci(&out_column(slot))
+                    .and_then(|c| c.first().cloned())
+                    .unwrap_or(CfmlValue::Null);
+                if !o.variable.is_empty() {
+                    outputs.insert(o.variable.clone(), v);
+                }
+            }
+        }
+    };
+    let select = (0..outs.len())
+        .map(|slot| {
+            let col = out_column(slot);
+            format!("@{col} AS {col}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match dialect {
+        ProcDialect::Mssql => {
+            let mut batch = String::from("SET NOCOUNT ON; ");
+            let mut bound: Vec<CfmlValue> = Vec::new();
+            for (slot, o) in outs.iter().enumerate() {
+                batch.push_str(&format!("DECLARE @{} {}", out_column(slot), mssql_out_type(&o.cfsqltype)));
+                if let Some((_, v)) = init.iter().find(|(s, _)| *s == slot) {
+                    batch.push_str(" = ?");
+                    bound.push(v.clone());
+                }
+                batch.push_str("; ");
+            }
+            batch.push_str(&format!("EXEC {} {}; SELECT {};", name, args.join(", "), select));
+            bound.extend(in_values);
+            let mut sets = as_sets(exec(&batch, &CfmlValue::array(bound), RESULT_SETS_RETURN_TYPE)?);
+            let last = sets.pop().unwrap_or(CfmlValue::Null);
+            read_outputs(&last, &mut outputs);
+            finish(sets, outputs)
+        }
+        _ => {
+            for (slot, v) in &init {
+                exec(&format!("SET @{} = ?", out_column(*slot)), &CfmlValue::array(vec![v.clone()]), "query")?;
+            }
+            for slot in 0..outs.len() {
+                if !init.iter().any(|(s, _)| *s == slot) {
+                    exec(&format!("SET @{} = NULL", out_column(slot)), &CfmlValue::array(Vec::new()), "query")?;
+                }
+            }
+            let call = format!("CALL {}({})", name, args.join(", "));
+            let sets = as_sets(exec(&call, &CfmlValue::array(in_values), RESULT_SETS_RETURN_TYPE)?);
+            let row = exec(&format!("SELECT {select}"), &CfmlValue::array(Vec::new()), "query")?;
+            read_outputs(&row, &mut outputs);
+            finish(sets, outputs)
+        }
+    }
+}
 
 /// Cap a query result to `max_rows` (Lucee `maxrows`), applied after execution
 /// so it is driver-independent. Handles the query and array return shapes; the
@@ -16735,6 +17001,22 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
 /// Execute a query using an existing transaction connection
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
+    // A cfstoredproc with OUT parameters inside a transaction: the same
+    // statements as outside one, all on this transaction's connection.
+    if return_type == PROC_RESULT_RETURN_TYPE {
+        let (bound, outs, total) = split_proc_params(params_arg);
+        let (sql, values) = normalize_positional_params(sql.to_string(), &bound);
+        let dialect = match conn {
+            #[cfg(feature = "mssql_db")]
+            TransactionConn::Mssql(_) => ProcDialect::Mssql,
+            #[cfg(feature = "mysql_db")]
+            TransactionConn::Mysql(_) => ProcDialect::Mysql,
+            #[allow(unreachable_patterns)]
+            _ => ProcDialect::Other,
+        };
+        let mut exec = |s: &str, p: &CfmlValue, rt: &str| execute_with_transaction(conn, s, p, rt);
+        return run_proc_with_outputs(dialect, &sql, total, &outs, &values, &mut exec);
+    }
     // The transaction path receives the raw cfqueryparam param array (the
     // non-transaction `fn_query_execute` does this normalization before the
     // driver sees the params). Without it the `{value, cfsqltype}` structs are
@@ -23489,5 +23771,68 @@ mod cfzip_slip_tests {
         assert!(!flat.join("a").exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+mod proc_outputs_tests {
+    use super::*;
+
+    /// `CALL dbo.p(in, out, inout)`: one IN value, one OUT, one INOUT.
+    fn outs() -> Vec<ProcOut> {
+        vec![
+            ProcOut { index: 1, mode: ProcParamMode::Out, cfsqltype: "cf_sql_integer".into(), variable: "o".into() },
+            ProcOut { index: 2, mode: ProcParamMode::InOut, cfsqltype: "cf_sql_varchar".into(), variable: "io".into() },
+        ]
+    }
+
+    /// Run with a recording executor; every statement returns an empty result.
+    fn statements(dialect: ProcDialect) -> Vec<(String, Vec<String>)> {
+        let mut seen = Vec::new();
+        let values = CfmlValue::array(vec![CfmlValue::string("in0".to_string()), CfmlValue::string("io-init".to_string())]);
+        let mut exec = |sql: &str, params: &CfmlValue, _rt: &str| -> CfmlResult {
+            let bound = match params {
+                CfmlValue::Array(a) => a.snapshot().iter().map(|v| v.as_string()).collect(),
+                _ => Vec::new(),
+            };
+            seen.push((sql.to_string(), bound));
+            Ok(CfmlValue::array(Vec::new()))
+        };
+        run_proc_with_outputs(dialect, "CALL dbo.p(?, ?, ?)", 3, &outs(), &values, &mut exec).expect("runs");
+        seen
+    }
+
+    #[test]
+    fn sql_server_runs_one_batch_with_output_variables() {
+        assert_eq!(
+            statements(ProcDialect::Mssql),
+            vec![(
+                "SET NOCOUNT ON; DECLARE @__o0 INT; DECLARE @__o1 NVARCHAR(MAX) = ?; \
+                 EXEC dbo.p ?, @__o0 OUTPUT, @__o1 OUTPUT; SELECT @__o0 AS __o0, @__o1 AS __o1;"
+                    .to_string(),
+                vec!["io-init".to_string(), "in0".to_string()],
+            )]
+        );
+    }
+
+    #[test]
+    fn mysql_sets_session_variables_around_the_call() {
+        let s = |sql: &str, bound: &[&str]| (sql.to_string(), bound.iter().map(|b| b.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            statements(ProcDialect::Mysql),
+            vec![
+                s("SET @__o1 = ?", &["io-init"]),
+                s("SET @__o0 = NULL", &[]),
+                s("CALL dbo.p(?, @__o0, @__o1)", &["in0"]),
+                s("SELECT @__o0 AS __o0, @__o1 AS __o1", &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_call_name_survives_the_odbc_escape() {
+        assert_eq!(proc_call_name("{call dbo.p(?)}").as_deref(), Some("dbo.p"));
+        assert_eq!(proc_call_name("  CALL p").as_deref(), Some("p"));
+        assert_eq!(proc_call_name("SELECT 1"), None);
     }
 }

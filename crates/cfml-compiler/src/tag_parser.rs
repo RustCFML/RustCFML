@@ -519,6 +519,10 @@ const MAX_TAG_NEST_DEPTH: usize = 64;
 /// `<cfprocresult>` is assigned from them.
 pub(crate) const PROC_RESULT_SETS_VAR: &str = "__cfproc_rs";
 
+/// The local a `<cfstoredproc>` with OUT parameters keeps its
+/// `{ resultSets, outputs }` result in.
+pub(crate) const PROC_RESULT_VAR: &str = "__cfproc_r";
+
 thread_local! {
     /// Current `tags_to_script_inner` recursion depth, bounded by
     /// `MAX_TAG_NEST_DEPTH`.
@@ -2865,32 +2869,53 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     .map(|(name, _)| name.clone())
                     .unwrap_or_else(|| "cfresult".to_string());
 
+                // OUT/INOUT parameters, found statically even when the body
+                // wraps them in control flow: their `variable` is an assignment
+                // target, so it has to be known at compile time.
+                let out_vars: Vec<String> = parse_cfprocparam_tags(&body)
+                    .iter()
+                    .filter_map(|p| p.out_variable().map(str::to_string))
+                    .collect();
+
                 let mut query_opts = Vec::new();
                 if let Some(ds) = &datasource {
                     query_opts.push(format!("datasource: \"{}\"", ds));
                 }
                 // With cfprocresult tags, fetch every result set and give each
                 // tag the one its resultSet names (default 1). A set the
-                // procedure didn't return leaves its variable unset.
-                let (result_var, assign_results) = if proc_results.is_empty() {
+                // procedure didn't return leaves its variable unset. With OUT
+                // parameters the result is `{ resultSets, outputs }`, and each
+                // `variable` takes its value (NULL as "").
+                let (result_var, assign_results) = if proc_results.is_empty() && out_vars.is_empty() {
                     (result_var, String::new())
                 } else {
-                    let sets = PROC_RESULT_SETS_VAR;
-                    query_opts.push(format!(
-                        "returnType: \"{}\"",
+                    use std::fmt::Write as _;
+                    let (sets, proc_result) = (PROC_RESULT_SETS_VAR, PROC_RESULT_VAR);
+                    let mut code = String::new();
+                    let return_type = if out_vars.is_empty() {
                         cfml_common::query_options::RESULT_SETS_RETURN_TYPE
-                    ));
-                    // A driver without multi-set support may hand back one query, and a
-                    // procedure that returns no result set yields the mutation struct.
-                    let guard = format!(
-                        "{sets} = isArray({sets}) ? {sets} : (isQuery({sets}) ? [{sets}] : []);\n"
-                    );
-                    let assigns: String = std::iter::once(guard)
-                        .chain(proc_results.iter().map(|(name, n)| {
-                            format!("if (arrayLen({sets}) >= {n}) {{ {name} = {sets}[{n}]; }}\n")
-                        }))
-                        .collect();
-                    (format!("var {sets}"), assigns)
+                    } else {
+                        // Writing to a String cannot fail.
+                        let _ = writeln!(code, "var {sets} = {proc_result}.resultSets;");
+                        cfml_common::query_options::PROC_RESULT_RETURN_TYPE
+                    };
+                    query_opts.push(format!("returnType: \"{return_type}\""));
+                    if !proc_results.is_empty() {
+                        // A driver without multi-set support may hand back one query, and a
+                        // procedure that returns no result set yields the mutation struct.
+                        let _ = writeln!(
+                            code,
+                            "{sets} = isArray({sets}) ? {sets} : (isQuery({sets}) ? [{sets}] : []);"
+                        );
+                        for (name, n) in &proc_results {
+                            let _ = writeln!(code, "if (arrayLen({sets}) >= {n}) {{ {name} = {sets}[{n}]; }}");
+                        }
+                    }
+                    for v in &out_vars {
+                        let _ = writeln!(code, "{v} = {proc_result}.outputs[\"{v}\"] ?: \"\";");
+                    }
+                    let target = if out_vars.is_empty() { sets } else { proc_result };
+                    (format!("var {target}"), code)
                 };
                 let opts_str = if query_opts.is_empty() {
                     String::new()
@@ -2932,6 +2957,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     // value ("" here) went to the database instead.
                     if let Some(ref n) = p.null {
                         parts.push(format!("null: {}", format_attr_value(n, true)));
+                    }
+                    if let Some(v) = p.out_variable() {
+                        let mode = p.mode.as_deref().unwrap_or("out").to_ascii_lowercase();
+                        parts.push(format!("type: \"{mode}\", variable: \"{v}\""));
                     }
                     format!("{{ {} }}", parts.join(", "))
                 }).collect();
@@ -4984,6 +5013,9 @@ fn cfprocparam_attrs_to_literal(
     if let Some(n) = tag_attrs.get("null") {
         parts.push(format!("null: {}", format_attr_value(n, quoted.contains("null"))));
     }
+    if let (Some(t), Some(v)) = (tag_attrs.get("type"), tag_attrs.get("variable")) {
+        parts.push(format!("type: \"{}\", variable: \"{}\"", t.to_ascii_lowercase(), v));
+    }
     format!("{{ {} }}", parts.join(", "))
 }
 
@@ -5330,6 +5362,22 @@ struct ProcParam {
     value: Option<String>,
     cfsqltype: Option<String>,
     null: Option<String>,
+    /// `type`: in (default), out or inout.
+    mode: Option<String>,
+    /// `variable`: where an OUT/INOUT value is assigned.
+    variable: Option<String>,
+}
+
+impl ProcParam {
+    /// The variable an OUT/INOUT parameter assigns, if it is one.
+    fn out_variable(&self) -> Option<&str> {
+        let mode = self.mode.as_deref().unwrap_or("in").to_ascii_lowercase();
+        if mode == "out" || mode == "inout" {
+            self.variable.as_deref().filter(|v| !v.is_empty())
+        } else {
+            None
+        }
+    }
 }
 
 /// Parse <cfprocparam> tags from the body of a <cfstoredproc> tag.
@@ -5352,6 +5400,8 @@ fn parse_cfprocparam_tags(body: &str) -> Vec<ProcParam> {
                         value: tag_attrs.get("value").cloned(),
                         cfsqltype: tag_attrs.get("cfsqltype").cloned(),
                         null: tag_attrs.get("null").cloned(),
+                        mode: tag_attrs.get("type").cloned(),
+                        variable: tag_attrs.get("variable").cloned(),
                     });
 
                     while i < len && chars[i] != '>' { i += 1; }
