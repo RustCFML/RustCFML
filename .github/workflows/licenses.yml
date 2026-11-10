@@ -48,6 +48,11 @@ jobs:
       - name: Check dependency licenses
         run: cargo deny check licenses
 
+      # A new security advisory against the dependency tree fails CI. Reviewed
+      # exceptions live in deny.toml [advisories].ignore, each with its reason.
+      - name: Check security advisories
+        run: cargo deny check advisories
+
       - name: Verify THIRD-PARTY.txt is up to date
         run: |
           ./scripts/gen-licenses.sh

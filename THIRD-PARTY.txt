@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 595 crate(s)
+  MIT License (MIT) — 603 crate(s)
   Apache License 2.0 (Apache-2.0) — 47 crate(s)
   Unicode License v3 (Unicode-3.0) — 20 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -183,7 +183,7 @@ Dependencies
   wasm-bindgen-shared 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
   wasm-bindgen 0.2.129 — https://github.com/wasm-bindgen/wasm-bindgen
 [MIT]
-  libz-sys 1.1.30 — https://github.com/rust-lang/libz-sys
+  libz-sys 1.1.33 — https://github.com/rust-lang/libz-sys
 [MIT]
   mio 1.2.4 — https://github.com/tokio-rs/mio
 [MIT]
@@ -219,12 +219,12 @@ Dependencies
   html5ever 0.29.1 — https://github.com/servo/html5ever
   markup5ever 0.14.1 — https://github.com/servo/html5ever
 [MIT]
+  libsqlite3-sys 0.39.1 — https://github.com/rusqlite/rusqlite
+  rusqlite 0.41.1 — https://github.com/rusqlite/rusqlite
+[MIT]
   nom 8.0.0 — https://github.com/rust-bakery/nom
 [MIT]
   float-cmp 0.9.0 — https://github.com/mikedilger/float-cmp
-[MIT]
-  libsqlite3-sys 0.28.0 — https://github.com/rusqlite/rusqlite
-  rusqlite 0.31.0 — https://github.com/rusqlite/rusqlite
 [MIT]
   lettre 0.11.23 — https://github.com/lettre/lettre
 [MIT]
@@ -293,7 +293,6 @@ Dependencies
   futures-util 0.3.34 — https://github.com/rust-lang/futures-rs
   futures 0.3.34 — https://github.com/rust-lang/futures-rs
 [MIT]
-  hashbrown 0.14.5 — https://github.com/rust-lang/hashbrown
   hashbrown 0.16.1 — https://github.com/rust-lang/hashbrown
   hashbrown 0.17.1 — https://github.com/rust-lang/hashbrown
 [MIT]
@@ -423,10 +422,13 @@ Dependencies
 [MIT]
   cbc 0.1.2 — https://github.com/RustCrypto/block-modes
   cbc 0.2.1 — https://github.com/RustCrypto/block-modes
+  ctr 0.9.2 — https://github.com/RustCrypto/block-modes
 [MIT]
   signature 2.2.0 — https://github.com/RustCrypto/traits/tree/master/signature
 [MIT]
   try-lock 0.2.5 — https://github.com/seanmonstar/try-lock
+[MIT]
+  opaque-debug 0.3.1 — https://github.com/RustCrypto/utils
 [MIT]
   aes 0.9.3 — https://github.com/RustCrypto/block-ciphers
 [MIT]
@@ -457,10 +459,16 @@ Dependencies
 [MIT]
   bumpalo 3.20.3 — https://github.com/fitzgen/bumpalo
 [MIT]
+  ghash 0.5.1 — https://github.com/RustCrypto/universal-hashes
+[MIT]
   protobuf-support 3.7.2 — https://github.com/stepancheg/rust-protobuf/
   protobuf 3.7.2 — https://github.com/stepancheg/rust-protobuf/
 [MIT]
   ppv-lite86 0.2.21 — https://github.com/cryptocorrosion/cryptocorrosion
+[MIT]
+  aes-gcm 0.10.3 — https://github.com/RustCrypto/AEADs
+[MIT]
+  aead 0.5.2 — https://github.com/RustCrypto/traits
 [MIT]
   tracing-attributes 0.1.31 — https://github.com/tokio-rs/tracing
   tracing-core 0.1.36 — https://github.com/tokio-rs/tracing
@@ -474,7 +482,11 @@ Dependencies
 [MIT]
   axum 0.8.9 — https://github.com/tokio-rs/axum
 [MIT]
+  universal-hash 0.5.1 — https://github.com/RustCrypto/traits
+[MIT]
   tower-http 0.6.11 — https://github.com/tower-rs/tower-http
+[MIT]
+  polyval 0.6.2 — https://github.com/RustCrypto/universal-hashes
 [MIT]
   http-body-util 0.1.5 — https://github.com/hyperium/http-body
   http-body 1.1.0 — https://github.com/hyperium/http-body
@@ -558,7 +570,7 @@ Dependencies
 [MIT]
   debug_unsafe 0.1.4 — https://github.com/RoDmitry/debug_unsafe
 [MIT]
-  ctutils 0.4.5 — https://github.com/RustCrypto/utils
+  ctutils 0.4.8 — https://github.com/RustCrypto/utils
 [MIT]
   fearless_simd_macros 0.1.0 — https://github.com/linebender/fearless_simd
 [MIT]
@@ -957,7 +969,8 @@ Dependencies
   derive_more 0.99.20 — https://github.com/JelteF/derive_more
   derive_more 2.1.1 — https://github.com/JelteF/derive_more
 [MIT]
-  calamine 0.36.1 — https://github.com/tafia/calamine
+  calamine 0.38.0 — https://github.com/tafia/calamine
+  quick-xml 0.42.0 — https://github.com/tafia/quick-xml
 [MIT]
   pem 4.0.0 — https://github.com/jcreekmore/pem-rs.git
 [MIT]
@@ -1012,6 +1025,7 @@ Dependencies
   uncased 0.9.10 — https://github.com/SergioBenitez/uncased
 [MIT]
   generic-array 0.14.7 — https://github.com/fizyk20/generic-array.git
+  generic-array 1.4.5 — https://github.com/fizyk20/generic-array.git
 [MIT]
   named_pipe 0.4.1 — https://github.com/blackbeam/named_pipe
 [MIT]
@@ -1019,7 +1033,7 @@ Dependencies
 [MIT]
   virtue 0.0.18 — https://github.com/bincode-org/virtue
 [MIT]
-  hashlink 0.9.1 — https://github.com/kyren/hashlink
+  hashlink 0.12.2 — https://github.com/djc/hashlink
 [MIT]
   urlencoding 2.1.3 — https://github.com/kornelski/rust_urlencoding
 [MIT]
@@ -4524,7 +4538,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - libz-sys 1.1.30
+  - libz-sys 1.1.33
 ================================================================================
 
 Copyright (c) 2014 Alex Crichton
@@ -4831,6 +4845,34 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - libsqlite3-sys 0.39.1
+  - rusqlite 0.41.1
+================================================================================
+
+Copyright (c) 2014 The rusqlite developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - nom 8.0.0
 ================================================================================
 
@@ -4881,34 +4923,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
-
-================================================================================
-MIT License (MIT)
-
-Applies to:
-  - libsqlite3-sys 0.28.0
-  - rusqlite 0.31.0
-================================================================================
-
-Copyright (c) 2014-2021 The rusqlite developers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
@@ -5497,7 +5511,6 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - hashbrown 0.14.5
   - hashbrown 0.16.1
   - hashbrown 0.17.1
 ================================================================================
@@ -7201,6 +7214,7 @@ MIT License (MIT)
 Applies to:
   - cbc 0.1.2
   - cbc 0.2.1
+  - ctr 0.9.2
 ================================================================================
 
 Copyright (c) 2018-2022 RustCrypto Developers
@@ -7290,6 +7304,39 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - opaque-debug 0.3.1
+================================================================================
+
+Copyright (c) 2018-2024 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ================================================================================
 MIT License (MIT)
@@ -7700,6 +7747,39 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - ghash 0.5.1
+================================================================================
+
+Copyright (c) 2019 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - protobuf-support 3.7.2
   - protobuf 3.7.2
 ================================================================================
@@ -7732,6 +7812,73 @@ Applies to:
 ================================================================================
 
 Copyright (c) 2019 The CryptoCorrosion Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - aes-gcm 0.10.3
+================================================================================
+
+Copyright (c) 2019 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - aead 0.5.2
+================================================================================
+
+Copyright (c) 2019 The RustCrypto Project Developers
+Copyright (c) 2019 MobileCoin, LLC
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -7891,10 +8038,76 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - universal-hash 0.5.1
+================================================================================
+
+Copyright (c) 2019-2020 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
   - tower-http 0.6.11
 ================================================================================
 
 Copyright (c) 2019-2021 Tower Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+================================================================================
+MIT License (MIT)
+
+Applies to:
+  - polyval 0.6.2
+================================================================================
+
+Copyright (c) 2019-2023 RustCrypto Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -9046,7 +9259,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - ctutils 0.4.5
+  - ctutils 0.4.8
 ================================================================================
 
 Copyright (c) 2025-2026 The RustCrypto Project Developers
@@ -12220,7 +12433,8 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - calamine 0.36.1
+  - calamine 0.38.0
+  - quick-xml 0.42.0
 ================================================================================
 
 The MIT License (MIT)
@@ -12869,6 +13083,7 @@ MIT License (MIT)
 
 Applies to:
   - generic-array 0.14.7
+  - generic-array 1.4.5
 ================================================================================
 
 The MIT License (MIT)
@@ -12987,7 +13202,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - hashlink 0.9.1
+  - hashlink 0.12.2
 ================================================================================
 
 This work is derived in part from the `linked-hash-map` crate, Copyright (c)

@@ -77,7 +77,7 @@ serde_yaml = { version = "0.9", optional = true }
 jsonschema = { version = "0.46", optional = true, default-features = false }
 sha1 = "0.10"
 ureq = { version = "2", optional = true }
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 mysql = { version = "28", optional = true }
 postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 tokio-postgres = { version = "0.7", optional = true }
@@ -140,7 +140,7 @@ comrak = { version = "0.56", optional = true, default-features = false }
 umya-spreadsheet = { version = "3", optional = true }
 # Pure-Rust reader for legacy .xls (BIFF), .xlsb and .ods that umya can't open.
 # Data-only (styles dropped) — used for SpreadsheetRead of legacy formats.
-calamine = { version = "0.36", optional = true }
+calamine = { version = "0.38", optional = true }
 # Pure-Rust image-dimension probe (already in umya's tree) — lets addImage accept
 # raw bytes by supplying width/height to umya's new_image_with_dimensions.
 imagesize = { version = "0.14", optional = true }

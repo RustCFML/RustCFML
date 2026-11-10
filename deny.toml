@@ -58,9 +58,34 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 multiple-versions = "allow"
 
 [advisories]
-# Security advisories are already covered by Dependabot; keep this check
-# non-fatal here so a licence gate failure is never confused with a CVE.
+# `cargo deny check advisories` runs in CI (licenses.yml) as its own step, so a
+# new RustSec advisory against anything in the tree fails the build. Every
+# entry below is a REVIEWED exception: why it does not apply, or why it cannot
+# be fixed yet. Re-check each when its upstream moves.
 yanked = "warn"
+ignore = [
+    # rsa 0.9 Marvin timing side channel. Fixed only in rsa 0.10, which needs
+    # pkcs8 0.11 and so the next p256/p384/p521 generation (release
+    # candidates). Used by the java.security Signature shim; exposure needs an
+    # attacker able to time many private-key operations.
+    { id = "RUSTSEC-2023-0071", reason = "no compatible fix; needs RustCrypto 0.10/0.14 migration" },
+    # crypto-bigint 0.5 timing variability, via elliptic-curve 0.13 (p256 &c).
+    # Fixed in 0.7, same RustCrypto migration as above.
+    { id = "RUSTSEC-2026-0387", reason = "no compatible fix; needs RustCrypto migration" },
+    # zip 8 `ZipArchive::extract` / `ZipStreamReader::extract` issues. zip 8 is
+    # only umya-spreadsheet's, which reads entries by name and never calls
+    # extract(); our own cfzip uses zip 9 and confines every entry itself.
+    { id = "RUSTSEC-2026-0367", reason = "extract() unreachable: zip 8 only via umya-spreadsheet" },
+    { id = "RUSTSEC-2026-0368", reason = "extract() unreachable: zip 8 only via umya-spreadsheet" },
+    { id = "RUSTSEC-2026-0369", reason = "extract() unreachable: zip 8 only via umya-spreadsheet" },
+    { id = "RUSTSEC-2026-0429", reason = "extract() unreachable: zip 8 only via umya-spreadsheet" },
+    # Unmaintained, no known vulnerability. Tracked for replacement.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; cluster wire format, replace when convenient" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; no vulnerability" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time macro only" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; no vulnerability" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; no vulnerability" },
+]
 
 [sources]
 unknown-registry = "deny"
