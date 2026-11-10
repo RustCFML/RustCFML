@@ -33,6 +33,66 @@ const DEFAULT_MCAST_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_K8S_INTERVAL: Duration = Duration::from_secs(10);
 const K8S_SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const MCAST_ANNOUNCE_TAG: &[u8] = b"RCFM1";
+/// Signed announcement: `RCFM2 || unix_secs (8, BE) || mac (16) || addr`. Sent
+/// and REQUIRED when the cluster has a `secretKey`, so a host on the LAN cannot
+/// steer members into dialling an address of its choosing.
+const MCAST_SIGNED_TAG: &[u8] = b"RCFM2";
+/// How old a signed announcement may be (seconds) before it is ignored —
+/// bounds how long a captured datagram can be replayed.
+const MCAST_MAX_AGE_SECS: u64 = 60;
+
+/// HMAC-SHA256 (RFC 2104), truncated to 16 bytes.
+fn announce_mac(key: &[u8], ts: u64, addr: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let (mut ipad, mut opad) = ([0x36u8; 64], [0x5cu8; 64]);
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = Sha256::new().chain_update(ipad).chain_update(ts.to_be_bytes()).chain_update(addr).finalize();
+    let outer = Sha256::new().chain_update(opad).chain_update(inner).finalize();
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&outer[..16]);
+    mac
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The address an announcement carries, if it is acceptable: with a key, only
+/// a fresh, correctly signed `RCFM2`; without one, the unsigned `RCFM1`.
+fn parse_announcement(datagram: &[u8], key: Option<&[u8]>) -> Option<SocketAddr> {
+    let addr_bytes = match key {
+        Some(key) => {
+            let rest = datagram.strip_prefix(MCAST_SIGNED_TAG)?;
+            if rest.len() < 8 + 16 {
+                return None;
+            }
+            let ts = u64::from_be_bytes(rest[..8].try_into().ok()?);
+            let (mac, addr) = rest[8..].split_at(16);
+            if unix_secs().abs_diff(ts) > MCAST_MAX_AGE_SECS {
+                return None;
+            }
+            let expected = announce_mac(key, ts, addr);
+            if expected.iter().zip(mac).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 {
+                return None;
+            }
+            addr
+        }
+        None => datagram.strip_prefix(MCAST_ANNOUNCE_TAG)?,
+    };
+    std::str::from_utf8(addr_bytes).ok()?.parse().ok()
+}
 
 #[derive(Clone)]
 pub enum Discovery {
@@ -169,6 +229,7 @@ impl MulticastDiscovery {
         port: u16,
         interval_secs: u64,
         self_addr: SocketAddr,
+        key: Option<Vec<u8>>,
     ) -> Result<Self, String> {
         use socket2::{Domain, Protocol, Socket, Type};
         use std::net::{Ipv4Addr, SocketAddrV4};
@@ -223,14 +284,24 @@ impl MulticastDiscovery {
         let send_sock = tokio_sock.clone();
         let group_target: SocketAddr = SocketAddr::new(group_ip.into(), port);
         let self_label = self_addr.to_string();
+        let send_key = key.clone();
         tokio::spawn(async move {
-            let mut payload = Vec::with_capacity(MCAST_ANNOUNCE_TAG.len() + self_label.len());
-            payload.extend_from_slice(MCAST_ANNOUNCE_TAG);
-            payload.extend_from_slice(self_label.as_bytes());
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
+                // Re-signed every tick: the timestamp is part of the MAC.
+                let mut payload = Vec::with_capacity(5 + 8 + 16 + self_label.len());
+                match &send_key {
+                    Some(k) => {
+                        let ts = unix_secs();
+                        payload.extend_from_slice(MCAST_SIGNED_TAG);
+                        payload.extend_from_slice(&ts.to_be_bytes());
+                        payload.extend_from_slice(&announce_mac(k, ts, self_label.as_bytes()));
+                    }
+                    None => payload.extend_from_slice(MCAST_ANNOUNCE_TAG),
+                }
+                payload.extend_from_slice(self_label.as_bytes());
                 if let Err(e) = send_sock.send_to(&payload, group_target).await {
                     eprintln!(
                         "[session/cluster] discovery: multicast send to {} failed: {}",
@@ -258,20 +329,8 @@ impl MulticastDiscovery {
                         continue;
                     }
                 };
-                if n < MCAST_ANNOUNCE_TAG.len() {
+                let Some(parsed) = parse_announcement(&buf[..n], key.as_deref()) else {
                     continue;
-                }
-                if &buf[..MCAST_ANNOUNCE_TAG.len()] != MCAST_ANNOUNCE_TAG {
-                    continue;
-                }
-                let addr_bytes = &buf[MCAST_ANNOUNCE_TAG.len()..n];
-                let addr_str = match std::str::from_utf8(addr_bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let parsed: SocketAddr = match addr_str.parse() {
-                    Ok(a) => a,
-                    Err(_) => continue,
                 };
                 if parsed == self_addr_filter {
                     continue;
@@ -516,3 +575,39 @@ mod kubernetes_tests {
     }
 }
 
+
+#[cfg(test)]
+mod announce_tests {
+    use super::*;
+
+    fn signed(key: &[u8], ts: u64, addr: &str) -> Vec<u8> {
+        let mut p = MCAST_SIGNED_TAG.to_vec();
+        p.extend_from_slice(&ts.to_be_bytes());
+        p.extend_from_slice(&announce_mac(key, ts, addr.as_bytes()));
+        p.extend_from_slice(addr.as_bytes());
+        p
+    }
+
+    #[test]
+    fn keyed_discovery_accepts_only_fresh_signed_announcements() {
+        let key = b"cluster-key";
+        let now = unix_secs();
+        assert_eq!(
+            parse_announcement(&signed(key, now, "10.0.0.2:7946"), Some(key)),
+            Some("10.0.0.2:7946".parse().unwrap())
+        );
+        // Unsigned, wrong key, stale, or tampered: ignored.
+        assert_eq!(parse_announcement(b"RCFM110.6.6.6:7946", Some(key)), None);
+        assert_eq!(parse_announcement(&signed(b"other", now, "10.0.0.2:7946"), Some(key)), None);
+        assert_eq!(parse_announcement(&signed(key, now - 600, "10.0.0.2:7946"), Some(key)), None);
+        let mut forged = signed(key, now, "10.0.0.2:7946");
+        let last = forged.len() - 1;
+        forged[last] = b'7';
+        assert_eq!(parse_announcement(&forged, Some(key)), None);
+        // Keyless (loopback) clusters keep the unsigned form.
+        assert_eq!(
+            parse_announcement(b"RCFM1127.0.0.1:7946", None),
+            Some("127.0.0.1:7946".parse().unwrap())
+        );
+    }
+}

@@ -2625,11 +2625,15 @@ fn build_discovery(
                     listen_addr
                 );
             }
+            let key = Some(props.secret_key.trim())
+                .filter(|k| !k.is_empty())
+                .map(|k| k.as_bytes().to_vec());
             match MulticastDiscovery::start(
                 group,
                 port,
                 props.discovery.interval_secs,
                 self_addr,
+                key,
             ) {
                 Ok(m) => Discovery::Multicast(m),
                 Err(e) => {
