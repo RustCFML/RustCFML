@@ -1818,6 +1818,14 @@ impl Parser {
                     self.match_token(&Token::RParen);
                 }
                 self.match_token(&Token::Semicolon);
+                // Always carry a `value`, so `procparam null=true;` with none is
+                // still read as a parameter struct (and bound as NULL).
+                if !pairs.iter().any(|(k, _)| matches!(k, Expression::Literal(Literal { value: LiteralValue::String(n), .. }) if n == "value")) {
+                    pairs.push((
+                        Expression::Literal(Literal { value: LiteralValue::String("value".into()), location: stmt_loc }),
+                        Expression::Literal(Literal { value: LiteralValue::String(String::new()), location: stmt_loc }),
+                    ));
+                }
                 return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {

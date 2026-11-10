@@ -12882,20 +12882,27 @@ fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlE
 ///
 /// Intentionally NOT feature-gated: `pg_sql::prepare_pg_statements` is
 /// always-compiled (no DB feature gate), so the helper has to be too.
+/// A param's `null` attribute: any CFML boolean (`true`/`yes`/`1`), as Lucee reads it.
+fn param_null_flag(v: &CfmlValue) -> bool {
+    match v {
+        CfmlValue::Bool(b) => *b,
+        CfmlValue::Int(i) => *i != 0,
+        CfmlValue::Double(d) => *d != 0.0,
+        CfmlValue::String(s) => {
+            let t = s.trim();
+            t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes") || t.parse::<f64>().is_ok_and(|n| n != 0.0)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn cfqueryparam_unwrap(v: &CfmlValue) -> CfmlValue {
     if let CfmlValue::Struct(s) = v {
         let has_value = s.data_contains_key("value");
         if !has_value {
             return v.clone();
         }
-        let is_null = s.data_get("null").map(|nv| match nv {
-                CfmlValue::Bool(b) => b,
-                CfmlValue::String(s) => {
-                    s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
-                }
-                _ => false,
-            })
-            .unwrap_or(false);
+        let is_null = s.data_get("null").is_some_and(|nv| param_null_flag(&nv));
         if is_null {
             return CfmlValue::Null;
         }
@@ -12922,14 +12929,7 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                             let value = s.data_get("value")
                                 .unwrap_or(CfmlValue::Null);
 
-                            let is_null = s.data_get("null").map(|v| {
-                                    match v {
-                                        CfmlValue::Bool(b) => b,
-                                        CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
-                                        _ => false,
-                                    }
-                                })
-                                .unwrap_or(false);
+                            let is_null = s.data_get("null").is_some_and(|v| param_null_flag(&v));
 
                             let cfsqltype = s.data_get("cfsqltype").map(|v| v.as_string().to_lowercase())
                                 .unwrap_or_else(|| "cf_sql_varchar".to_string());
