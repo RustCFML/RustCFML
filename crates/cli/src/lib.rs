@@ -1590,6 +1590,71 @@ impl Drop for CompletionGuard {
 /// runs the body, and reports the `ThreadResult` back over a channel. The
 /// parent joins on the returned handle. Registered as the VM's
 /// `thread_spawn_fn` (a plain `fn`, so it coerces to the fn-pointer type).
+/// One live cfthread OS thread, counted against `RUSTCFML_MAX_LIVE_THREADS`
+/// (default 2048) until dropped — when the body finishes, or at once if the
+/// thread never started.
+struct LiveThreadSlot;
+
+static LIVE_CFTHREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl LiveThreadSlot {
+    fn cap() -> usize {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("RUSTCFML_MAX_LIVE_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048)
+        })
+    }
+
+    fn claim() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let cap = Self::cap();
+        LIVE_CFTHREADS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < cap).then_some(n + 1))
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for LiveThreadSlot {
+    fn drop(&mut self) {
+        LIVE_CFTHREADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A handle for a thread that never ran: reported as TERMINATED with
+/// `message`, the same shape as a body that threw, and its completion signalled
+/// so joiners and `threadData()` see it finish.
+fn refused_thread_handle(
+    message: String,
+    completion: Option<Arc<(std::sync::Mutex<Option<cfml_vm::ThreadResult>>, std::sync::Condvar)>>,
+    registry: Arc<std::sync::RwLock<cfml_vm::RequestThreadRegistry>>,
+    name: Option<String>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> ThreadHandle {
+    let mut err = cfml_common::dynamic::ValueMap::default();
+    err.insert("message".to_string(), CfmlValue::string(message.clone()));
+    err.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+    let result = cfml_vm::ThreadResult {
+        status: "TERMINATED".to_string(),
+        output: String::new(),
+        error: message,
+        error_struct: Some(CfmlValue::strukt(err)),
+        mem_allocated: 0,
+        elapsed: 0,
+        thread_vars: cfml_common::dynamic::ValueMap::default(),
+        return_value: None,
+    };
+    let mut guard = CompletionGuard::new(completion, Some(registry), name);
+    guard.set_result(result.clone());
+    drop(guard);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(result);
+    ThreadHandle { name: String::new(), rx, cancel, join: None, result: None }
+}
+
 fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = seed.cancel_flag.clone();
@@ -1600,9 +1665,27 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     // ran: waiters and `threadData()` must still see the thread finish.
     let (fail_completion, fail_registry, fail_name) =
         (completion_handle.clone(), registry.clone(), thread_name.clone());
+    // Process-wide ceiling on live cfthread OS threads. The per-request
+    // `cfthread` scope cap evicts old entries but does not stop their threads,
+    // and threads outlive their request, so a page that spawns in a loop could
+    // otherwise grow the process without bound (64 MB of stack each).
+    let Some(live_slot) = LiveThreadSlot::claim() else {
+        return refused_thread_handle(
+            format!(
+                "cfthread: {} threads are already running (RUSTCFML_MAX_LIVE_THREADS); \
+                 the thread was not started",
+                LiveThreadSlot::cap()
+            ),
+            fail_completion,
+            fail_registry,
+            fail_name,
+            cancel,
+        );
+    };
     let spawned = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
+            let _live_slot = live_slot;
             // B1 fix: Drop guard ensures completion is signaled on ALL exit paths
             // Item #4: Also updates shared registry entry with final status/output/error/elapsed
             let mut guard = CompletionGuard::new(completion_handle, Some(registry), thread_name);
@@ -1680,26 +1763,13 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let join = match spawned {
         Ok(join) => Some(join),
         Err(e) => {
-            let message = format!("cfthread: the operating system refused a new thread: {e}");
-            let mut err = cfml_common::dynamic::ValueMap::default();
-            err.insert("message".to_string(), CfmlValue::string(message.clone()));
-            err.insert("type".to_string(), CfmlValue::string("Application".to_string()));
-            let result = cfml_vm::ThreadResult {
-                status: "TERMINATED".to_string(),
-                output: String::new(),
-                error: message,
-                error_struct: Some(CfmlValue::strukt(err)),
-                mem_allocated: 0,
-                elapsed: 0,
-                thread_vars: cfml_common::dynamic::ValueMap::default(),
-                return_value: None,
-            };
-            let mut guard = CompletionGuard::new(fail_completion, Some(fail_registry), fail_name);
-            guard.set_result(result.clone());
-            drop(guard);
-            let (tx, rx_fail) = std::sync::mpsc::channel();
-            let _ = tx.send(result);
-            return ThreadHandle { name: String::new(), rx: rx_fail, cancel, join: None, result: None };
+            return refused_thread_handle(
+                format!("cfthread: the operating system refused a new thread: {e}"),
+                fail_completion,
+                fail_registry,
+                fail_name,
+                cancel,
+            );
         }
     };
     ThreadHandle {
