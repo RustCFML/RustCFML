@@ -400,6 +400,12 @@ pub(crate) fn ip_allowed(allowed: &[String], peer: IpAddr) -> bool {
     })
 }
 
+/// Like [`ip_allowed`], but an empty list allows NOBODY — for lists of
+/// trusted peers, where "none configured" must mean "trust none".
+pub(crate) fn ip_allowed_strict(allowed: &[String], peer: IpAddr) -> bool {
+    !allowed.is_empty() && ip_allowed(allowed, peer)
+}
+
 /// Treat `::ffff:127.0.0.1` as `127.0.0.1`: a dual-stack listener reports
 /// IPv4 clients in that mapped form, so an `allowedIPs` of `127.0.0.1` would
 /// otherwise reject the loopback it was written for.

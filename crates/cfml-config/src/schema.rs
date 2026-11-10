@@ -291,6 +291,20 @@ pub struct ServerCfg {
     /// anywhere (only sensible when something else authenticates the path).
     #[serde(rename = "adminAllowedIPs")]
     pub admin_allowed_ips: Vec<String>,
+    /// Peers (addresses or CIDR ranges) whose `X-Forwarded-Proto` is
+    /// believed. The header decides `cgi.https` and the auto-`Secure` cookie
+    /// flag; from anyone else it is dropped, so a client cannot claim HTTPS
+    /// for itself. Default: loopback and the private ranges, where a
+    /// TLS-terminating proxy normally sits. `[]` = trust nobody.
+    #[serde(rename = "trustedProxies")]
+    pub trusted_proxies: Vec<String>,
+    /// Host names this server answers to (`Host` header, port ignored,
+    /// case-insensitive; `*.example.com` matches subdomains). Any other host
+    /// gets 400, so a forged `Host` cannot poison absolute URLs an application
+    /// builds from `cgi.server_name` (password-reset links, redirects). Empty
+    /// = any host (the default).
+    #[serde(rename = "allowedHosts")]
+    pub allowed_hosts: Vec<String>,
     /// Bytes. `0` = unlimited. Defaults to 200 MB to match the Lucee/CommandBox
     /// reference (its default post-entity limit), which real uploaders assume:
     /// Preside's chunked asset uploader slices at exactly 10 MiB per request, so
@@ -353,6 +367,15 @@ impl Default for ServerCfg {
             max_concurrent_requests: 0,
             websocket_allowed_origins: Vec::new(),
             admin_allowed_ips: vec!["127.0.0.1".into(), "::1".into()],
+            trusted_proxies: vec![
+                "127.0.0.1".into(),
+                "::1".into(),
+                "10.0.0.0/8".into(),
+                "172.16.0.0/12".into(),
+                "192.168.0.0/16".into(),
+                "fc00::/7".into(),
+            ],
+            allowed_hosts: Vec::new(),
             max_request_body_size: 200 * 1024 * 1024,
             max_multipart_parts: 1000,
             request_timeout: 0,

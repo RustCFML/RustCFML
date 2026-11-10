@@ -4090,6 +4090,8 @@ async fn handle_request_inner(
     // `handle_request`, before this is called.)
 
     // Extract headers as Vec<(String, String)>
+    let peer_is_trusted_proxy =
+        crate::mcp::auth::ip_allowed_strict(&state.cfconfig.server.trusted_proxies, addr.ip());
     let mut headers: Vec<(String, String)> = parts.headers.iter()
         .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or("").to_string()))
         // `X-Original-URL` / `X-Rewrite-URL` are how a front controller learns
@@ -4101,7 +4103,36 @@ async fn handle_request_inner(
         .filter(|(name, _)| {
             !name.eq_ignore_ascii_case("x-original-url") && !name.eq_ignore_ascii_case("x-rewrite-url")
         })
+        // `X-Forwarded-Proto` is believed only from `server.trustedProxies`;
+        // from any other peer a client could claim HTTPS for itself.
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("x-forwarded-proto")
+                || peer_is_trusted_proxy
+        })
         .collect();
+
+    // `server.allowedHosts`: refuse a Host this server does not serve.
+    if !state.cfconfig.server.allowed_hosts.is_empty() {
+        let host = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| crate::mcp::auth::origin_host(v))
+            .unwrap_or_default();
+        let ok = state.cfconfig.server.allowed_hosts.iter().any(|allowed| {
+            let allowed = allowed.trim().to_ascii_lowercase();
+            match allowed.strip_prefix("*.") {
+                Some(suffix) => host.ends_with(&format!(".{suffix}")),
+                None => host == allowed,
+            }
+        });
+        if !ok {
+            return axum::response::Response::builder()
+                .status(400)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(axum::body::Body::from("Bad Request: unknown host"))
+                .unwrap();
+        }
+    }
 
     // Read body bytes. `server.maxRequestBodySize` from cfconfig caps the
     // allowed size (`0` = unlimited).

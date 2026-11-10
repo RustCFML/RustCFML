@@ -356,3 +356,37 @@ fn admin_endpoints_are_limited_to_admin_addresses() {
     assert_eq!(status(r.clone()), "404", "{r}");
     assert!(!r.contains("\"requests\""), "profiler data served to a non-admin address:\n{r}");
 }
+
+/// `X-Forwarded-Proto` is believed only from `server.trustedProxies`, and
+/// `server.allowedHosts` refuses a forged `Host`.
+#[test]
+fn forwarded_proto_and_host_are_not_client_controlled() {
+    let page = "<cfoutput>https=[#cgi.https#] host=[#cgi.server_name#]</cfoutput>";
+    // The test client is 127.0.0.1, so trust nobody to play an outside client.
+    let untrusted = start("xfp", r#"{"server":{"trustedProxies":[]}}"#, &[("p.cfm", page)], &[]);
+    let r = get_with(untrusted.port, "/p.cfm", "X-Forwarded-Proto: https\r\n");
+    assert!(!r.contains("https=[on]") && !r.contains("https=[true]"), "client claimed https:\n{r}");
+
+    let trusted = start("xfp2", "{}", &[("p.cfm", page)], &[]);
+    let r = get_with(trusted.port, "/p.cfm", "X-Forwarded-Proto: https\r\n");
+    assert!(r.contains("https=[on]") || r.contains("https=[true]"), "trusted proxy ignored:\n{r}");
+
+    let hosts = start(
+        "hosts",
+        r#"{"server":{"allowedHosts":["127.0.0.1","*.example.com"]}}"#,
+        &[("p.cfm", page)],
+        &[],
+    );
+    let status = |r: String| r.split_whitespace().nth(1).unwrap_or("").to_string();
+    assert_eq!(status(get(hosts.port, "/p.cfm")), "200");
+    let forged = request(
+        hosts.port,
+        "GET /p.cfm HTTP/1.0\r\nHost: evil.test\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(forged), "400");
+    let sub = request(
+        hosts.port,
+        "GET /p.cfm HTTP/1.0\r\nHost: app.example.com:8080\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(sub), "200");
+}
