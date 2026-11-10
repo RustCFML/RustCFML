@@ -2277,7 +2277,7 @@ struct AppState {
 /// is shed with 503. Short on purpose: a slot that does not free up within
 /// this window means the server is genuinely saturated, and holding the
 /// client (and its connection) any longer only deepens the queue.
-const REQUEST_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const REQUEST_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve `server.maxConcurrentRequests` to a permit count: the configured
 /// value, or 4 × the available CPU cores when it is 0/unset. The CFML side of

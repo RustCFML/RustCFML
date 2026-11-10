@@ -390,3 +390,38 @@ fn forwarded_proto_and_host_are_not_client_controlled() {
     );
     assert_eq!(status(sub), "200");
 }
+
+/// `server.maxWebSocketConnectionsPerIP`: once an address holds its quota of
+/// open sockets, a further upgrade is refused (503) until one closes.
+#[test]
+fn websocket_connections_per_address_are_capped() {
+    let server = start(
+        "wscap",
+        r#"{"server":{"maxWebSocketConnectionsPerIP":1}}"#,
+        &[("websockets/room.cfc", "component {}"), ("index.cfm", "ok")],
+        &[],
+    );
+    let open = || {
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /ws/room HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: Upgrade\r\n\
+                     Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                    server.port
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut line).unwrap();
+        (stream, line)
+    };
+    let (_first, l1) = open();
+    assert!(l1.contains(" 101 "), "first upgrade refused: {l1}");
+    let (_second, l2) = open();
+    assert!(l2.contains(" 503 "), "second upgrade from the same address allowed: {l2}");
+}

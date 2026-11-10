@@ -283,6 +283,7 @@ pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -293,10 +294,70 @@ pub async fn ws_handler(
         Some(i) => i,
         None => return (axum::http::StatusCode::NOT_FOUND, "Unknown channel").into_response(),
     };
+    let srv = &state.cfconfig.server;
+    let Some(slot) = ConnectionSlot::claim(
+        peer.ip(),
+        srv.max_websocket_connections as usize,
+        srv.max_websocket_connections_per_ip as usize,
+    ) else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Too many WebSocket connections",
+        )
+            .into_response();
+    };
+    let max_msg = match srv.max_websocket_message_size {
+        0 => usize::MAX,
+        n => usize::try_from(n).unwrap_or(usize::MAX),
+    };
     let session_id = session_id_from_headers(&headers);
     let params = parse_query(query.as_deref());
     let handshake = handshake_map(&headers, &format!("/ws/{}", name), query.as_deref());
-    ws.on_upgrade(move |socket| driver(socket, state, info, session_id, params, handshake))
+    ws.max_message_size(max_msg)
+        .max_frame_size(max_msg)
+        .on_upgrade(move |socket| async move {
+            let _slot = slot;
+            driver(socket, state, info, session_id, params, handshake).await
+        })
+}
+
+/// One open raw WebSocket, counted against the server-wide and per-address
+/// caps for as long as it lives (released on drop, whatever ends the driver).
+struct ConnectionSlot {
+    ip: std::net::IpAddr,
+}
+
+static WS_CONNECTIONS: std::sync::Mutex<Option<(usize, std::collections::HashMap<std::net::IpAddr, usize>)>> =
+    std::sync::Mutex::new(None);
+
+impl ConnectionSlot {
+    /// `None` when either cap (`0` = none) is already reached.
+    fn claim(ip: std::net::IpAddr, max_total: usize, max_per_ip: usize) -> Option<Self> {
+        let mut g = WS_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, per_ip) = g.get_or_insert_with(Default::default);
+        let mine = per_ip.get(&ip).copied().unwrap_or(0);
+        if (max_total > 0 && *total >= max_total) || (max_per_ip > 0 && mine >= max_per_ip) {
+            return None;
+        }
+        *total += 1;
+        per_ip.insert(ip, mine + 1);
+        Some(Self { ip })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut g = WS_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((total, per_ip)) = g.as_mut() {
+            *total = total.saturating_sub(1);
+            if let Some(n) = per_ip.get_mut(&self.ip) {
+                *n -= 1;
+                if *n == 0 {
+                    per_ip.remove(&self.ip);
+                }
+            }
+        }
+    }
 }
 
 /// Parse a raw query string (`a=1&b=hi%20there`) into a CFML struct for
@@ -618,6 +679,20 @@ pub(crate) fn relay_client_event(
     }
 }
 
+/// A slot from the same `server.maxConcurrentRequests` gate HTTP requests
+/// use. Each frame runs CFML on a blocking worker; without the gate a client
+/// flooding frames got unbounded concurrent VMs while HTTP was being shed.
+async fn acquire_dispatch_permit(
+    state: &Arc<AppState>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    match tokio::time::timeout(crate::REQUEST_GATE_WAIT, state.request_gate.clone().acquire_owned())
+        .await
+    {
+        Ok(Ok(p)) => Ok(p),
+        _ => Err("server busy: server.maxConcurrentRequests reached".to_string()),
+    }
+}
+
 /// Run one channel dispatch on a blocking worker (the VM is synchronous).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch(
@@ -629,6 +704,7 @@ pub(crate) async fn dispatch(
     event: Option<&str>,
     payload: Option<CfmlValue>,
 ) -> Result<Option<CfmlValue>, String> {
+    let permit = acquire_dispatch_permit(state).await?;
     let server_state = state.server_state.clone();
     let vfs = state.vfs.clone();
     let sandbox = state.sandbox;
@@ -637,6 +713,7 @@ pub(crate) async fn dispatch(
     let conn_id = conn_id.to_string();
     let event = event.map(|e| e.to_string());
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         run_dispatch(
             server_state,
             vfs,
@@ -756,12 +833,14 @@ pub(crate) async fn dispatch_sio(
     session_id: Option<String>,
     kind: SioDispatch,
 ) -> Result<Option<CfmlValue>, String> {
+    let permit = acquire_dispatch_permit(state).await?;
     let server_state = state.server_state.clone();
     let vfs = state.vfs.clone();
     let sandbox = state.sandbox;
     let ns = ns.to_string();
     let conn_id = conn_id.to_string();
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let empty = crate::CfmlCompiler::new()
             .compile(crate::CfmlParser::new(String::new()).parse().expect("empty source parses"));
         let mut vm = CfmlVirtualMachine::new(empty);

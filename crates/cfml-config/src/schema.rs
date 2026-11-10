@@ -305,6 +305,20 @@ pub struct ServerCfg {
     /// = any host (the default).
     #[serde(rename = "allowedHosts")]
     pub allowed_hosts: Vec<String>,
+    /// Most WebSocket connections (raw `/ws/` channels) open at once,
+    /// server-wide. Over the cap an upgrade is refused with 503. `0` = no cap.
+    #[serde(rename = "maxWebSocketConnections")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub max_websocket_connections: u32,
+    /// Most WebSocket connections one client address may hold. `0` = no cap.
+    #[serde(rename = "maxWebSocketConnectionsPerIP")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub max_websocket_connections_per_ip: u32,
+    /// Largest WebSocket message (and frame) accepted, in bytes. The
+    /// transport's own default was 64 MiB per message.
+    #[serde(rename = "maxWebSocketMessageSize")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub max_websocket_message_size: u64,
     /// Bytes. `0` = unlimited. Defaults to 200 MB to match the Lucee/CommandBox
     /// reference (its default post-entity limit), which real uploaders assume:
     /// Preside's chunked asset uploader slices at exactly 10 MiB per request, so
@@ -376,6 +390,9 @@ impl Default for ServerCfg {
                 "fc00::/7".into(),
             ],
             allowed_hosts: Vec::new(),
+            max_websocket_connections: 10_000,
+            max_websocket_connections_per_ip: 256,
+            max_websocket_message_size: 4 * 1024 * 1024,
             max_request_body_size: 200 * 1024 * 1024,
             max_multipart_parts: 1000,
             request_timeout: 0,
