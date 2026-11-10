@@ -10672,14 +10672,18 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let body: Option<Vec<u8>> = if explicit_body.is_none() {
                 if let Some(CfmlValue::Array(params)) = opts.data_get("params") {
                     if use_multipart {
-                        // Generate a boundary unlikely to collide with body bytes.
-                        // Combines a fixed prefix, the request URL hash, and a
-                        // per-process atomic counter — sufficient for uniqueness
-                        // without pulling in `rand`.
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static MULTIPART_SEQ: AtomicU64 = AtomicU64::new(0);
-                        let seq = MULTIPART_SEQ.fetch_add(1, Ordering::Relaxed);
-                        let boundary = format!("----RustCFMLBoundary{:016x}{:016x}", seq, url.len() as u64);
+                        // A random boundary. The old one (a counter plus the
+                        // URL length) was predictable, so a form-field value
+                        // chosen to contain it could end its part early and
+                        // inject fields of its own.
+                        let boundary = format!("----RustCFMLBoundary{:032x}", rand::random::<u128>());
+                        // `name` / `filename` go inside a quoted header
+                        // parameter: escape `"` and line breaks as browsers do
+                        // (WHATWG multipart/form-data), or a value could close
+                        // the quote and add header lines.
+                        let quote_param = |v: &str| -> String {
+                            v.replace('"', "%22").replace('\r', "%0D").replace('\n', "%0A")
+                        };
 
                         let mut buf: Vec<u8> = Vec::new();
                         let dashes = b"--";
@@ -10694,7 +10698,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                     buf.extend_from_slice(dashes);
                                     buf.extend_from_slice(boundary.as_bytes());
                                     buf.extend_from_slice(crlf);
-                                    buf.extend_from_slice(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", pname).as_bytes());
+                                    buf.extend_from_slice(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", quote_param(&pname)).as_bytes());
                                     buf.extend_from_slice(pvalue.as_bytes());
                                     buf.extend_from_slice(crlf);
                                 }
@@ -10732,7 +10736,9 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                     buf.extend_from_slice(crlf);
                                     buf.extend_from_slice(format!(
                                         "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
-                                        pname, filename, mime
+                                        quote_param(&pname),
+                                        quote_param(&filename),
+                                        mime.replace(['\r', '\n'], "")
                                     ).as_bytes());
                                     buf.extend_from_slice(&file_bytes);
                                     buf.extend_from_slice(crlf);
