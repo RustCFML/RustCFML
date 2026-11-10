@@ -141,6 +141,9 @@ fn evict_lfu_quarter(cache: &mut HashMap<String, RegexEntry>) {
 // building on `regex_automata::meta::Regex` with `onepass_size_limit`; not done
 // here.
 static REGEX_CACHE_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+/// Patterns longer than this (bytes) are compiled but not cached; see
+/// `cached_regex`.
+const REGEX_CACHE_MAX_PATTERN_LEN: usize = 4096;
 
 /// Set the compiled-regex cache's entry cap (`runtime.regexCacheSize`). A cap
 /// below 16 is raised to 16 so the eviction quarter is never empty.
@@ -454,6 +457,13 @@ fn cached_regex(pat: &str) -> Result<std::sync::Arc<CfRegex>, CfmlError> {
         },
     };
     let re = std::sync::Arc::new(re);
+    // A very long pattern is used but not kept. Patterns can be request input
+    // (`reFind( url.q, … )`), and each compiled entry can hold megabytes, so a
+    // client could otherwise fill all 1,024 slots with giant automata. Real
+    // code's patterns are far below this; such a pattern just recompiles.
+    if pat.len() > REGEX_CACHE_MAX_PATTERN_LEN {
+        return Ok(re);
+    }
     let mut cache = REGEX_CACHE.write().unwrap();
     if cache.len() >= REGEX_CACHE_CAP.load(std::sync::atomic::Ordering::Relaxed) {
         evict_lfu_quarter(&mut cache);
