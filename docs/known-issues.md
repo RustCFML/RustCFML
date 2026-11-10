@@ -232,7 +232,7 @@ attribute never reaches the runtime — no "unknown option" either.
 | Tag | Survives lowering | Silently dropped |
 |---|---|---|
 | `<cfqueryparam>` | `value`, `cfsqltype`, `list`, `null` | `maxLength`, `scale` — precision/truncation not applied. |
-| `<cfstoredproc>` | `procedure`, `datasource` | `returnCode`, `result`, `blockFactor`, `cachedWithin`; a second and subsequent `<cfprocresult>`, and `resultSet=` — only the first result set is bound. |
+| `<cfstoredproc>` | `procedure`, `datasource`; `<cfprocresult resultSet=…>` (every result set on SQL Server and MySQL; the one result set elsewhere) | `returnCode`, `result`, `blockFactor`, `cachedWithin` |
 
 Both rows are blocked on the same thing: a database the reference Lucee can also
 reach, so the expected precision/OUT-param behaviour can be probed rather than guessed.

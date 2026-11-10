@@ -515,6 +515,10 @@ impl Drop for EncodeForGuard {
 /// release binary; a debug build on a small stack can still overflow below it.
 const MAX_TAG_NEST_DEPTH: usize = 64;
 
+/// The local a `<cfstoredproc>` block's result sets are held in while each
+/// `<cfprocresult>` is assigned from them.
+pub(crate) const PROC_RESULT_SETS_VAR: &str = "__cfproc_rs";
+
 thread_local! {
     /// Current `tags_to_script_inner` recursion depth, bounded by
     /// `MAX_TAG_NEST_DEPTH`.
@@ -2865,6 +2869,29 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if let Some(ds) = &datasource {
                     query_opts.push(format!("datasource: \"{}\"", ds));
                 }
+                // With cfprocresult tags, fetch every result set and give each
+                // tag the one its resultSet names (default 1). A set the
+                // procedure didn't return leaves its variable unset.
+                let (result_var, assign_results) = if proc_results.is_empty() {
+                    (result_var, String::new())
+                } else {
+                    let sets = PROC_RESULT_SETS_VAR;
+                    query_opts.push(format!(
+                        "returnType: \"{}\"",
+                        cfml_common::query_options::RESULT_SETS_RETURN_TYPE
+                    ));
+                    // A driver without multi-set support may hand back one query, and a
+                    // procedure that returns no result set yields the mutation struct.
+                    let guard = format!(
+                        "{sets} = isArray({sets}) ? {sets} : (isQuery({sets}) ? [{sets}] : []);\n"
+                    );
+                    let assigns: String = std::iter::once(guard)
+                        .chain(proc_results.iter().map(|(name, n)| {
+                            format!("if (arrayLen({sets}) >= {n}) {{ {name} = {sets}[{n}]; }}\n")
+                        }))
+                        .collect();
+                    (format!("var {sets}"), assigns)
+                };
                 let opts_str = if query_opts.is_empty() {
                     String::new()
                 } else {
@@ -2878,8 +2905,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     // Placeholders are constructed from the runtime list length
                     // — repeatString is a builtin in stdlib.
                     let code = format!(
-                        "var __cfproc_params = [];\n{}var __cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n",
-                        body_script, result_var, procedure, opts_str
+                        "var __cfproc_params = [];\n{}var __cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n{}",
+                        body_script, result_var, procedure, opts_str, assign_results
                     );
                     return (code, close_end - start);
                 }
@@ -2905,8 +2932,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     format!("{{ {} }}", parts.join(", "))
                 }).collect();
 
-                (format!("{} = queryExecute(\"{}\", [{}]{});\n",
-                    result_var, sql, params_arr.join(", "), opts_str), close_end - start)
+                (format!("{} = queryExecute(\"{}\", [{}]{});\n{}",
+                    result_var, sql, params_arr.join(", "), opts_str, assign_results), close_end - start)
             } else {
                 // Self-closing (unusual)
                 (format!("queryExecute(\"CALL {}()\");\n", procedure), tag_end - start)
