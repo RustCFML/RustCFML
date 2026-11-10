@@ -1859,6 +1859,7 @@ impl Parser {
                 }
                 let mut name_expr: Option<Expression> = None;
                 let mut set_expr: Option<Expression> = None;
+                let mut maxrows_expr: Option<Expression> = None;
                 while !self.check(&Token::Semicolon)
                     && !self.check(&Token::RBrace)
                     && !self.check(&Token::RParen)
@@ -1872,6 +1873,8 @@ impl Parser {
                             name_expr = Some(pvalue);
                         } else if pname.eq_ignore_ascii_case("resultset") {
                             set_expr = Some(pvalue);
+                        } else if pname.eq_ignore_ascii_case("maxrows") {
+                            maxrows_expr = Some(pvalue);
                         }
                         if paren {
                             self.match_token(&Token::Comma);
@@ -1884,7 +1887,8 @@ impl Parser {
                     self.match_token(&Token::RParen);
                 }
                 self.match_token(&Token::Semicolon);
-                // The marker carries [name, resultSet]; resultSet defaults to 1.
+                // The marker carries [name, resultSet, maxRows]; resultSet
+                // defaults to 1, maxRows to -1 (no limit).
                 let marker = Expression::Array(Array {
                     elements: vec![
                         name_expr.unwrap_or(Expression::Literal(Literal {
@@ -1893,6 +1897,10 @@ impl Parser {
                         })),
                         set_expr.unwrap_or(Expression::Literal(Literal {
                             value: LiteralValue::Int(1),
+                            location: stmt_loc,
+                        })),
+                        maxrows_expr.unwrap_or(Expression::Literal(Literal {
+                            value: LiteralValue::Int(-1),
                             location: stmt_loc,
                         })),
                     ],
@@ -4154,16 +4162,16 @@ impl Parser {
                 // `procresult name="x"` lowers to a marker assignment the body
                 // carries; lift the name out of it and drop the marker, so the
                 // result lands in the variable the author named.
-                let mut proc_results: Vec<(String, Expression)> = Vec::new();
+                let mut proc_results: Vec<(String, Expression, Expression)> = Vec::new();
                 let body: Vec<Statement> = body
                     .into_iter()
                     .filter(|st| {
                         if let Statement::Assignment(a) = st {
                             if matches!(&a.target, AssignTarget::Variable(n) if n == PROC_RESULT_MARKER) {
                                 if let Expression::Array(arr) = &a.value {
-                                    if let [Expression::Literal(Literal { value: LiteralValue::String(nm), .. }), set] = arr.elements.as_slice() {
+                                    if let [Expression::Literal(Literal { value: LiteralValue::String(nm), .. }), set, maxrows] = arr.elements.as_slice() {
                                         if !nm.is_empty() {
-                                            proc_results.push((nm.clone(), set.clone()));
+                                            proc_results.push((nm.clone(), set.clone(), maxrows.clone()));
                                         }
                                     }
                                 }
@@ -4290,20 +4298,52 @@ impl Parser {
                             location: loc,
                         }))));
                     }
-                    for (name, set) in proc_results {
+                    for (name, set, maxrows) in proc_results {
                         let rs = ident(crate::tag_parser::PROC_RESULT_SETS_VAR);
+                        let mut then_branch = vec![assign(&name, Expression::ArrayAccess(Box::new(ArrayAccess {
+                            array: Box::new(rs.clone()),
+                            index: Box::new(set.clone()),
+                            location: loc,
+                        })))];
+                        // maxRows caps the rows kept; -1 (the default) or any
+                        // negative value is no limit.
+                        let unlimited = matches!(&maxrows, Expression::Literal(Literal { value: LiteralValue::Int(n), .. }) if *n < 0);
+                        if !unlimited {
+                            let m = || call("val", vec![maxrows.clone()]);
+                            let bin = |l: Expression, op: BinaryOpType, r: Expression| Expression::BinaryOp(Box::new(BinaryOp {
+                                left: Box::new(l), operator: op, right: Box::new(r), location: loc,
+                            }));
+                            let count = Expression::MemberAccess(Box::new(MemberAccess {
+                                object: Box::new(ident(&name)),
+                                member: "recordCount".to_string(),
+                                null_safe: false,
+                                location: loc,
+                            }));
+                            let zero = Expression::Literal(Literal { value: LiteralValue::Int(0), location: loc });
+                            then_branch.push(Statement::If(Box::new(If {
+                                condition: bin(
+                                    bin(m(), BinaryOpType::GreaterEqual, zero),
+                                    BinaryOpType::And,
+                                    bin(count, BinaryOpType::Greater, m()),
+                                ),
+                                then_branch: vec![assign(&name, call("querySlice", vec![
+                                    ident(&name),
+                                    Expression::Literal(Literal { value: LiteralValue::Int(1), location: loc }),
+                                    m(),
+                                ]))],
+                                else_if: vec![],
+                                else_branch: None,
+                                location: loc,
+                            })));
+                        }
                         stmts.push(Statement::If(Box::new(If {
                             condition: Expression::BinaryOp(Box::new(BinaryOp {
                                 left: Box::new(call("arrayLen", vec![rs.clone()])),
                                 operator: BinaryOpType::GreaterEqual,
-                                right: Box::new(set.clone()),
+                                right: Box::new(set),
                                 location: loc,
                             })),
-                            then_branch: vec![assign(&name, Expression::ArrayAccess(Box::new(ArrayAccess {
-                                array: Box::new(rs),
-                                index: Box::new(set),
-                                location: loc,
-                            })))],
+                            then_branch,
                             else_if: vec![],
                             else_branch: None,
                             location: loc,
