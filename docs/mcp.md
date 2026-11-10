@@ -454,7 +454,7 @@ are unreachable until tokens exist to authenticate against.
 |---|---|---|
 | `enabled` | `true` | Off returns 404, as if the endpoint did not exist. |
 | `allowedIPs` | `["127.0.0.1", "::1"]` | Addresses or CIDR ranges. **Empty means anywhere** — only sensible behind a proxy that authenticates for you. |
-| `authToken` | none | A string, an array of strings, or objects with `roles` and per-token tool filters. With none configured nobody is authenticated, so `secured` handlers stay unreachable. |
+| `authToken` | none | A string, an array of strings, or objects with `roles` and per-token tool filters. With none configured nobody is authenticated, so `secured` handlers stay unreachable — and a request that arrived through a proxy (it carries `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host` or `X-Original-URL`) is refused, because behind a proxy on the same host every client's address is `127.0.0.1` and the loopback default would admit anyone. Serve MCP through a proxy only with a token or an `authenticate` hook. |
 | `includedTools` / `excludedTools` | `["*"]` / none | Globs (`*`, `?`). Exclusions apply after inclusions. A token's own filters replace the global ones. |
 | `corsAllowedOrigins` | none | Browser origins beyond localhost, which is always allowed. |
 | `stdioRoles` | none | Roles granted on the stdio transport. |

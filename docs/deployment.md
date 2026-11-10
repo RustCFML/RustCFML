@@ -352,7 +352,13 @@ In sandbox mode:
 
 - **Embedded files are readable** — `fileRead()`, `fileExists()`, `directoryList()`, `expandPath()`, and `include` all work against the embedded virtual filesystem. Your application can read its own bundled config files, templates, and assets normally.
 - **Host filesystem is invisible** — `fileExists("/etc/passwd")` returns `false`; `fileRead()` on any host path returns "file not found". The application cannot discover or read files outside the embedded archive.
-- **All writes are blocked** — `fileWrite()`, `fileAppend()`, `fileDelete()`, `directoryCreate()`, and other write operations throw *"filesystem writes are disabled in sandbox mode"*.
+- **All writes are blocked** — `fileWrite()`, `fileAppend()`, `fileDelete()`, `directoryCreate()`, and other write operations throw *"filesystem writes are disabled in sandbox mode"*. This covers every route to the host, not only the `file*` functions: `cfhttp file=`, `writeDump(output=path)`, `spreadsheetWrite`/`spreadsheetWriteToCsv`, `imageWrite`, `cfzip`, uploads, and the Java shims (`java.io.File` mutators, `java.nio.file.Files`, `java.io.FileOutputStream`, the `FileWriter` family).
+- **No processes** — `cfexecute`, `java.lang.ProcessBuilder` and the stdio transport of `mcpConnect()` throw *"process execution is disabled in sandbox mode"*.
+- **Reads that bypass the virtual filesystem are refused** — functions that open a path directly (`imageRead`, `spreadsheetRead`, `java.io.FileInputStream`, …) cannot read host files. Bundled images and spreadsheets should be read with `fileReadBinary()` and passed in as binary.
+
+The sandbox is decided before any CFML runs, from `--sandbox` or from `"security": { "sandbox": true }` in the binary's configuration, and cannot be turned off from application code.
+
+`security.sandbox` on an ordinary `--serve` (an application served from disk) refuses writes and process execution the same way, but cannot hide the host filesystem from reads — the application itself lives there.
 
 Even if application code is compromised (e.g. via a code-injection vulnerability), the attacker cannot read sensitive host files, write persistent backdoors/web shells, or modify host files. The embedded virtual filesystem is **read-only and non-persistent** — any state the application needs to persist should use external services (databases, APIs).
 

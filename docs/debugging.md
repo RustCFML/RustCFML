@@ -75,9 +75,21 @@ security-by-obscurity:
 }
 ```
 
-Then `?myhiddenvar=s3cr3t-9f2a` unlocks the footer for that request. An empty
-`value` means presence-only (any value) — and is **refused in production mode**,
-so a bare `?debug` can never expose a live site.
+Then `?myhiddenvar=s3cr3t-9f2a` unlocks the footer for that request — for **any
+client**, whatever `showFromIPs` says, so treat the value as a password.
+
+The trigger is **off by default**: switch it on with `"enabled": true`. In
+production mode two values are refused outright, so neither can expose a live
+site: an empty `value` (presence-only — a bare `?debug`) and the published
+default `"true"`. Choose your own secret.
+
+### Error pages
+
+With `debugging.enabled`, an uncaught error's page shows the message, detail and
+stack trace (template paths included) only to a client whose address is in
+`showFromIPs`. Every other client gets the generic *"The server encountered an
+error processing your request"* page; the full error is always written to the
+server log.
 
 Behind a reverse proxy, set `trustForwardedFor` so the gate resolves the real
 client IP rather than the proxy's (see the config reference below).
@@ -158,9 +170,9 @@ ignored):
                                                //   true   = trust X-Forwarded-For / X-Real-IP (foot-gun; only
                                                //            safe if your edge overwrites the header on ingress)
     "urlTrigger": {                            // RustCFML enhancement (Lucee matches by IP only)
-      "enabled": true,
+      "enabled": false,                        // off by default; when on it bypasses showFromIPs
       "param": "debug",                        // the URL/form variable NAME — rename to hide it
-      "value": "true"                          // required value; "" = presence-only (refused in production)
+      "value": "true"                          // required value; "" and the default "true" are refused in production
     },
     "template": "modern",                      // modern | classic | simple | comment | none
     "highlightMs": 250,                        // queries slower than this (ms) are highlighted red
@@ -305,6 +317,7 @@ what the footprint and collection-time figures measure.
       "sampleRatio": 0.05,                    // head sampling (0.0–1.0)
       "spanDepthCap": 3,                      // user fns at/under this depth may be spanned
       "spanAllowList": ["*"],                 // name globs eligible for a span
+      "captureSql": true,                     // put SQL text on query spans; false keeps interpolated values out of traces
       "metrics": { "enabled": true, "prometheusPath": "/__rustcfml/metrics" }
     }
   }

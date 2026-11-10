@@ -160,7 +160,15 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `maxRequestBodySize` | int (bytes) | `209715200` (200 MB) | `0` = unlimited. Over the limit the request gets **413** |
 | `maxMultipartParts` | int | `1000` | Parts per `multipart/form-data` body; `0` = unlimited. Over the limit the request gets **413** |
 | `requestTimeout` | int (sec) | `0` | `0` = no timeout. Bounds CFML execution; see [known-issues §3](known-issues.md) for what it does and does not interrupt |
+| `requestTimeoutStopsLoops` | bool | `false` | Also enforce `requestTimeout` inside CPU-bound loops (checked at loop back-edges). Off keeps Lucee's behaviour, where only blocking calls are interrupted |
 | `maxConcurrentRequests` | int | `0` | `0` = 4 × available CPU cores. See [Overload protection](#overload-protection) |
+| `websocketAllowedOrigins` | string[] | `[]` | Browser origins (globs, e.g. `https://*.example.com`) that may open a WebSocket or socket.io connection besides the server's own origin and localhost. Any other `Origin` is refused with 403 before a channel runs — a connection carries the visitor's session cookie. Clients that send no `Origin` are unaffected |
+| `maxWebSocketConnections` | int | `10000` | Raw `/ws/` connections open at once, server-wide; further upgrades get 503. `0` = no cap |
+| `maxWebSocketConnectionsPerIP` | int | `256` | Raw `/ws/` connections one client address may hold. `0` = no cap. Raise it if many users share one NAT address |
+| `maxWebSocketMessageSize` | int (bytes) | `4194304` | Largest WebSocket message/frame accepted (was the transport's 64 MiB). Each inbound message also takes a `maxConcurrentRequests` slot while its handler runs |
+| `adminAllowedIPs` | string[] | `["127.0.0.1","::1"]` | Addresses or CIDR ranges that may reach the engine's admin endpoints (`/__rustcfml/profiler` and the Prometheus metrics path); everyone else gets 404, as does any request carrying `X-Forwarded-For`/`Forwarded`/`X-Real-IP`. **Changed behaviour:** these used to answer any client — add your Prometheus scraper's address. `[]` = anywhere |
+| `trustedProxies` | string[] | loopback + `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7` | Peers whose `X-Forwarded-Proto` is believed (it sets `cgi.https` and the auto-`Secure` session cookie). From any other peer the header is dropped, so a client cannot claim HTTPS. **Changed behaviour:** the header used to be believed from anyone — a TLS proxy on a public address must be listed. `[]` = trust nobody |
+| `allowedHosts` | string[] | `[]` | Host names this server answers (port ignored; `*.example.com` matches subdomains). Any other `Host` gets 400, so a forged `Host` cannot poison absolute URLs built from `cgi.server_name`. Empty = any host |
 | `headerReadTimeout` | int (sec) | `30` | `0` = no limit. See [Overload protection](#overload-protection) |
 | `bodyReadTimeout` | int (sec) | `60` | `0` = no limit. See [Overload protection](#overload-protection) |
 
@@ -369,13 +377,14 @@ The resolved directory is readable from CFML as
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `sandbox` | bool | `false` | Same as `--sandbox`: blocks host filesystem writes |
-| `disallowedFunctions` | string[] | `[]` | Case-insensitive BIF/user-function names that are refused |
-| `disallowedImports` | string[] | `[]` | Regex patterns blocking `createObject("component"\|"rust", ...)` |
+| `sandbox` | bool | `false` | Same as `--sandbox`: refuses host filesystem writes and process execution (`cfexecute`, `java.lang.ProcessBuilder`, stdio `mcpConnect`). In a self-contained (`--build`) binary it also hides host files from reads; a server running an application from disk still reads its own files. See [Deployment › Sandbox](deployment.md#sandbox--virtual-filesystem-web-and-cli) |
+| `disallowedFunctions` | string[] | `[]` | Case-insensitive BIF/user-function names that are refused, however they are called: directly, as a member (`"a".ucase()`), through `evaluate()`, or by a tag. `"cfexecute"` covers `<cfexecute>`, `cfexecute()` and `execute …;` |
+| `disallowedImports` | string[] | `[]` | Regex patterns blocking `createObject("component"\|"rust"\|"java", ...)` — e.g. `"java\\.lang\\.ProcessBuilder"` |
 | `blockedPaths` | string[] | `["*.cfm.bak","*.cfm~","Application.cfc","*.config.cfm"]` | URL globs returning 404 |
 | `csrfEnabled` | bool | `true` | When false, `csrfGenerateToken` / `csrfVerifyToken` error out |
 | `secureJSON` | bool | `false` | Prepend `secureJSONPrefix` to `serializeJSON` output |
 | `secureJSONPrefix` | string | `"//"` | Hijack-prevention prefix |
+| `rotateSessionOnLogin` | bool | `false` | `<cfloginuser>` moves the session to a fresh id (a new `CFID` cookie), so an id known before login is useless after it. Off by default, as on Lucee |
 
 ### `markdown`
 
@@ -471,7 +480,8 @@ Both Lucee Memcached class names are recognised:
                 "listenAddr": "0.0.0.0:7946",
                 "advertiseAddr": "192.168.1.10:7946",
                 "seeds": ["node2.internal:7946", "node3.internal:7946"],
-                "nodeName": "node1"
+                "nodeName": "node1",
+                "secretKey": "${CLUSTER_SECRET_KEY}"
             }
         }
     }
@@ -489,6 +499,7 @@ Cluster properties:
 | `seeds` | `[]` | Legacy static seed list. Used when `discovery` is absent; equivalent to `discovery.method = "static"`. Prefer `discovery` for new configs. |
 | `nodeName` | derived | Stable identifier used as the node's id. Defaults to `advertiseAddr`, or `listenAddr-<uuid>` when neither is set. Set this explicitly in production so a node keeps the same identity across restarts. |
 | `discovery` | `{}` | Peer discovery strategy. See [Discovery methods](#discovery-methods) below. |
+| `secretKey` | (empty) | **Required** unless `listenAddr` is a loopback address. Base64 of 16, 24 or 32 random bytes (AES-128/192/256-GCM), identical on every member — generate one with `openssl rand -base64 32` and supply it as `${CLUSTER_SECRET_KEY}`. All gossip, state sync and application messages are encrypted and authenticated with it, and unencrypted traffic is rejected. Without it the cluster port would hand every session to, and accept forged sessions from, any host that can reach it, so the node refuses to start (logging why) and the server carries on without the cluster — sessions fall back to each node's own memory, so they are no longer shared between nodes. **Changed behaviour:** earlier releases ran the cluster unencrypted and needed no key — add one to every member when upgrading; members with and without a key, or with different keys, cannot join each other. Still firewall the gossip port to the cluster's own network. |
 
 ### Discovery methods
 
@@ -515,7 +526,7 @@ Common `discovery` fields:
 | `namespace` | the pod's own | `kubernetes` | Namespace to list. Defaults to the service account's namespace. |
 | `apiServer` | in-cluster service | `kubernetes` | API base URL; defaults to `https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`, trusting the service account's `ca.crt`. |
 
-`${VAR}` placeholders are expanded in every cluster field (`listenAddr`, `advertiseAddr`, `nodeName`, `seeds`, and the `discovery` fields), so a pod can use `${POD_IP}` or `${KUBE_NAMESPACE}` from its environment.
+`${VAR}` placeholders are expanded in every cluster field (`listenAddr`, `advertiseAddr`, `nodeName`, `secretKey`, `seeds`, and the `discovery` fields), so a pod can use `${POD_IP}` or `${KUBE_NAMESPACE}` from its environment.
 
 ### Fly.io recipe (DNS discovery on 6PN)
 
@@ -528,6 +539,7 @@ Fly's private network is IPv6-only WireGuard and **does not support multicast**.
         "properties": {
             "listenAddr": "[::]:7946",
             "nodeName":   "${FLY_MACHINE_ID}",
+            "secretKey":  "${CLUSTER_SECRET_KEY}",
             "discovery": {
                 "method":       "dns",
                 "name":         "${FLY_APP_NAME}.internal",

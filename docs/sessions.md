@@ -116,7 +116,10 @@ binary and are selected purely by `.cfconfig.json` — no rebuild:
 - **Cluster** — gossip-based peer-to-peer replication across native RustCFML
   nodes ([memberlist](https://github.com/al8n/memberlist) membership +
   [Automerge](https://automerge.org) CRDTs); good for LAN/WAN deployments up to a
-  few dozen nodes, no external store.
+  few dozen nodes, no external store. Every member needs the same `secretKey`
+  (all cluster traffic is encrypted and authenticated with it); a node bound to
+  anything but loopback refuses to start without one — see
+  [Configuration › cluster properties](configuration.md).
 - **Datasource (SQL)** — `sessionStorage` may also name a SQL datasource; the
   blob is stored in an auto-created table.
 

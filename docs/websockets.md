@@ -585,7 +585,9 @@ onto socket.io event packets, so the field names below are the raw-WS encoding:
 
 When the server runs as part of a **clustered session store** (`--features
 cluster`, with `sessionStorage` pointing at a `provider: "cluster"` cache),
-WebSocket fan-out automatically rides the same gossip cluster — no extra config.
+WebSocket fan-out automatically rides the same gossip cluster — no extra config
+beyond the cluster's own (including its required `secretKey`; see
+[Configuration](configuration.md)).
 A `wsPublish` / `io().broadcast()` / `socket.to(room)` on one node reaches
 clients connected to **any** node, and the presence roster is cluster-wide. The
 CFML API is identical to single-node; nothing in your channel code changes.

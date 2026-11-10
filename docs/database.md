@@ -243,23 +243,36 @@ backend.
 ## Working with SQL Server
 
 Microsoft SQL Server connections are **encrypted by default** — the `tiberius`
-driver negotiates TLS (via rustls) and, out of the box, trusts the server
-certificate. This works with Azure SQL Database and any managed instance
-without extra configuration:
+driver negotiates TLS (via rustls) — and the server certificate is **validated**
+against the platform trust store, as mssql-jdbc does since 10.2. Azure SQL
+Database and other servers with a publicly trusted certificate need no extra
+configuration:
 
 ```cfc
 queryExecute("select 1", [], { datasource =
-    "sqlserver://user:pass@host:1433/db" });
+    "sqlserver://user:pass@host.database.windows.net:1433/db" });
 ```
 
-To validate the server certificate against the platform trust store instead of
-trusting it blindly, add `trustServerCertificate=false` (or `encrypt=strict`)
-to the URL:
+A server with a **self-signed** or internally issued certificate (a local
+development instance, a Docker `mcr.microsoft.com/mssql/server` container) now
+fails the handshake. Either add its CA to the platform trust store, or opt out
+of validation with `trustServerCertificate=true`:
 
 ```cfc
 queryExecute("select 1", [], { datasource =
-    "sqlserver://user:pass@host.database.windows.net:1433/db?trustServerCertificate=false" });
+    "sqlserver://user:pass@localhost:1433/db?trustServerCertificate=true" });
 ```
+
+> **Changed behaviour.** Earlier releases trusted any certificate unless
+> `trustServerCertificate=false` (or `encrypt=strict`) was given, which left the
+> encryption open to an attacker in the network path. Datasources pointing at a
+> self-signed server need `trustServerCertificate=true` added when upgrading.
+> `encrypt=strict` is still accepted and still validates.
+
+Credentials in the URL are percent-decoded, like MySQL and PostgreSQL URLs, so
+a password containing `@`, `:`, `/`, `?`, `#` or `%` must be percent-encoded
+(`p%40ss`). A datasource declared with separate `username` / `password` keys in
+`.cfconfig.json` is encoded for you.
 
 ## Tracing the SQL an app actually sends
 

@@ -177,7 +177,9 @@ raise or lower it part-way through a request. Pinned in
   finishes normally, because its watchdog can only interrupt a blocked thread. A
   `sleep()` is interrupted mid-call on both engines; `cfhttp` and `queryExecute` abort
   at the boundary rather than mid-flight (interrupting those needs the remaining budget
-  pushed into the client's own timeout).
+  pushed into the client's own timeout). To stop CPU-bound loops as well — a runaway or
+  hostile loop otherwise keeps a worker busy after its client has gone — set
+  `server.requestTimeoutStopsLoops: true` (off by default; checked at loop back-edges).
 - **The default is 0 = no timeout**, where Lucee defaults to 50 seconds. 🌟 Enforcement
   only ever applies to a deployment that asked for it, so nothing that runs today
   starts aborting on upgrade — but a deployment expecting Lucee's implicit 50s net has
@@ -210,7 +212,7 @@ follow-up (mirrors the datasource work).
 | Function | Ignored argument(s) | Reason |
 |---|---|---|
 | `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
-| `fileUpload()` / `fileUploadAll()` | `accept` | **Implemented** — VM-intercepted, it reads the form scope's `tempFilePath`/`clientFile`, creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. The remaining gap is `accept`: the MIME/extension allow-list is parsed and discarded, so an upload is never rejected on content type. |
+| `fileUpload()` / `fileUploadAll()` | `accept` | **Implemented** — VM-intercepted, it reads the form scope's `tempFilePath`/`clientFile`, creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. `accept` is enforced against the client-declared type and the extension, not the file's bytes (no content sniffing — see the upload note further down). |
 | `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
 | `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
 | `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
@@ -4409,7 +4411,12 @@ panic into a CFML error.
   html,jsp,jspx,php` — override with `allowedExtensions`/`blockedExtensions` or
   `this.blockedExtForFileUpload`), and `nameConflict` defaults to `error` as on Lucee
   (it used to overwrite silently). A `.cfm` declared as `image/png` was previously
-  saved and then executed.
+  saved and then executed. Note what `accept` checks: the **client-declared**
+  `Content-Type` and, under `strict=true`, the type implied by the file extension —
+  not the bytes. Lucee sniffs content with Tika; RustCFML does not, so a file whose
+  name and declared type agree passes whatever it contains. Never serve an upload
+  directory from the web root (an `.svg` or `.html` there is stored XSS), and
+  validate content (e.g. `isImageFile()`) where it matters.
 - `cfzip action="unzip"`: an entry whose name is absolute or climbs out of the
   destination (`../x`) refuses the whole archive, as Lucee does.
 - Server limits (`server.headerReadTimeout` 30 s, `server.bodyReadTimeout` 60 s,
