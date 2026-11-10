@@ -43941,36 +43941,6 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // Lucee's default lookup ("curr2root") stops at the web root. Walking on
-        // past it picked up an Application.cfc — and the `.cfconfig.json`
-        // beside it — from whatever directory happened to sit above the site.
-        // Only applies to a template under the web root; one reached through a
-        // mapping outside it keeps the unbounded walk.
-        //
-        // The web root is stored canonical (`/private/var/...` on macOS) while
-        // the template path may not be (`/var/...`), so the depth below the
-        // root is measured on the canonical form and the stop applied to the
-        // spelling the walk actually uses.
-        let stop_at = self
-            .server_state
-            .as_ref()
-            .and_then(|ss| ss.webroot.as_deref())
-            .and_then(|root| {
-                if start_dir.starts_with(root) {
-                    return Some(root.to_path_buf());
-                }
-                let canon = self.canonicalize_cached(&start_dir.to_string_lossy()).ok()?;
-                let canon = std::path::Path::new(&canon);
-                if !canon.starts_with(root) {
-                    return None;
-                }
-                let depth = canon.components().count() - root.components().count();
-                let mut stop = start_dir.as_path();
-                for _ in 0..depth {
-                    stop = stop.parent()?;
-                }
-                Some(stop.to_path_buf())
-            });
         let mut dir = start_dir.as_path();
         let mut found: Option<String> = None;
         loop {
@@ -43988,9 +43958,6 @@ impl CfmlVirtualMachine {
                     found = hit;
                     break;
                 }
-            }
-            if stop_at.as_deref() == Some(dir) {
-                break;
             }
             match dir.parent() {
                 Some(parent) if parent != dir => dir = parent,

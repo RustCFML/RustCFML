@@ -319,21 +319,6 @@ fn cfc_source_is_never_served_as_static() {
     assert!(!resp.contains("SOURCE-MARKER"), "component source served:\n{resp}");
 }
 
-/// The Application.cfc search stops at the web root (Lucee's "curr2root"),
-/// so one sitting in a directory above the site is never run.
-#[test]
-fn application_cfc_above_the_webroot_is_ignored() {
-    let server = start("approot", "{}", &[("index.cfm", "<cfoutput>page</cfoutput>")], &[]);
-    std::fs::write(
-        server.root.join("Application.cfc"),
-        "component { this.name = \"outside\"; function onRequestStart() { writeOutput(\"OUTSIDE-APP-RAN\"); } }",
-    )
-    .unwrap();
-    let resp = get(server.port, "/index.cfm");
-    assert!(resp.contains("page"), "page did not render:\n{resp}");
-    assert!(!resp.contains("OUTSIDE-APP-RAN"), "Application.cfc above the webroot ran:\n{resp}");
-}
-
 /// Static files carry `X-Content-Type-Options: nosniff`.
 #[test]
 fn static_files_are_not_content_sniffed() {
