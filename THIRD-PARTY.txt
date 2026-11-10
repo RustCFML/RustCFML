@@ -746,6 +746,7 @@ Dependencies
 [MIT]
   memchr-n 0.1.10 — https://github.com/Dr-Emann/memchr_n
 [MIT]
+  chrono-tz 0.10.4 — https://github.com/chronotope/chrono-tz
   agnostic-io 0.2.0 — https://github.com/al8n/agnostic
   agnostic-lite 0.6.2 — https://github.com/al8n/agnostic
   agnostic-net 0.3.1 — https://github.com/al8n/agnostic
@@ -753,7 +754,6 @@ Dependencies
   automerge 0.9.0 — https://github.com/automerge/automerge
   base64-simd 0.8.0 — https://github.com/Nugine/simd
   brotli-decompressor 5.0.3 — https://github.com/dropbox/rust-brotli-decompressor
-  chrono-tz 0.10.4 — https://github.com/chronotope/chrono-tz
   chrono 0.4.45 — https://github.com/chronotope/chrono
   derivit-core 0.1.5 — https://github.com/al8n/derivit
   engineioxide-core 0.2.2 — https://github.com/totodore/socketioxide
@@ -11137,6 +11137,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
+  - chrono-tz 0.10.4
   - agnostic-io 0.2.0
   - agnostic-lite 0.6.2
   - agnostic-net 0.3.1
@@ -11144,7 +11145,6 @@ Applies to:
   - automerge 0.9.0
   - base64-simd 0.8.0
   - brotli-decompressor 5.0.3
-  - chrono-tz 0.10.4
   - chrono 0.4.45
   - derivit-core 0.1.5
   - engineioxide-core 0.2.2

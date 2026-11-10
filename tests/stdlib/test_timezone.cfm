@@ -86,6 +86,20 @@ assertThrows("getTimeZoneInfo unknown id throws", function() {
     getTimeZoneInfo("Not/AZone");
 });
 
+// The bundled tz database must carry the 2026 Canadian DST changes (tzdata
+// 2026e+). chrono-tz's crates.io releases ship stale data, so RustCFML vendors
+// it with a refreshed tz/ (scripts/update-tzdata.sh). An explicit zone argument
+// keeps these independent of the request timezone.
+tzWinter = parseDateTime("2026-12-15T20:00:00Z");
+assert("BC permanent -07 (America/Vancouver)",
+    dateTimeFormat(tzWinter, "HH:nn", "America/Vancouver"), "13:00");
+assert("Alberta permanent -06 (America/Edmonton)",
+    dateTimeFormat(tzWinter, "HH:nn", "America/Edmonton"), "14:00");
+assert("Manitoba permanent -05 (America/Winnipeg)",
+    dateTimeFormat(tzWinter, "HH:nn", "America/Winnipeg"), "15:00");
+assert("California still on standard time (America/Los_Angeles)",
+    dateTimeFormat(tzWinter, "HH:nn", "America/Los_Angeles"), "12:00");
+
 // Restore the request timezone so subsequent test files are unaffected.
 setTimeZone(originalTZ);
 
