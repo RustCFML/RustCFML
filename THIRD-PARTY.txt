@@ -10348,7 +10348,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ================================================================================
 MIT License (MIT)
-
 Applies to:
   - tokio-postgres-rustls 0.14.0
 ================================================================================
