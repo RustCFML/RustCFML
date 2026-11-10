@@ -3926,7 +3926,9 @@ async fn stream_multipart_form(
                 // Owned by the request from here on, so a parse that fails
                 // part-way still deletes what it already wrote (GH #386).
                 uploads.push(path.clone());
-                let mut file = match tokio::fs::File::create(&path).await {
+                let mut file = match cfml_vm::web::create_upload_temp_file(&path)
+                    .map(tokio::fs::File::from_std)
+                {
                     Ok(f) => f,
                     Err(e) => {
                         log::error!(

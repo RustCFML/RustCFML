@@ -913,10 +913,25 @@ pub fn next_upload_temp_path() -> (std::path::PathBuf, String, String) {
     )
 }
 
+/// Create an upload temp file exclusively and readable by this user only.
+/// The names are predictable (pid + counter) and live in the shared temp
+/// directory, so a plain create would follow a symlink another local user
+/// planted there, or write into a file they already hold open.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_upload_temp_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn write_multipart_file(bytes: &[u8]) -> (String, String, bool) {
     let (path, server_dir, temp_path) = next_upload_temp_path();
-    let saved = match std::fs::write(&path, bytes) {
+    let saved = match create_upload_temp_file(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
+    {
         Ok(()) => true,
         Err(e) => {
             log::error!("upload: could not write temp file {}: {e}", path.display());
