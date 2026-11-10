@@ -202,7 +202,9 @@ struct Inner {
     /// Opt-in per channel via the `history="N"` component attribute — only
     /// channels with a non-zero cap retain anything. The distributed `Broker`
     /// makes this cluster-correct (Phase 2); single-node + same-node-only today.
-    history: HashMap<String, VecDeque<WireEnvelope>>,
+    /// Each frame carries the room it was sent to (`None` = channel-wide), so
+    /// replay re-sends a room's frames only to that room's members.
+    history: HashMap<String, VecDeque<(Option<String>, WireEnvelope)>>,
     /// Per-channel retention cap for `history` (0 / absent = disabled).
     history_cap: HashMap<String, usize>,
 }
@@ -486,7 +488,7 @@ impl WebSocketRegistry {
     pub fn broadcast(&self, channel: &str, frame: WireEnvelope, except: Option<&str>) {
         // Record on the originating node only (replay is same-node, decision 3);
         // peers re-fan-out via broadcast_local, which never records.
-        self.record_history(&channel.to_lowercase(), &frame);
+        self.record_history(&channel.to_lowercase(), None, &frame);
         self.publish(BrokerMsg::Broadcast {
             channel: channel.to_string(),
             frame: frame.clone(),
@@ -516,7 +518,7 @@ impl WebSocketRegistry {
     /// Recorded as channel history (replay is channel-wide) and published to
     /// peers; peers re-deliver via [`to_room_local`](Self::to_room_local).
     pub fn to_room(&self, channel: &str, room: &str, frame: WireEnvelope, except: Option<&str>) {
-        self.record_history(&channel.to_lowercase(), &frame);
+        self.record_history(&channel.to_lowercase(), Some(room), &frame);
         self.publish(BrokerMsg::ToRoom {
             channel: channel.to_string(),
             room: room.to_string(),
@@ -614,7 +616,7 @@ impl WebSocketRegistry {
     /// Append a channel-wide fan-out frame to the channel's history ring,
     /// trimming to the cap. No-op unless the channel opted in. Takes the write
     /// lock briefly; callers must not hold any registry lock across this.
-    fn record_history(&self, channel: &str, frame: &WireEnvelope) {
+    fn record_history(&self, channel: &str, room: Option<&str>, frame: &WireEnvelope) {
         if !self.history_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -625,7 +627,7 @@ impl WebSocketRegistry {
             return;
         }
         let ring = inner.history.entry(channel).or_default();
-        ring.push_back(frame.clone());
+        ring.push_back((room.map(str::to_lowercase), frame.clone()));
         while ring.len() > cap {
             ring.pop_front();
         }
@@ -658,15 +660,26 @@ impl WebSocketRegistry {
                 Some(ring) if !ring.is_empty() => {
                     let oldest = ring
                         .iter()
-                        .filter_map(|f| parse_event_id(&f.id).map(|(_, s)| s))
+                        .filter_map(|(_, f)| parse_event_id(&f.id).map(|(_, s)| s))
                         .min()
                         .unwrap_or(0);
+                    // A frame sent to a room is replayed only to a member of
+                    // that room. Replaying every retained frame used to hand any
+                    // connection on the channel the private messages of rooms it
+                    // had never joined.
+                    let member_of = |room: &String| {
+                        inner
+                            .rooms
+                            .get(&(channel_l.clone(), room.clone()))
+                            .is_some_and(|set| set.contains(conn_id))
+                    };
                     let frames = ring
                         .iter()
-                        .filter(|f| {
+                        .filter(|(room, f)| {
                             parse_event_id(&f.id).map(|(_, s)| s > last_seq).unwrap_or(false)
+                                && room.as_ref().is_none_or(member_of)
                         })
-                        .cloned()
+                        .map(|(_, f)| f.clone())
                         .collect();
                     (last_seq < oldest, frames)
                 }
@@ -1347,6 +1360,39 @@ mod tests {
         }
         let CfmlValue::Struct(empty) = reg.presence_state("/chat") else { panic!() };
         assert_eq!(empty.keys().len(), 0, "roster empty after disconnect");
+    }
+
+    /// A room's frames are replayed only to that room's members.
+    #[test]
+    fn replay_withholds_room_frames_from_non_members() {
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        reg.set_history_cap("/chat", 50);
+        let (_s, s_dyn) = sink();
+        let id_s = reg.register("/chat", s_dyn, None, ValueMap::default());
+        let cursor = reg.msg("/chat", Some("say".into()), CfmlValue::Int(0));
+        reg.broadcast("/chat", cursor.clone(), None);
+        reg.join(&id_s, "secret");
+        reg.to_room("/chat", "secret", reg.msg("/chat", Some("say".into()), CfmlValue::Int(1)), None);
+        reg.broadcast("/chat", reg.msg("/chat", Some("say".into()), CfmlValue::Int(2)), None);
+
+        let ints = |frames: &std::sync::Mutex<Vec<WireEnvelope>>| -> Vec<i64> {
+            frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|f| if let CfmlValue::Int(i) = f.d { Some(i) } else { None })
+                .collect()
+        };
+        let (outsider, o_dyn) = sink();
+        let id_o = reg.register("/chat", o_dyn, None, ValueMap::default());
+        reg.replay_since("/chat", &cursor.id, &id_o);
+        assert_eq!(ints(&outsider.frames), vec![2], "room frame leaked to a non-member");
+
+        let (member, m_dyn) = sink();
+        let id_m = reg.register("/chat", m_dyn, None, ValueMap::default());
+        reg.join(&id_m, "secret");
+        reg.replay_since("/chat", &cursor.id, &id_m);
+        assert_eq!(ints(&member.frames), vec![1, 2], "member lost its room frame");
     }
 
     #[test]
