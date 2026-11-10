@@ -13517,6 +13517,11 @@ enum MysqlMutationError {
     Refused(String),
 }
 
+/// MySQL's `ER_UNSUPPORTED_PS`: "This command is not supported in the prepared
+/// statement protocol yet".
+#[cfg(feature = "mysql_db")]
+const MYSQL_ER_UNSUPPORTED_PS: u16 = 1295;
+
 /// Runs a non-row-returning statement, routing `LOAD DATA` / `LOAD XML` around
 /// MySQL's prepared-statement protocol (error 1295 — see `MysqlLoadForm`) and,
 /// for the `LOCAL` form, serving the file the statement named.
@@ -13539,7 +13544,20 @@ fn mysql_run_mutation(
     use MysqlMutationError::{Refused, Server};
 
     let path = match mysql_load_form(sql, !conn.no_backslash_escape()) {
-        MysqlLoadForm::NotLoad => return conn.exec_drop(sql, params).map_err(Server),
+        MysqlLoadForm::NotLoad => {
+            return match conn.exec_drop(sql, params) {
+                // CREATE PROCEDURE/FUNCTION/TRIGGER/EVENT and a few others are
+                // refused by the prepared-statement protocol. With no bind
+                // parameters, run them as plain text, as JDBC does for a
+                // Statement — that is how Lucee runs them.
+                Err(mysql::Error::MySqlError(ref e))
+                    if e.code == MYSQL_ER_UNSUPPORTED_PS && matches!(params, mysql::Params::Empty) =>
+                {
+                    conn.query_drop(sql).map_err(Server)
+                }
+                other => other.map_err(Server),
+            };
+        }
         MysqlLoadForm::ServerSide => return conn.query_drop(sql).map_err(Server),
         MysqlLoadForm::Local(path) => path,
         // Refusing beats running it. With no handler registered the crate answers
