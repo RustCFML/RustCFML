@@ -329,3 +329,30 @@ fn static_files_are_not_content_sniffed() {
         "no nosniff header:\n{resp}"
     );
 }
+
+/// The engine's admin endpoints answer only `server.adminAllowedIPs`
+/// (loopback by default) and never a proxied request.
+#[test]
+fn admin_endpoints_are_limited_to_admin_addresses() {
+    let server = start(
+        "adminips",
+        r#"{"observability":{"profiler":{"enabled":true}}}"#,
+        &[("index.cfm", "ok")],
+        &[],
+    );
+    let status = |r: String| r.split_whitespace().nth(1).unwrap_or("").to_string();
+    // From loopback, directly: not refused by the address gate.
+    assert_ne!(status(get(server.port, "/__rustcfml/profiler")), "403");
+    let proxied = get_with(server.port, "/__rustcfml/profiler", "X-Forwarded-For: 203.0.113.9\r\n");
+    assert_eq!(status(proxied), "404");
+
+    let locked = start(
+        "adminips2",
+        r#"{"server":{"adminAllowedIPs":["10.9.9.9"]},"observability":{"profiler":{"enabled":true}}}"#,
+        &[("index.cfm", "ok")],
+        &[],
+    );
+    let r = get(locked.port, "/__rustcfml/profiler");
+    assert_eq!(status(r.clone()), "404", "{r}");
+    assert!(!r.contains("\"requests\""), "profiler data served to a non-admin address:\n{r}");
+}

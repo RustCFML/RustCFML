@@ -4375,6 +4375,24 @@ async fn handle_request_inner(
         }
     };
     if is_admin_endpoint {
+        let allowed_ips = &state.cfconfig.server.admin_allowed_ips;
+        let peer_ok = addr.ip();
+        let proxied = !allowed_ips.is_empty()
+            && headers.iter().any(|(n, _)| {
+                matches!(
+                    n.to_ascii_lowercase().as_str(),
+                    "x-forwarded-for" | "forwarded" | "x-real-ip" | "x-forwarded-host"
+                )
+            });
+        if proxied || !crate::mcp::auth::ip_allowed(allowed_ips, peer_ok) {
+            log::debug!("  -> 404 (admin endpoint: client not in server.adminAllowedIPs)");
+            return finish_response(
+                axum::response::Response::builder()
+                    .status(404)
+                    .header("Content-Type", "text/plain; charset=utf-8"),
+                axum::body::Body::from("Not found"),
+            );
+        }
         if let Some(code) = rewrite_status.filter(|c| *c >= 400) {
             log::debug!("  -> {} (admin endpoint refused by a rewrite rule)", code);
             return finish_response(

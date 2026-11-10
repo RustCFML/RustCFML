@@ -282,6 +282,15 @@ pub struct ServerCfg {
     /// hijacking). Clients that send no `Origin` (non-browser) are unaffected.
     #[serde(rename = "websocketAllowedOrigins")]
     pub websocket_allowed_origins: Vec<String>,
+    /// Addresses or CIDR ranges allowed to reach the engine's own admin
+    /// endpoints (`/__rustcfml/profiler`, the Prometheus metrics path). They
+    /// expose template paths, timings and request names, and used to answer
+    /// anyone. Loopback by default; add a scraper's address to serve metrics
+    /// to it. A request a proxy forwarded (`X-Forwarded-For` etc.) is refused,
+    /// since behind a same-host proxy every client is 127.0.0.1. Empty =
+    /// anywhere (only sensible when something else authenticates the path).
+    #[serde(rename = "adminAllowedIPs")]
+    pub admin_allowed_ips: Vec<String>,
     /// Bytes. `0` = unlimited. Defaults to 200 MB to match the Lucee/CommandBox
     /// reference (its default post-entity limit), which real uploaders assume:
     /// Preside's chunked asset uploader slices at exactly 10 MiB per request, so
@@ -343,6 +352,7 @@ impl Default for ServerCfg {
             cfml_extensions: vec!["cfm".into(), "cfc".into()],
             max_concurrent_requests: 0,
             websocket_allowed_origins: Vec::new(),
+            admin_allowed_ips: vec!["127.0.0.1".into(), "::1".into()],
             max_request_body_size: 200 * 1024 * 1024,
             max_multipart_parts: 1000,
             request_timeout: 0,
