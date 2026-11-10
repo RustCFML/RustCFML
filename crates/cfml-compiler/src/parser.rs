@@ -4224,7 +4224,26 @@ impl Parser {
                     operator: AssignOp::Equal,
                     location: loc,
                 }));
-                if proc_results.is_empty() && out_vars.is_empty() {
+                // returnCode=true: the procedure's return value, as
+                // result.statusCode. result="x": { executionTime, statusCode }.
+                // (Lucee sets no `cfstoredproc` variable, so neither do we.)
+                let want_rc = pick("returncode").is_some_and(|e| match e {
+                    Expression::Literal(Literal { value: LiteralValue::Bool(b), .. }) => b,
+                    Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                        matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1")
+                    }
+                    Expression::Literal(Literal { value: LiteralValue::Int(i), .. }) => i != 0,
+                    _ => false,
+                });
+                let result_attr = match pick("result") {
+                    Some(Expression::Literal(Literal { value: LiteralValue::String(s), .. })) if !s.is_empty() => Some(s),
+                    _ => None,
+                };
+                let proc_mode = !out_vars.is_empty() || want_rc;
+                if want_rc || result_attr.is_some() {
+                    stmts.push(assign(crate::tag_parser::PROC_START_TICK_VAR, call("getTickCount", vec![])));
+                }
+                if proc_results.is_empty() && !proc_mode {
                     if !opt_pairs.is_empty() {
                         qe_args.push(Expression::Struct(Struct { pairs: opt_pairs, ordered: false, location: loc }));
                     }
@@ -4235,14 +4254,16 @@ impl Parser {
                     // its variable unset. With OUT parameters the result is
                     // `{ resultSets, outputs }` and each `variable` takes its
                     // value (NULL as "").
-                    let rt = if out_vars.is_empty() {
+                    let rt = if !proc_mode {
                         cfml_common::query_options::RESULT_SETS_RETURN_TYPE
+                    } else if want_rc {
+                        cfml_common::query_options::PROC_RESULT_RC_RETURN_TYPE
                     } else {
                         cfml_common::query_options::PROC_RESULT_RETURN_TYPE
                     };
                     opt_pairs.push((str_lit("returnType"), str_lit(rt)));
                     qe_args.push(Expression::Struct(Struct { pairs: opt_pairs, ordered: false, location: loc }));
-                    if out_vars.is_empty() {
+                    if !proc_mode {
                         stmts.push(assign(crate::tag_parser::PROC_RESULT_SETS_VAR, call("queryExecute", qe_args)));
                     } else {
                         stmts.push(assign(crate::tag_parser::PROC_RESULT_VAR, call("queryExecute", qe_args)));
@@ -4314,6 +4335,37 @@ impl Parser {
                             assign(v, value)
                         });
                     }
+                }
+                let elapsed = || Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(call("getTickCount", vec![])),
+                    operator: BinaryOpType::Sub,
+                    right: Box::new(ident(crate::tag_parser::PROC_START_TICK_VAR)),
+                    location: loc,
+                }));
+                let status = || if want_rc {
+                    Expression::MemberAccess(Box::new(MemberAccess {
+                        object: Box::new(ident(crate::tag_parser::PROC_RESULT_VAR)),
+                        member: "statusCode".to_string(),
+                        null_safe: false,
+                        location: loc,
+                    }))
+                } else {
+                    Expression::Literal(Literal { value: LiteralValue::Int(0), location: loc })
+                };
+                let info = || Expression::Struct(Struct {
+                    pairs: vec![(str_lit("executionTime"), elapsed()), (str_lit("statusCode"), status())],
+                    ordered: false,
+                    location: loc,
+                });
+                if let Some(r) = &result_attr {
+                    stmts.push(if r.contains('.') {
+                        Statement::Expression(ExpressionStatement {
+                            expr: call("setVariable", vec![str_lit(r), info()]),
+                            location: loc,
+                        })
+                    } else {
+                        assign(r, info())
+                    });
                 }
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }

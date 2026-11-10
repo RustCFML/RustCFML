@@ -14084,7 +14084,9 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
 
     // A cfstoredproc with OUT parameters: take them out of the bound list
     // before the params are reduced to plain values (see `run_proc_with_outputs`).
-    let proc_mode = options_return_type(&options_arg).as_deref() == Some(PROC_RESULT_RETURN_TYPE);
+    let proc_rt = options_return_type(&options_arg).unwrap_or_default();
+    let proc_mode = proc_rt.starts_with(PROC_RESULT_RETURN_TYPE);
+    let proc_rc = ProcReturnCode::for_return_type(&proc_rt);
     let (raw_params, proc_outs, proc_total) = if proc_mode {
         split_proc_params(&raw_params)
     } else {
@@ -14191,7 +14193,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(driver) = dynamic_driver {
         if proc_mode {
             let mut exec = |s: &str, p: &CfmlValue, rt: &str| driver.execute(s, p, rt);
-            return run_proc_with_outputs(ProcDialect::Other, &sql, proc_total, &proc_outs, &params_arg, &mut exec);
+            return run_proc_with_outputs(ProcDialect::Other, &sql, proc_total, &proc_outs, proc_rc, &params_arg, &mut exec);
         }
         let r = driver.execute(&sql, &params_arg, &return_type)?;
         return Ok(apply_query_maxrows(r, max_rows));
@@ -14225,7 +14227,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         }
     };
     let result = if proc_mode {
-        run_proc_with_outputs(dialect, &sql, proc_total, &proc_outs, &params_arg, &mut exec)
+        run_proc_with_outputs(dialect, &sql, proc_total, &proc_outs, proc_rc, &params_arg, &mut exec)
     } else {
         exec(&sql, &params_arg, &return_type)
     }
@@ -14248,7 +14250,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(apply_query_maxrows(result, max_rows))
 }
 
-pub use cfml_common::query_options::{PROC_RESULT_RETURN_TYPE, RESULT_SETS_RETURN_TYPE};
+pub use cfml_common::query_options::{PROC_RESULT_RC_RETURN_TYPE, PROC_RESULT_RETURN_TYPE, RESULT_SETS_RETURN_TYPE};
 
 /// The `returnType` option, lower-cased.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -14322,6 +14324,31 @@ enum ProcDialect {
     Other,
 }
 
+/// Whether a `<cfstoredproc>` asked for the procedure's return value
+/// (`returnCode="true"`).
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcReturnCode {
+    Ignored,
+    Captured,
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+impl ProcReturnCode {
+    fn for_return_type(return_type: &str) -> Self {
+        if return_type == PROC_RESULT_RC_RETURN_TYPE {
+            Self::Captured
+        } else {
+            Self::Ignored
+        }
+    }
+}
+
+/// The session variable (`@` + this) and result column that carry a SQL Server
+/// procedure's return value back (`returnCode="true"`).
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+const RETURN_CODE_COLUMN: &str = "__rc";
+
 /// The session variable (`@` + this) and result column that carry OUT
 /// parameter `slot` back from the procedure.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -14373,6 +14400,7 @@ fn run_proc_with_outputs(
     sql: &str,
     total: usize,
     outs: &[ProcOut],
+    return_code: ProcReturnCode,
     values: &CfmlValue,
     exec: &mut dyn FnMut(&str, &CfmlValue, &str) -> CfmlResult,
 ) -> CfmlResult {
@@ -14383,15 +14411,19 @@ fn run_proc_with_outputs(
             _ => Vec::new(),
         }
     };
-    let finish = |sets: Vec<CfmlValue>, outputs: ValueMap| -> CfmlResult {
+    let finish = |sets: Vec<CfmlValue>, outputs: ValueMap, status: CfmlValue| -> CfmlResult {
         let mut m = ValueMap::default();
         m.insert("resultSets".to_string(), CfmlValue::array(sets));
         m.insert("outputs".to_string(), CfmlValue::strukt(outputs));
+        m.insert("statusCode".to_string(), status);
         Ok(CfmlValue::strukt(m))
     };
-    if outs.is_empty() {
+    // A return code is SQL Server's alone (`EXEC @rc = proc`); elsewhere it is 0.
+    // Only SQL Server returns a procedure status through EXEC.
+    let want_rc = return_code == ProcReturnCode::Captured && dialect == ProcDialect::Mssql;
+    if outs.is_empty() && !want_rc {
         let sets = as_sets(exec(sql, values, RESULT_SETS_RETURN_TYPE)?);
-        return finish(sets, ValueMap::default());
+        return finish(sets, ValueMap::default(), CfmlValue::Int(0));
     }
     if dialect == ProcDialect::Other {
         return Err(CfmlError::database(
@@ -14440,13 +14472,16 @@ fn run_proc_with_outputs(
             }
         }
     };
-    let select = (0..outs.len())
+    let mut select_cols: Vec<String> = (0..outs.len())
         .map(|slot| {
             let col = out_column(slot);
             format!("@{col} AS {col}")
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+    if want_rc {
+        select_cols.push(format!("@{RETURN_CODE_COLUMN} AS {RETURN_CODE_COLUMN}"));
+    }
+    let select = select_cols.join(", ");
     match dialect {
         ProcDialect::Mssql => {
             let mut batch = String::from("SET NOCOUNT ON; ");
@@ -14459,12 +14494,23 @@ fn run_proc_with_outputs(
                 }
                 batch.push_str("; ");
             }
-            batch.push_str(&format!("EXEC {} {}; SELECT {};", name, args.join(", "), select));
+            if want_rc {
+                batch.push_str(&format!("DECLARE @{RETURN_CODE_COLUMN} INT; "));
+            }
+            let exec_head = if want_rc { format!("EXEC @{RETURN_CODE_COLUMN} = {name}") } else { format!("EXEC {name}") };
+            batch.push_str(&format!("{} {}; SELECT {};", exec_head, args.join(", "), select));
             bound.extend(in_values);
             let mut sets = as_sets(exec(&batch, &CfmlValue::array(bound), RESULT_SETS_RETURN_TYPE)?);
             let last = sets.pop().unwrap_or(CfmlValue::Null);
             read_outputs(&last, &mut outputs);
-            finish(sets, outputs)
+            let status = match &last {
+                CfmlValue::Query(q) if want_rc => q
+                    .column_values_ci(RETURN_CODE_COLUMN)
+                    .and_then(|c| c.first().cloned())
+                    .unwrap_or(CfmlValue::Int(0)),
+                _ => CfmlValue::Int(0),
+            };
+            finish(sets, outputs, status)
         }
         _ => {
             for (slot, v) in &init {
@@ -14479,7 +14525,7 @@ fn run_proc_with_outputs(
             let sets = as_sets(exec(&call, &CfmlValue::array(in_values), RESULT_SETS_RETURN_TYPE)?);
             let row = exec(&format!("SELECT {select}"), &CfmlValue::array(Vec::new()), "query")?;
             read_outputs(&row, &mut outputs);
-            finish(sets, outputs)
+            finish(sets, outputs, CfmlValue::Int(0))
         }
     }
 }
@@ -17003,7 +17049,8 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
 fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     // A cfstoredproc with OUT parameters inside a transaction: the same
     // statements as outside one, all on this transaction's connection.
-    if return_type == PROC_RESULT_RETURN_TYPE {
+    if return_type.starts_with(PROC_RESULT_RETURN_TYPE) {
+        let return_code = ProcReturnCode::for_return_type(return_type);
         let (bound, outs, total) = split_proc_params(params_arg);
         let (sql, values) = normalize_positional_params(sql.to_string(), &bound);
         let dialect = match conn {
@@ -17015,7 +17062,7 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
             _ => ProcDialect::Other,
         };
         let mut exec = |s: &str, p: &CfmlValue, rt: &str| execute_with_transaction(conn, s, p, rt);
-        return run_proc_with_outputs(dialect, &sql, total, &outs, &values, &mut exec);
+        return run_proc_with_outputs(dialect, &sql, total, &outs, return_code, &values, &mut exec);
     }
     // The transaction path receives the raw cfqueryparam param array (the
     // non-transaction `fn_query_execute` does this normalization before the
@@ -23787,7 +23834,7 @@ mod proc_outputs_tests {
     }
 
     /// Run with a recording executor; every statement returns an empty result.
-    fn statements(dialect: ProcDialect) -> Vec<(String, Vec<String>)> {
+    fn statements(dialect: ProcDialect, return_code: ProcReturnCode) -> Vec<(String, Vec<String>)> {
         let mut seen = Vec::new();
         let values = CfmlValue::array(vec![CfmlValue::string("in0".to_string()), CfmlValue::string("io-init".to_string())]);
         let mut exec = |sql: &str, params: &CfmlValue, _rt: &str| -> CfmlResult {
@@ -23798,14 +23845,15 @@ mod proc_outputs_tests {
             seen.push((sql.to_string(), bound));
             Ok(CfmlValue::array(Vec::new()))
         };
-        run_proc_with_outputs(dialect, "CALL dbo.p(?, ?, ?)", 3, &outs(), &values, &mut exec).expect("runs");
+        run_proc_with_outputs(dialect, "CALL dbo.p(?, ?, ?)", 3, &outs(), return_code, &values, &mut exec)
+            .expect("runs");
         seen
     }
 
     #[test]
     fn sql_server_runs_one_batch_with_output_variables() {
         assert_eq!(
-            statements(ProcDialect::Mssql),
+            statements(ProcDialect::Mssql, ProcReturnCode::Ignored),
             vec![(
                 "SET NOCOUNT ON; DECLARE @__o0 INT; DECLARE @__o1 NVARCHAR(MAX) = ?; \
                  EXEC dbo.p ?, @__o0 OUTPUT, @__o1 OUTPUT; SELECT @__o0 AS __o0, @__o1 AS __o1;"
@@ -23819,7 +23867,7 @@ mod proc_outputs_tests {
     fn mysql_sets_session_variables_around_the_call() {
         let s = |sql: &str, bound: &[&str]| (sql.to_string(), bound.iter().map(|b| b.to_string()).collect::<Vec<_>>());
         assert_eq!(
-            statements(ProcDialect::Mysql),
+            statements(ProcDialect::Mysql, ProcReturnCode::Ignored),
             vec![
                 s("SET @__o1 = ?", &["io-init"]),
                 s("SET @__o0 = NULL", &[]),
@@ -23827,6 +23875,18 @@ mod proc_outputs_tests {
                 s("SELECT @__o0 AS __o0, @__o1 AS __o1", &[]),
             ]
         );
+    }
+
+    #[test]
+    fn sql_server_captures_the_return_code() {
+        let batch = &statements(ProcDialect::Mssql, ProcReturnCode::Captured)[0].0;
+        assert_eq!(
+            batch,
+            "SET NOCOUNT ON; DECLARE @__o0 INT; DECLARE @__o1 NVARCHAR(MAX) = ?; DECLARE @__rc INT; \
+             EXEC @__rc = dbo.p ?, @__o0 OUTPUT, @__o1 OUTPUT; SELECT @__o0 AS __o0, @__o1 AS __o1, @__rc AS __rc;"
+        );
+        // MySQL has no procedure status: the request is ignored there.
+        assert!(statements(ProcDialect::Mysql, ProcReturnCode::Captured).iter().all(|(sql, _)| !sql.contains("__rc")));
     }
 
     #[test]
