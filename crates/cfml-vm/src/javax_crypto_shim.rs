@@ -52,6 +52,7 @@ pub const SECRET_KEY_FACTORY_CLASS: &str = "javax.crypto.secretkeyfactory";
 pub const PBE_KEY_SPEC_CLASS: &str = "javax.crypto.spec.pbekeyspec";
 pub const SECRET_KEY_CLASS: &str = "javax.crypto.secretkey";
 pub const SECURE_RANDOM_CLASS: &str = "java.security.securerandom";
+pub const KEY_GENERATOR_CLASS: &str = "javax.crypto.keygenerator";
 
 pub fn is_crypto_class(class_lower: &str) -> bool {
     matches!(
@@ -62,6 +63,7 @@ pub fn is_crypto_class(class_lower: &str) -> bool {
             | PBE_KEY_SPEC_CLASS
             | SECRET_KEY_CLASS
             | SECURE_RANDOM_CLASS
+            | KEY_GENERATOR_CLASS
     )
 }
 
@@ -454,6 +456,128 @@ pub fn handle_secret_key_factory(
 /// getters — it is the same `javax.crypto.SecretKey` interface.
 pub fn handle_secret_key(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     handle_secret_key_spec(method, args, object)
+}
+
+// ── javax.crypto.KeyGenerator ────────────────────────────────────────────────
+
+/// The algorithms `KeyGenerator.getInstance()` accepts here, as (canonical
+/// name, default key size in bits). The defaults are the JDK providers': an HMAC
+/// key the size of the digest for SHA-256/384/512, 64 bytes for the two legacy
+/// digests, and 256 bits for AES (the JDK 19+ default).
+fn key_generator_algorithm(name: &str) -> Option<(&'static str, i64)> {
+    match name.to_ascii_uppercase().replace(['-', '_'], "").as_str() {
+        "HMACMD5" => Some(("HmacMD5", 512)),
+        "HMACSHA1" => Some(("HmacSHA1", 512)),
+        "HMACSHA256" => Some(("HmacSHA256", 256)),
+        "HMACSHA384" => Some(("HmacSHA384", 384)),
+        "HMACSHA512" => Some(("HmacSHA512", 512)),
+        "AES" => Some(("AES", 256)),
+        _ => None,
+    }
+}
+
+fn invalid_key_size(algorithm: &str, bits: i64) -> CfmlError {
+    CfmlError::new(
+        format!(
+            "java.security.InvalidParameterException: Invalid key size for {}: {} bits",
+            algorithm, bits
+        ),
+        CfmlErrorType::Custom("java.security.InvalidParameterException".to_string()),
+    )
+}
+
+/// `KeyGenerator.getInstance( alg )` → `init( bits )` → `generateKey()`, the
+/// way CFML code mints a fresh symmetric or HMAC key when it wants the key
+/// *object* rather than `generateSecretKey()`'s base64 text:
+///
+/// ```cfml
+/// keyGen = CreateObject( "java", "javax.crypto.KeyGenerator" ).getInstance( "HmacSHA256" );
+/// keyGen.init( 256 );
+/// key    = ToBase64( keyGen.generateKey().getEncoded() );
+/// ```
+///
+/// The key material comes from `random_bytes`, the `randomBytes()` builtin (the
+/// OS CSPRNG). A `SecureRandom` passed to `init()` is accepted and ignored, for
+/// the reason `SecureRandom`'s own seed is: every draw is already from the
+/// system source. The result is the same `SecretKey` shim a `SecretKeyFactory`
+/// produces, so `getEncoded()`/`getAlgorithm()` and `Mac.init( key )` work on it.
+pub fn handle_key_generator(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+    random_bytes: impl Fn(i64) -> CfmlResult,
+) -> CfmlResult {
+    match method {
+        "getinstance" => {
+            let requested = args.first().map(|v| v.as_string()).unwrap_or_default();
+            let (alg, bits) =
+                key_generator_algorithm(&requested).ok_or_else(|| no_such_algorithm(&requested))?;
+            let mut m = shim(KEY_GENERATOR_CLASS);
+            m.insert("__algorithm".to_string(), CfmlValue::string(alg.to_string()));
+            m.insert("__requested".to_string(), CfmlValue::string(requested));
+            m.insert("__bits".to_string(), CfmlValue::Int(bits));
+            Ok(CfmlValue::strukt(m))
+        }
+        // init(int keysize) / init(int keysize, SecureRandom) / init(SecureRandom).
+        // Recorded on the receiver in place, as Mac.init() is.
+        "init" => {
+            let alg = field_str(object, "__algorithm");
+            if alg.is_empty() {
+                return Err(unsupported("javax.crypto.KeyGenerator", "init (call getInstance first)"));
+            }
+            let size = match args.first() {
+                Some(CfmlValue::Int(n)) => Some(*n),
+                Some(CfmlValue::Double(d)) => Some(*d as i64),
+                // A SecureRandom (or any other object): keep the default size.
+                Some(CfmlValue::Struct(_)) | None => None,
+                Some(other) => other.as_string().trim().parse::<i64>().ok(),
+            };
+            if let Some(bits) = size {
+                let valid = if alg == "AES" {
+                    matches!(bits, 128 | 192 | 256)
+                } else {
+                    // An HMAC key may be any whole number of bytes; the cap only
+                    // stops a typo from allocating megabytes of key.
+                    bits > 0 && bits % 8 == 0 && bits <= 8192
+                };
+                if !valid {
+                    return Err(invalid_key_size(&alg, bits));
+                }
+                if let CfmlValue::Struct(s) = object {
+                    s.insert("__bits".to_string(), CfmlValue::Int(bits));
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "generatekey" => {
+            let alg = field_str(object, "__algorithm");
+            if alg.is_empty() {
+                return Err(unsupported(
+                    "javax.crypto.KeyGenerator",
+                    "generateKey (call getInstance first)",
+                ));
+            }
+            let bits = field_int(object, "__bits", 256);
+            let key = match random_bytes(bits / 8)? {
+                CfmlValue::Binary(b) => (*b).clone(),
+                other => to_bytes(&other),
+            };
+            // Never hand back a short key: a failed draw must not become an
+            // empty or truncated secret that still "works".
+            if key.len() as i64 != bits / 8 {
+                return Err(CfmlError::new(
+                    "java.security.ProviderException: could not draw key material".to_string(),
+                    CfmlErrorType::Custom("java.security.ProviderException".to_string()),
+                ));
+            }
+            let mut m = shim(SECRET_KEY_CLASS);
+            m.insert("__key".to_string(), CfmlValue::binary(key));
+            m.insert("__algorithm".to_string(), CfmlValue::string(alg));
+            Ok(CfmlValue::strukt(m))
+        }
+        "getalgorithm" => Ok(CfmlValue::string(field_str(object, "__requested"))),
+        other => Err(unsupported("javax.crypto.KeyGenerator", other)),
+    }
 }
 
 // ── java.security.SecureRandom ───────────────────────────────────────────────

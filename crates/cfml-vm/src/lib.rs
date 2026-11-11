@@ -31789,6 +31789,16 @@ impl CfmlVirtualMachine {
                     "java.util.properties" | "java.util.hashtable" => {
                         java_shims::handle_java_properties(&m, all_args, object)
                     }
+                    javax_crypto_shim::KEY_GENERATOR_CLASS => {
+                        let rb = |n: i64| {
+                            self.require_bif(
+                                "javax.crypto.KeyGenerator",
+                                "randomBytes",
+                                vec![CfmlValue::Int(n)],
+                            )
+                        };
+                        javax_crypto_shim::handle_key_generator(&m, all_args, object, rb)
+                    }
                     javax_crypto_shim::SECURE_RANDOM_CLASS => {
                         let rb = |n: i64| {
                             self.require_bif(

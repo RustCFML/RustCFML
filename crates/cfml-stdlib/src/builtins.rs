@@ -2423,9 +2423,22 @@ fn fn_to_base64(args: Vec<CfmlValue>) -> CfmlResult {
     // crudSpec's `hasChanged` binary test (SQLite adapter base64-encodes blobs)
     // saw no change between a PNG and a TXT because both encoded to the same
     // "<Binary>" string.
+    //
+    // An Array is a Java `byte[]` as the shims hand it to CFML (signed ints —
+    // see `get_bytes`): `ToBase64( mac.doFinal( … ) )` and
+    // `ToBase64( key.getEncoded() )` are how CFML turns a MAC or a generated key
+    // into text. Read through `get_str` it encoded the array's *rendering*
+    // ("[-1, -29, …]"), which still looked like base64 and round-tripped against
+    // itself, so nothing failed — the signature was simply not the HMAC. Lucee
+    // has no other meaning for an array here (it refuses to cast one to a string).
     let input_string;
+    let input_bytes;
     let bytes: &[u8] = match args.first() {
         Some(CfmlValue::Binary(b)) => b.as_slice(),
+        Some(CfmlValue::Array(_)) => {
+            input_bytes = get_bytes(&args, 0);
+            input_bytes.as_slice()
+        }
         _ => {
             input_string = get_str(&args, 0);
             input_string.as_bytes()
@@ -2602,11 +2615,8 @@ fn fn_csv_format_row(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_binary_encode(args: Vec<CfmlValue>) -> CfmlResult {
-    let bytes = match args.first() {
-        Some(CfmlValue::Binary(b)) => b.to_vec(),
-        Some(other) => other.as_string().into_bytes(),
-        None => Vec::new(),
-    };
+    // A Java `byte[]` (array of signed ints) is bytes too — see `fn_to_base64`.
+    let bytes = get_bytes(&args, 0);
     let encoding = get_str(&args, 1).to_lowercase();
     match encoding.as_str() {
         "hex" => Ok(CfmlValue::string(hex_encode(&bytes))),
@@ -18351,6 +18361,24 @@ fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
                 return Err(CfmlError::runtime(format!(
                     "Invalid Blowfish key size: {}. Must be a multiple of 8 from 32 to 448",
                     bits
+                )));
+            }
+            bits / 8
+        }
+        // HMAC keys, as Lucee's KeyGenerator-backed generateSecretKey() mints
+        // them: the digest's size for SHA-256/384/512, 64 bytes for the legacy
+        // digests, or the whole number of bytes the caller asked for.
+        "HMACMD5" | "HMACSHA1" | "HMACSHA256" | "HMACSHA384" | "HMACSHA512" => {
+            let default_bits = match algorithm.as_str() {
+                "HMACSHA256" => 256,
+                "HMACSHA384" => 384,
+                _ => 512,
+            };
+            let bits = if key_size > 0 { key_size } else { default_bits };
+            if bits % 8 != 0 || bits > 8192 {
+                return Err(CfmlError::runtime(format!(
+                    "Invalid {} key size: {}. Must be a multiple of 8, up to 8192",
+                    algorithm, bits
                 )));
             }
             bits / 8
