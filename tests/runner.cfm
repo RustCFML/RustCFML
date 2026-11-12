@@ -1253,6 +1253,7 @@ include "harness.cfm";
 
 <!--- Declared parameter/return types are enforced (docs/known-issues.md §29). --->
 <cf_runtest file="functions/test_fn_type_enforcement.cfm" />
+<cf_runtest file="functions/test_fn_integer_argument_adobe.cfm" rustcfmlOnly="true" why="Adobe ColdFusion behaviour; Lucee 7 rejects every value for type=integer (#524)" />
 
 <!--- Writes through the explicit `local.` scope prefix (perf plan T3.1 stage 1.5). --->
 <cf_runtest file="functions/test_local_scope_member_writes.cfm" />
