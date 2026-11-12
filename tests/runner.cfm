@@ -391,6 +391,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_refind_scope_all.cfm" />
 <cf_runtest file="stdlib/test_image_exif_baseline_keys.cfm" />
 <cf_runtest file="stdlib/test_locale_functions.cfm" />
+<cf_runtest file="stdlib/test_lsparsenumber_grouping.cfm" />
 <cf_runtest file="stdlib/test_java_i18n_shims.cfm" />
 <cf_runtest file="stdlib/test_cache_functions.cfm" />
 <cf_runtest file="stdlib/test_cache_properties.cfm" rustcfmlOnly="true" />
