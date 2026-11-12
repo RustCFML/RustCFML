@@ -9160,8 +9160,30 @@ fn fn_hash(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(hex))
 }
 
+/// LSParseNumber(string [, locale]): reads a number written in the locale's
+/// notation. Adobe ColdFusion and Lucee accept the locale's grouping separator
+/// ("5,000" in en_US, "5.000" in de_DE) and its decimal separator; the value is
+/// normalised to "1234.5" form and then converted as before.
 fn fn_ls_parse_number(args: Vec<CfmlValue>) -> CfmlResult {
-    fn_to_numeric(args)
+    let locale = ls_locale_arg(&args, 1)?;
+    let fmt = cfml_common::locale::number_format_for(&locale);
+    let raw = get_str(&args, 0);
+    let mut normalised = String::with_capacity(raw.len());
+    for c in raw.trim().chars() {
+        if c == fmt.grouping && fmt.grouping != '\u{0}' {
+            continue;
+        }
+        // Locales that group with a space also accept the non-breaking forms
+        if fmt.grouping == ' ' && (c == '\u{00A0}' || c == '\u{202F}') {
+            continue;
+        }
+        if c == fmt.decimal {
+            normalised.push('.');
+        } else {
+            normalised.push(c);
+        }
+    }
+    fn_to_numeric(vec![CfmlValue::string(normalised)]).map_err(|_| CfmlError::runtime(format!("Cannot convert '{}' to a number", raw)))
 }
 
 // ===============================================
