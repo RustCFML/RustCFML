@@ -2202,6 +2202,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 "rollback" => {
                     (format!("__cftransaction_rollback();\n"), tag_end - start)
                 }
+                // A self-closing `<cftransaction action="begin" />` is a block
+                // with an empty body, as Lucee and Adobe ColdFusion read it:
+                // it has no end tag to find, and nothing to run.
+                _ if tag_end >= 2 && chars[tag_end - 2] == '/' => (String::new(), tag_end - start),
                 _ => {
                     // "begin" (default) — wraps body in try/catch
                     if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cftransaction") {
@@ -3823,6 +3827,26 @@ fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) ->
     let mut depth = 0;
     let mut i = start;
     while i < len {
+        // A CFML comment is not code: a tag written inside one opens and
+        // closes nothing. CFML comments nest.
+        if is_cfml_comment_open(chars, i, len) {
+            let mut nest = 1;
+            i += 5;
+            while i < len && nest > 0 {
+                if is_cfml_comment_open(chars, i, len) {
+                    nest += 1;
+                    i += 5;
+                } else if i + 3 < len && chars[i] == '-' && chars[i + 1] == '-'
+                    && chars[i + 2] == '-' && chars[i + 3] == '>'
+                {
+                    nest -= 1;
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
         if chars[i] == '<' {
             if chars.get(i + 1) == Some(&'/') {
                 // Potential closing tag
@@ -3843,7 +3867,29 @@ fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) ->
                     // Verify it's actually a tag (next char is space, >, or /)
                     let next_char = remaining.chars().nth(open_target.len());
                     if matches!(next_char, Some(' ') | Some('>') | Some('/') | Some('\t') | Some('\n') | Some('\r') | None) {
-                        depth += 1;
+                        // A nested tag of the same name with no body opens no
+                        // level: `<cftransaction action="commit" />` inside a
+                        // transaction block (or its slash-less
+                        // `action="rollback">` form) has no end tag, so
+                        // counting it left the outer block unmatched.
+                        let tag_end = find_tag_end(chars, i, len);
+                        let self_closing = tag_end >= 2 && chars[tag_end - 2] == '/';
+                        let bodyless_action = tag_name.eq_ignore_ascii_case("cftransaction") && {
+                            let text: String = chars[i..tag_end]
+                                .iter()
+                                .filter(|c| !c.is_whitespace())
+                                .collect::<String>()
+                                .to_lowercase();
+                            ["commit", "rollback", "setsavepoint"].iter().any(|a| {
+                                text.contains(&format!("action=\"{}", a))
+                                    || text.contains(&format!("action='{}", a))
+                            })
+                        };
+                        if !self_closing && !bodyless_action {
+                            depth += 1;
+                        }
+                        i = tag_end;
+                        continue;
                     }
                 }
             }
@@ -3851,6 +3897,12 @@ fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) ->
         i += 1;
     }
     None
+}
+
+/// True when `<!---` (a CFML comment) starts at `i`.
+fn is_cfml_comment_open(chars: &[char], i: usize, len: usize) -> bool {
+    i + 4 < len && chars[i] == '<' && chars[i + 1] == '!'
+        && chars[i + 2] == '-' && chars[i + 3] == '-' && chars[i + 4] == '-'
 }
 
 /// Scan ahead from current position to find `<cfargument>` tags and build the
