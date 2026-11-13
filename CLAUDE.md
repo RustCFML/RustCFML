@@ -82,12 +82,26 @@ Tests are CFML-based, not Rust-based. The test runner (`tests/runner.cfm`) inclu
 The same test suite runs against Lucee to verify compatibility with the reference engine. Start Lucee via CommandBox (served out of the project root), then hit `tests/runner.cfm` over HTTP:
 
 ```bash
-box server start cfengine=lucee@be   # starts Lucee on a CommandBox-assigned port (e.g. 127.0.0.1:8585)
-curl -s http://127.0.0.1:8585/tests/runner.cfm -o /tmp/lucee_out.txt
-grep -E "^(SUMMARY|FAIL \||ERROR)" /tmp/lucee_out.txt
+box server start                     # server.json pins the Lucee version (see below)
+curl -s http://127.0.0.1:8599/tests/runner.cfm -o /tmp/lucee_out.txt   # server.json port
+# FAIL lines are INDENTED inside a suite's block — never anchor the grep at ^.
+grep -E "^\s*(SUMMARY|FAIL \||ERROR \||ERRORED|SKIPPED)" /tmp/lucee_out.txt
 box server status                    # show port if you don't see it in startup output
 box server stop                      # shut it down
 ```
+
+**Reading a Lucee run.** It is green only when the `SUMMARY` line shows every
+assertion passed and nothing is `ERRORED`. A missing `SUMMARY` line means the run
+broke, not that it passed. Count from the `SUMMARY` totals, not from the FAIL
+lines you happened to match: an anchored `^FAIL` grep hid seven indented
+failures behind a 10281/10290 summary (2026-11-13).
+
+**The Lucee version is pinned in `server.json`** (`cfengine`). Do not pass
+`cfengine=` to `box server start`, which overrides it. A floating `lucee@7`
+picked up 7.1.2 on a routine restart and turned seven assertions red with no
+RustCFML change (Lucee had changed arraySlice, isClosure, replaceNoCase and
+directoryList, and its Image/Guard extensions). Bump the pin deliberately, then
+fix what the new version changes.
 
 **Writing tests that pass on both engines:**
 - Do NOT use `var` at page scope — Lucee rejects it ("Unsupported Context for Local Scope"). Declare without `var` at page level, or wrap the test body in a function.

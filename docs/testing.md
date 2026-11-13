@@ -43,9 +43,10 @@ cargo test                       # Rust unit tests (tag parser, pg_sql, etc.)
 Start Lucee via CommandBox (served from the project root), then hit the runner over HTTP:
 
 ```bash
-box server start cfengine=lucee@7    # use @7, not @be — bleeding edge can fail to start
+box server start                     # server.json pins the Lucee version (see below)
 curl -s http://127.0.0.1:<port>/tests/runner.cfm -o /tmp/lucee_out.txt
-grep -E "^(SUMMARY|FAIL \||ERROR)" /tmp/lucee_out.txt
+# FAIL lines are INDENTED inside a suite's block — never anchor the grep at ^.
+grep -E "^\s*(SUMMARY|FAIL \||ERROR \||ERRORED|SKIPPED)" /tmp/lucee_out.txt
 box server status                    # shows the assigned port
 box server stop
 ```
