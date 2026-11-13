@@ -1645,12 +1645,10 @@ fn fn_replace_no_case(args: Vec<CfmlValue>) -> CfmlResult {
         let replace_with = get_str(&args, 2);
         let all = args.len() >= 4 && get_str(&args, 3).eq_ignore_ascii_case("all");
         if find.is_empty() {
-            // Lucee refuses an empty substring here (plain replace() does not).
-            return Err(CfmlError::expression(
-                "Invalid call of the function [ReplaceNoCase], second Argument [sub1] is invalid, \
-                 The string length must be greater than 0"
-                    .to_string(),
-            ));
+            // An empty substring finds nothing: the string comes back unchanged,
+            // as from replace() and on ACF. Lucee refused it before 7.1.2
+            // (LDEV-5857).
+            return Ok(CfmlValue::string(string));
         }
         Ok(CfmlValue::string(replace_nocase_str(&string, &find, &replace_with, all)))
     } else {

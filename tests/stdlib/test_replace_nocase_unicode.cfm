@@ -24,9 +24,10 @@ assert("matches do not overlap", replaceNoCase("aaaa", "AA", "b", "all"), "bb");
 assert("scope is case-insensitive", replaceNoCase("aAa", "a", "-", "ALL"), "---");
 assert("scope=one replaces only the first", replaceNoCase("aAa", "a", "-", "ONE"), "-Aa");
 
-assertThrows("an empty substring is refused", function() {
-	replaceNoCase("abc", "", "x");
-});
+// Lucee 7.1.2 (LDEV-5857): an empty substring finds nothing, as with replace()
+// and on ACF. Lucee 7.1.0 refused it.
+assert("an empty substring is a no-op", replaceNoCase("abc", "", "x"), "abc");
+assert("an empty substring is a no-op with scope=all", replaceNoCase("abc", "", "x", "all"), "abc");
 assert("plain replace() with an empty substring is a no-op", replace("abc", "", "x", "all"), "abc");
 assert("plain replace() scope=one with an empty substring is a no-op", replace("abc", "", "x"), "abc");
 
