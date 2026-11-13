@@ -99,6 +99,245 @@ fn extract_tld_element(block_lower: &str, block_orig: &str, element: &str) -> Op
     None
 }
 
+/// The fence that opens and closes a tag island inside script.
+pub const FENCE: &str = "```";
+
+/// Byte length of the character starting at `i`, so a scanner can step over
+/// it without splitting a multi-byte character. Callers keep `i` on a char
+/// boundary below `source.len()`; past the end this answers 1.
+fn char_len_at(source: &str, i: usize) -> usize {
+    source[i..].chars().next().map_or(1, char::len_utf8)
+}
+
+/// Skip a CFScript string/comment without interpreting delimiters inside it.
+fn skip_script_literal(source: &str, start: usize) -> Option<usize> {
+    let b = source.as_bytes();
+    let tail = &source[start..];
+    if tail.starts_with("<!---") {
+        let mut depth = 1;
+        let mut i = start + 5;
+        while i < b.len() {
+            if source[i..].starts_with("<!---") {
+                depth += 1;
+                i += 5;
+            } else if source[i..].starts_with("--->") {
+                depth -= 1;
+                i += 4;
+                if depth == 0 {
+                    return Some(i);
+                }
+            } else {
+                i += char_len_at(source, i);
+            }
+        }
+        return Some(b.len());
+    }
+    if tail.starts_with("//") {
+        // CR-only files exist (classic Mac line endings): a line comment ends
+        // at either terminator, or it would swallow the rest of the file.
+        return Some(tail.find(['\n', '\r']).map_or(b.len(), |n| start + n));
+    }
+    if let Some(body) = tail.strip_prefix("/*") {
+        return Some(body.find("*/").map_or(b.len(), |n| start + n + 4));
+    }
+    if matches!(b[start], b'\'' | b'"') {
+        return Some(skip_string(source, start, true));
+    }
+    None
+}
+
+/// End of the quoted string opening at `start`. A doubled quote is an escaped
+/// quote. With `interpolating`, a `#expr#` inside the string is CFML code and
+/// may hold strings of its own using the SAME quote character
+/// (`'"#replace( v, '"', '""' )#"'`), so its quotes do not close this string;
+/// `##` is a literal hash. Plain HTML attribute values pass `false`: a `#`
+/// there is just text (`href="#"`).
+fn skip_string(source: &str, start: usize, interpolating: bool) -> usize {
+    let b = source.as_bytes();
+    let quote = b[start];
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == quote {
+            if b.get(i + 1) == Some(&quote) {
+                i += 2;
+            } else {
+                return i + 1;
+            }
+        } else if interpolating && b[i] == b'#' {
+            if b.get(i + 1) == Some(&b'#') {
+                i += 2;
+                continue;
+            }
+            // Scan the expression to its closing hash, stepping over strings.
+            i += 1;
+            while i < b.len() && b[i] != b'#' {
+                if matches!(b[i], b'\'' | b'"') {
+                    i = skip_string(source, i, true);
+                } else {
+                    i += 1;
+                }
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    b.len()
+}
+
+fn starts_tag(source: &str, at: usize, name: &str) -> bool {
+    source
+        .get(at..at + name.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(name))
+        && source
+            .as_bytes()
+            .get(at + name.len())
+            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'>' || *c == b'/')
+}
+
+/// Find the end of a script region, skipping strings, comments and whole tag
+/// islands. Shared by island scanning and <cfscript> body extraction.
+fn script_end(source: &str, mut i: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_TAG_NEST_DEPTH {
+        return None;
+    }
+    while i < source.len() {
+        if let Some(end) = skip_script_literal(source, i) {
+            i = end;
+            continue;
+        }
+        if source[i..].starts_with(FENCE) {
+            i = tag_island_end(source, i + FENCE.len(), depth + 1)? + FENCE.len();
+        } else if starts_tag(source, i, "</cfscript") {
+            return Some(i);
+        } else {
+            i += char_len_at(source, i);
+        }
+    }
+    None
+}
+
+/// Locate a closing fence in template mode. Quotes in ordinary text are just
+/// text; quotes in tag attributes and strings/comments in nested cfscript are
+/// syntax and may contain literal fences. Do not special-case query tags.
+fn tag_island_end(source: &str, mut i: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_TAG_NEST_DEPTH {
+        return None;
+    }
+    let b = source.as_bytes();
+    while i < b.len() {
+        if source[i..].starts_with(FENCE) {
+            return Some(i);
+        }
+        if source[i..].starts_with("<!---") {
+            i = skip_script_literal(source, i)?;
+            continue;
+        }
+        if source[i..].starts_with("<!--") {
+            i = source[i + 4..].find("-->").map_or(b.len(), |n| i + n + 7);
+            continue;
+        }
+        if b[i] == b'<'
+            && b.get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'/')
+        {
+            let script = starts_tag(source, i, "<cfscript");
+            // Only CFML tags interpolate `#expr#` in their attribute values.
+            let cf_tag = source[i + 1..]
+                .trim_start_matches('/')
+                .get(..2)
+                .is_some_and(|p| p.eq_ignore_ascii_case("cf"));
+            i += 1;
+            while i < b.len() && b[i] != b'>' {
+                if matches!(b[i], b'\'' | b'"') {
+                    i = skip_string(source, i, cf_tag);
+                } else {
+                    i += 1;
+                }
+            }
+            i = (i + 1).min(b.len());
+            if script {
+                i = script_end(source, i, depth + 1)?;
+            }
+        } else {
+            i += char_len_at(source, i);
+        }
+    }
+    None
+}
+
+/// Lower each tag island using the SAME template compiler and import context
+/// as ordinary tags. The surrounding function/loop remains a script scope.
+fn script_islands_inner(
+    source: &str,
+    imports: &mut HashMap<String, String>,
+    in_cfoutput: bool,
+) -> String {
+    if !source.contains(FENCE) {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < source.len() {
+        if let Some(end) = skip_script_literal(source, i) {
+            i = end;
+            continue;
+        }
+        if source[i..].starts_with(FENCE) {
+            out.push_str(&source[copied..i]);
+            let Some(end) = tag_island_end(source, i + FENCE.len(), 0) else {
+                let line = source[..i].bytes().filter(|b| *b == b'\n').count() + 1;
+                record_preprocess_error(format!(
+                    "Unclosed tag island at line {line}: missing closing ``` (or nesting too deep)"
+                ));
+                return out;
+            };
+            out.push_str(&tags_to_script_inner(
+                &source[i + FENCE.len()..end],
+                imports,
+                in_cfoutput,
+            ));
+            i = end + FENCE.len();
+            copied = i;
+        } else {
+            i += char_len_at(source, i);
+        }
+    }
+    out.push_str(&source[copied..]);
+    out
+}
+
+/// Script entry point, also used by Parser for script-only components and
+/// inline code. Ordinary scripts avoid touching the template compiler state.
+pub fn script_islands_checked(source: &str) -> Result<String, String> {
+    if !source.contains(FENCE) {
+        return Ok(source.to_string());
+    }
+    TLD_CACHE.with(|c| c.borrow_mut().clear());
+    PREPROCESS_ERROR.with(|e| *e.borrow_mut() = None);
+    TAG_NEST_DEPTH.with(|d| d.set(0));
+    let out = script_islands_inner(source, &mut HashMap::new(), false);
+    match PREPROCESS_ERROR.with(|e| e.borrow_mut().take()) {
+        Some(msg) => Err(msg),
+        None => Ok(out),
+    }
+}
+
+/// [`script_islands_checked`] for a file at `source_path`: relative
+/// `<cfinclude>` / `<cfimport>` paths inside the islands resolve against its
+/// directory.
+pub fn script_islands_checked_at(source: &str, source_path: &str) -> Result<String, String> {
+    SOURCE_DIR.with(|d| {
+        *d.borrow_mut() = std::path::Path::new(source_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+    });
+    let out = script_islands_checked(source);
+    SOURCE_DIR.with(|d| *d.borrow_mut() = None);
+    out
+}
+
 /// Check if source contains CFML tags or CFML comments
 pub fn has_cfml_tags(source: &str) -> bool {
     // Scan for a real CFML tag — `<cf...>`, `</cf...>`, or a `<!--- --->`
@@ -129,6 +368,14 @@ pub fn has_cfml_tags(source: &str) -> bool {
     let mut i = 0;
     while i < n {
         let c = b[i];
+        // Tags inside a script island do not make the enclosing CFC a template.
+        // An unclosed fence is literal text (a template may contain stray
+        // backticks), so keep scanning after it rather than skipping the file.
+        if b[i..].starts_with(FENCE.as_bytes()) {
+            i = tag_island_end(source, i + FENCE.len(), 0)
+                .map_or(i + FENCE.len(), |end| end + FENCE.len());
+            continue;
+        }
         // Block comment /* ... */
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
             i += 2;
@@ -1019,9 +1266,28 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfscript" => {
             // Everything between <cfscript> and </cfscript> is raw script
-            // Find the closing </cfscript>
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfscript") {
-                let script: String = chars[tag_end..end_tag_pos].iter().collect();
+            // Find the closing </cfscript>. The end is found by `script_end`,
+            // which steps over strings, comments and tag islands (any of which
+            // may hold a literal `</cfscript>`). Running it over the rest of
+            // the file means copying the rest of the file, once per <cfscript>
+            // — quadratic in a template with many blocks. So take the first
+            // `</cfscript>` as a candidate, and accept it when the block has no
+            // fence and `script_end` agrees the block ends there (only the
+            // block is copied, as it always was). Otherwise scan the rest.
+            let plain = find_closing_tag(chars, tag_end, len, "cfscript").and_then(|end| {
+                let body: String = chars[tag_end..end].iter().collect();
+                let probe = format!("{body}</cfscript>");
+                (!body.contains(FENCE) && script_end(&probe, 0, 0) == Some(body.len()))
+                    .then_some((body, end))
+            });
+            let found = plain.or_else(|| {
+                let remaining: String = chars[tag_end..len].iter().collect();
+                script_end(&remaining, 0, 0).map(|end_byte| {
+                    let script = script_islands_inner(&remaining[..end_byte], imports, in_cfoutput);
+                    (script, tag_end + remaining[..end_byte].chars().count())
+                })
+            });
+            if let Some((script, end_tag_pos)) = found {
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 (script, close_end - start)
             } else {

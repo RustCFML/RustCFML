@@ -1484,6 +1484,9 @@ pub fn compile_file_cached_flagged(
             );
         }
         converted
+    } else if source_code.contains(cfml_compiler::tag_parser::FENCE) {
+        cfml_compiler::tag_parser::script_islands_checked_at(&source_code, path)
+            .map_err(|msg| CfmlError::runtime(format!("{} in '{}'", msg, path)))?
     } else {
         source_code
     };
