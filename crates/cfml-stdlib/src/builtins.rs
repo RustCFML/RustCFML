@@ -3673,10 +3673,11 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
         // lock — a whole-array snapshot made every call O(array length), so
         // slicing short spans out of a long array was quadratic (GH #461).
         //
-        // Bounds follow Lucee's ArraySlice exactly: an offset <= 0 counts back
-        // from the end (`len + offset`, repeatedly, so -2 of 5 starts at 3); a
-        // length <= 0 stops that many elements before the end; an offset or
-        // offset+length past the end throws rather than clamping.
+        // Bounds follow Lucee's ArraySlice exactly: a negative offset counts
+        // from the end, -1 being the last element (LDEV-2970, Lucee 7.1.2 —
+        // before it, -2 of 5 started at 3), and an offset of 0 or before the
+        // start throws; a length <= 0 stops that many elements before the end;
+        // an offset or offset+length past the end throws rather than clamping.
         let mut offset = get_int(&args, 1)?;
         let length = if args.len() >= 3 { get_int(&args, 2)? } else { 0 };
         let sliced = arr.with_read(|items| -> Result<Vec<CfmlValue>, CfmlError> {
@@ -3689,12 +3690,14 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
                 ));
             }
             if offset <= 0 {
-                // Lucee adds `n` until the offset is positive; the closed form
-                // avoids 2^63 iterations for an offset of i64::MIN.
-                offset = offset.rem_euclid(n);
-                if offset == 0 {
-                    offset = n;
+                if offset == 0 || offset < -n {
+                    return Err(CfmlError::expression(format!(
+                        "Invalid call of the function [arraySlice], second Argument [offset] is invalid, \
+                         Offset [{offset}] is invalid, it must be between 1 and {n} or between -1 and \
+                         -{n} (counted from the end of the array)"
+                    )));
                 }
+                offset += n + 1;
             }
             if n < offset {
                 return Err(CfmlError::expression(

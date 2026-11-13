@@ -57,7 +57,7 @@ function addTo(b) { b.append("!"); }
 addTo(sb);
 assert("append through a function argument", sb.toString(), "abc42!");
 
-// arraySlice bounds, measured against Lucee 7.1.0.204.
+// arraySlice bounds, measured against Lucee 7.1.2.191.
 arr = [1, 2, 3, 4, 5];
 assert("arraySlice middle", arrayToList(arraySlice(arr, 2, 3)), "2,3,4");
 assert("arraySlice to end", arrayToList(arraySlice(arr, 4)), "4,5");
@@ -65,10 +65,14 @@ assert("arraySlice exactly to the end", arrayToList(arraySlice(arr, 4, 2)), "4,5
 assertThrows("arraySlice length past the end throws", function() { arraySlice([1, 2, 3, 4, 5], 4, 3); });
 assertThrows("arraySlice offset past the end throws", function() { arraySlice([1, 2, 3, 4, 5], 6); });
 assertThrows("arraySlice of an empty array throws", function() { arraySlice([], 1); });
-assert("arraySlice offset 0 is the last element", arrayToList(arraySlice(arr, 0)), "5");
-assert("arraySlice negative offset counts back from len", arrayToList(arraySlice(arr, -2)), "3,4,5");
-assert("arraySlice negative offset with length", arrayToList(arraySlice(arr, -2, 1)), "3");
-assert("arraySlice negative offset past the start wraps", arrayToList(arraySlice(arr, -9)), "1,2,3,4,5");
+// Negative offsets count from the end, -1 being the last element; 0 and
+// offsets before the start throw (LDEV-2970, Lucee 7.1.2; 7.1.0 used len+offset).
+assertThrows("arraySlice offset 0 throws", function() { arraySlice([1, 2, 3, 4, 5], 0); });
+assert("arraySlice -1 is the last element", arrayToList(arraySlice(arr, -1)), "5");
+assert("arraySlice negative offset counts from the end", arrayToList(arraySlice(arr, -2)), "4,5");
+assert("arraySlice negative offset with length", arrayToList(arraySlice(arr, -2, 1)), "4");
+assert("arraySlice -len is the whole array", arrayToList(arraySlice(arr, -5)), "1,2,3,4,5");
+assertThrows("arraySlice offset before the start throws", function() { arraySlice([1, 2, 3, 4, 5], -6); });
 assert("arraySlice length 0 is to the end", arrayToList(arraySlice(arr, 2, 0)), "2,3,4,5");
 assert("arraySlice negative length stops before the end", arrayToList(arraySlice(arr, 2, -1)), "2,3,4");
 assert("arraySlice negative length to before offset", arrayLen(arraySlice(arr, 2, -4)), 0);
