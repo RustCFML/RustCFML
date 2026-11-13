@@ -18348,7 +18348,10 @@ fn fn_generate_secret_key(args: Vec<CfmlValue>) -> CfmlResult {
 
     let num_bytes = match algorithm.as_str() {
         "AES" => {
-            let bits = if key_size > 0 { key_size } else { 128 };
+            // No size: the JCE KeyGenerator's default, which is what Lucee and
+            // ACF hand back — 256 bits on Java 21 (it was 128 before Java 19),
+            // and what our javax.crypto.KeyGenerator shim already mints.
+            let bits = if key_size > 0 { key_size } else { 256 };
             match bits {
                 128 | 192 | 256 => bits / 8,
                 _ => return Err(CfmlError::runtime(format!("Invalid AES key size: {}. Must be 128, 192, or 256", bits)))

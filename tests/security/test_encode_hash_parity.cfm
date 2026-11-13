@@ -34,6 +34,8 @@ assertThrows("Blowfish size below 32", function() { generateSecretKey("BLOWFISH"
 assertThrows("Blowfish size not a multiple of 8", function() { generateSecretKey("BLOWFISH", 100); });
 assertThrows("Blowfish size above 448", function() { generateSecretKey("BLOWFISH", 512); });
 assert("Blowfish 128 is 16 bytes", len(binaryDecode(generateSecretKey("BLOWFISH", 128), "base64")), 16);
-assert("AES default is 16 bytes", len(binaryDecode(generateSecretKey("AES"), "base64")), 16);
+// The JCE default, as Lucee/ACF return it: 256 bits on Java 21.
+assert("AES default is 32 bytes", len(binaryDecode(generateSecretKey("AES"), "base64")), 32);
+assert("AES 128 is 16 bytes", len(binaryDecode(generateSecretKey("AES", 128), "base64")), 16);
 suiteEnd();
 </cfscript>
