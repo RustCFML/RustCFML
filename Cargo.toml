@@ -23,6 +23,8 @@ members = [
 exclude = [
     "examples/native_module_demo/native/greeter",
     "examples/native_markdown/native/md",
+    # Vendored crate patched in below; not a workspace member.
+    "vendor/chrono-tz",
 ]
 
 [workspace.package]
@@ -104,3 +106,12 @@ lto = "fat"
 inherits = "release"
 debug = true
 strip = false
+
+# chrono-tz compiles the IANA tz database into the binary, and its crates.io
+# releases lag IANA by months (0.10.4 ships 2025b, which predates BC, Alberta,
+# Manitoba and the NWT dropping DST in 2026). The vendored copy is 0.10.4 with
+# a current `tz/` directory. Refresh it with `scripts/update-tzdata.sh`.
+# The `case-insensitive` feature (set above) makes its build.rs compile `tz/`;
+# without it chrono-tz falls back to the stale 2025b `src/prebuilt/` tables.
+[patch.crates-io]
+chrono-tz = { path = "vendor/chrono-tz" }
