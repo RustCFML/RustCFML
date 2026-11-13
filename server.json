@@ -1,6 +1,6 @@
 {
     "app":{
-        "cfengine":"lucee@7"
+        "cfengine":"lucee@7.1.2.191"
     },
     "name":"RustCFML",
     "noOpen":true,
