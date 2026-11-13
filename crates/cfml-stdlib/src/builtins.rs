@@ -9610,8 +9610,9 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     let recurse = if args.len() >= 2 { args[1].is_true() } else { false };
     let list_info = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "path".to_string() };
     let filter = if args.len() >= 4 { get_str(&args, 3) } else { String::new() };
-    // 5th arg `sort` — applied to the QUERY form only; Lucee returns the
-    // `name`/`path` arrays in filesystem order whatever it says.
+    // 5th arg `sort`. Since Lucee 7.1.2 (LDEV-3188) it applies to the
+    // `name`/`path` arrays as well: the listing is built as the query form,
+    // sorted the same way, and the names or paths taken from it in that order.
     let sort = if args.len() >= 5 { get_str(&args, 4) } else { String::new() };
     // 6th arg `type` (dir|file|all, default all) — Lucee parity. Wheels' plugin
     // loader uses directoryList(..., "dir") to enumerate only sub-directories.
@@ -9714,7 +9715,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
     enum Entry {
         Scalar(CfmlValue),
-        Row { name: String, directory: String, size: u64, is_dir: bool, modified: CfmlValue, mode: String },
+        Row { name: String, directory: String, size: u64, is_dir: bool, modified: CfmlValue, mode: String, path: String },
     }
 
     fn list_dir(
@@ -9772,7 +9773,15 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                             .unwrap_or_default();
                         let modified = cfml_common::dirlist::date_last_modified(meta.as_ref());
                         let mode = cfml_common::dirlist::mode(meta.as_ref());
-                        results.push(Entry::Row { name: file_name.clone(), directory, size, is_dir, modified, mode });
+                        results.push(Entry::Row {
+                            name: file_name.clone(),
+                            directory,
+                            size,
+                            is_dir,
+                            modified,
+                            mode,
+                            path: full_path.clone(),
+                        });
                     }
                     "name" => results.push(Entry::Scalar(CfmlValue::string(file_name.clone()))),
                     _ => results.push(Entry::Scalar(CfmlValue::string(full_path.clone()))),
@@ -9798,7 +9807,11 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // (permissions, etc.) still surfaces as an error.
     let compiled_filter = compile_filter(&filter);
     let mut visited = std::collections::HashSet::new();
-    let listing = match list_dir(&path, recurse, &compiled_filter, &list_info, &type_filter, &mut visited) {
+    // A sorted `name`/`path` array is read off a sorted query listing.
+    let array_info = (list_info != "query").then(|| list_info.clone());
+    let sorted_array = array_info.is_some() && !sort.trim().is_empty();
+    let walk_info = if sorted_array { "query".to_string() } else { list_info.clone() };
+    let listing = match list_dir(&path, recurse, &compiled_filter, &walk_info, &type_filter, &mut visited) {
         Ok(entries) => Ok(entries),
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         // A path that exists but is a FILE yields ENOTDIR (os error 20). Lucee
@@ -9811,8 +9824,8 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
     match listing {
         Ok(entries) => {
-            if list_info == "query" {
-                let columns = vec![
+            if walk_info == "query" {
+                let mut columns = vec![
                     "name".to_string(),
                     "directory".to_string(),
                     "size".to_string(),
@@ -9821,9 +9834,12 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                     "attributes".to_string(),
                     "mode".to_string(),
                 ];
+                if sorted_array {
+                    columns.push("path".to_string());
+                }
                 let q = cfml_common::dynamic::CfmlQuery::new(columns);
                 for e in entries {
-                    if let Entry::Row { name, directory, size, is_dir, modified, mode } = e {
+                    if let Entry::Row { name, directory, size, is_dir, modified, mode, path } = e {
                         let mut row = ValueMap::default();
                         row.insert("name".to_string(), CfmlValue::string(name));
                         row.insert("directory".to_string(), CfmlValue::string(directory));
@@ -9832,11 +9848,24 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                         row.insert("dateLastModified".to_string(), modified);
                         row.insert("attributes".to_string(), CfmlValue::string(String::new()));
                         row.insert("mode".to_string(), CfmlValue::string(mode));
+                        if sorted_array {
+                            row.insert("path".to_string(), CfmlValue::string(path));
+                        }
                         q.add_row(row);
                     }
                 }
                 cfml_common::dirlist::sort_listing_query(&q, &sort);
-                Ok(CfmlValue::Query(q))
+                match array_info.as_deref() {
+                    None => Ok(CfmlValue::Query(q)),
+                    Some(info) => {
+                        let column = if info == "name" { "name" } else { "path" };
+                        let values = q
+                            .column_values_ci(column)
+                            .map(|c| c.as_ref().clone())
+                            .unwrap_or_default();
+                        Ok(CfmlValue::array(values))
+                    }
+                }
             } else {
                 let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
                     if let Entry::Scalar(v) = e { Some(v) } else { None }

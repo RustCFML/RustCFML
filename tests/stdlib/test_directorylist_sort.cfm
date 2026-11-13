@@ -1,8 +1,8 @@
 <cfscript>
 suiteBegin( "directoryList / cfdirectory sort (Lucee 7.1 verified)" );
-// Every expectation here was read off Lucee 7.1 (2026-09-24). Lucee sorts TEXT
-// case-sensitively, `size` numerically; a bad spec sorts nothing; and the
-// directoryList `name`/`path` arrays are never sorted.
+// Every expectation here was read off Lucee 7.1 (2026-09-24; the name/path
+// array sort re-read on 7.1.2.191). Lucee sorts TEXT case-sensitively, `size`
+// numerically; a bad spec sorts nothing.
 _dlRoot = getTempDirectory() & "dlsort_" & createUUID();
 directoryCreate( _dlRoot );
 directoryCreate( _dlRoot & "/beta" ); directoryCreate( _dlRoot & "/Alpha" ); directoryCreate( _dlRoot & "/beta/inner" );
@@ -28,8 +28,16 @@ assert( "named sort argument", _dlNames( directoryList( path = _dlRoot, listInfo
 unsorted = _dlQ( "" );
 assert( "unknown column leaves filesystem order", _dlQ( "bogus" ), unsorted );
 assert( "unknown direction leaves filesystem order", _dlQ( "name sideways" ), unsorted );
-// The name/path arrays ignore sort.
-assert( "listInfo=name ignores sort", directoryList( _dlRoot, false, "name", "", "name desc" ).toList(), directoryList( _dlRoot, false, "name" ).toList() );
+// The name/path arrays are sorted like the query form (Lucee 7.1.2, LDEV-3188;
+// Lucee 7.1.0 returned them in filesystem order whatever the sort said).
+assert( "listInfo=name honours sort", directoryList( _dlRoot, false, "name", "", "name desc" ).toList(), "c.txt,beta,a.txt,B.txt,Alpha" );
+assert( "listInfo=name sorts like the query form", directoryList( _dlRoot, false, "name", "", "type, name" ).toList(), _dlQ( "type, name" ) );
+assert( "listInfo=path honours sort",
+	directoryList( _dlRoot, false, "path", "", "name desc" ).map( ( p ) => listLast( p, "/" ) ).toList(),
+	"c.txt,beta,a.txt,B.txt,Alpha" );
+assert( "listInfo=path sorted gives the same paths as unsorted",
+	directoryList( _dlRoot, true, "path", "", "name" ).sort( "text" ).toList(),
+	directoryList( _dlRoot, true, "path" ).sort( "text" ).toList() );
 
 q = directoryList( _dlRoot, false, "query", "a.txt" );
 assertTrue( "dateLastModified is a date", isDate( q.dateLastModified ) );
