@@ -11,9 +11,22 @@ tmpPng = getTempDirectory() & "/rustcfml_commons_imaging_test.png";
 img = imageNew( "", 120, 80, "rgb", "ff9900" );
 imageWrite( img, tmpPng );
 
+// On Lucee the class comes from the Image extension: up to 3.0 it installed
+// commons-imaging as a global bundle, but 3.1 (Lucee 7.1.2) keeps it private to
+// the extension, so CFML cannot load it there. RustCFML always has the shim.
+imagingAvailable = true;
+try {
+    imaging = createObject( "java", "org.apache.commons.imaging.Imaging" );
+} catch ( any e ) {
+    if ( isRustCFML() ) rethrow;
+    imagingAvailable = false;
+}
+if ( !imagingAvailable ) {
+    assertTrue( "skipped: commons-imaging is not on this engine's classpath (Lucee Image extension 3.1+)", true );
+} else {
+
 // The exact call chain Preside's JavaImageMetaReader.readMeta uses.
 fileobj   = createObject( "java", "java.io.File" ).init( tmpPng );
-imaging   = createObject( "java", "org.apache.commons.imaging.Imaging" );
 imageInfo = imaging.getImageInfo( fileobj );
 
 assert( "getWidth reports the pixel width",  imageInfo.getWidth(),  120 );
@@ -52,6 +65,8 @@ try {
     threw = true;
 }
 assertTrue( "getImageInfo throws on non-image bytes", threw );
+
+}
 
 suiteEnd();
 </cfscript>

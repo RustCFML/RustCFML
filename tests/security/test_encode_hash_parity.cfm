@@ -4,14 +4,21 @@ suiteBegin("encodeForJavaScript follows ESAPI; hash() honours encoding and numIt
 // ESAPI JavaScriptCodec (Lucee's own tests expect \x22\x27 for a double+single quote).
 assert("quotes", encodeForJavaScript("""'"), "\x22\x27");
 assert("letters, digits and ,._ pass through", encodeForJavaScript("aZ09,._"), "aZ09,._");
-assert("ampersand and entity text are encoded",
-	encodeForJavaScript("&##39;);alert(1)//"),
-	"\x26\x2339\x3B\x29\x3Balert\x281\x29\x2F\x2F");
-assert("backtick and template-literal syntax are encoded", encodeForJavaScript("`${x}`"), "\x60\x24\x7Bx\x7D\x60");
-assert("Latin-1 uses \x", encodeForJavaScript("é"), "\xE9");
-bs = chr(92);
-assert("above 0xFF uses \u", encodeForJavaScript(chr(8364)), bs & "u20AC");
-assert("astral characters encode as their UTF-16 halves", encodeForJavaScript(chr(128512)), bs & "uD83D" & bs & "uDE00");
+// RustCFML-only from here: RustCFML keeps ESAPI's JavaScriptCodec (as ACF and
+// Lucee up to Guard/ESAPI extension 3.0 do). Lucee 7.1.2 ships Guard 3.1.0.1,
+// whose encodeForJavaScript is the OWASP Java Encoder: it leaves `;()` and
+// non-ASCII text as they are, writes `/` as `\/`, and DROPS astral characters
+// (an emoji encodes to ""). Deliberate divergence, tracked in GH #453.
+if (isRustCFML()) {
+	assert("ampersand and entity text are encoded",
+		encodeForJavaScript("&##39;);alert(1)//"),
+		"\x26\x2339\x3B\x29\x3Balert\x281\x29\x2F\x2F");
+	assert("backtick and template-literal syntax are encoded", encodeForJavaScript("`${x}`"), "\x60\x24\x7Bx\x7D\x60");
+	assert("Latin-1 uses \x", encodeForJavaScript("é"), "\xE9");
+	bs = chr(92);
+	assert("above 0xFF uses \u", encodeForJavaScript(chr(8364)), bs & "u20AC");
+	assert("astral characters encode as their UTF-16 halves", encodeForJavaScript(chr(128512)), bs & "uD83D" & bs & "uDE00");
+}
 
 // hash(input, algorithm, encoding, numIterations): the digest BYTES are
 // re-digested numIterations times (Lucee Hash.invoke).
