@@ -46,6 +46,30 @@ try {
     <cftransaction action="rollback">
 </cftransaction>
 
+<!---
+  Lucee's rule (transformer.cfml.attributes.impl.Transaction): a cftransaction
+  inside another one is bodyless whenever it has an action attribute, whatever
+  its value. Each form below runs on Lucee 7.1.
+--->
+<!--- A nested action="begin" is an empty block: the next end tag closes the outer one --->
+<cftransaction>
+    <cfquery datasource="#ds#">INSERT INTO t (name) VALUES ('third')</cfquery>
+    <cftransaction action="begin">
+</cftransaction>
+
+<!--- An action known only at run time --->
+<cfset nestedAction = "rollback" />
+<cftransaction>
+    <cfquery datasource="#ds#">INSERT INTO t (name) VALUES ('dynamic discarded')</cfquery>
+    <cftransaction action="#nestedAction#">
+</cftransaction>
+
+<!--- An unquoted action --->
+<cftransaction>
+    <cfquery datasource="#ds#">INSERT INTO t (name) VALUES ('fourth')</cfquery>
+    <cftransaction action=commit>
+</cftransaction>
+
 <!--- A self-closing begin is an empty block, with no end tag --->
 <cftransaction action="begin" />
 
@@ -55,7 +79,7 @@ try {
 
 <cfscript>
 assert("code after the blocks runs", afterBlocks, true);
-assert("committed rows kept", valueList(q.name), "first,second");
+assert("committed rows kept", valueList(q.name), "first,second,third,fourth");
 try { fileDelete(tmpfile); } catch (any e) {}
 </cfscript>
 

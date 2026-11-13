@@ -519,6 +519,26 @@ thread_local! {
     /// Current `tags_to_script_inner` recursion depth, bounded by
     /// `MAX_TAG_NEST_DEPTH`.
     static TAG_NEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many `<cftransaction>` blocks enclose the tag being converted —
+    /// Lucee's "has an ancestor transaction tag" test, which makes a nested
+    /// cftransaction with an `action` attribute bodyless.
+    static TXN_TAG_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard that decrements [`TXN_TAG_DEPTH`] however the body conversion exits.
+struct TxnTagGuard;
+
+impl TxnTagGuard {
+    fn enter() -> Self {
+        TXN_TAG_DEPTH.with(|d| d.set(d.get() + 1));
+        TxnTagGuard
+    }
+}
+
+impl Drop for TxnTagGuard {
+    fn drop(&mut self) {
+        TXN_TAG_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// Guard that decrements [`TAG_NEST_DEPTH`] however the frame exits.
@@ -569,6 +589,7 @@ pub fn tags_to_script(source: &str) -> String {
     TLD_CACHE.with(|c| c.borrow_mut().clear());
     PREPROCESS_ERROR.with(|e| *e.borrow_mut() = None);
     TAG_NEST_DEPTH.with(|d| d.set(0));
+    TXN_TAG_DEPTH.with(|d| d.set(0));
     tags_to_script_impl(source, &mut imports)
 }
 
@@ -2194,14 +2215,49 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let action = attrs.get("action").cloned().unwrap_or_else(|| "begin".to_string());
             let isolation = attrs.get("isolation").cloned();
             let datasource = attrs.get("datasource").cloned();
+            // Lucee makes a cftransaction bodyless when it has an `action`
+            // attribute and an enclosing cftransaction (with or without `/>`).
+            let nested_action =
+                attrs.contains_key("action") && TXN_TAG_DEPTH.with(|d| d.get()) > 0;
+            let self_closing = tag_end >= 2 && chars[tag_end - 2] == '/';
+            let dynamic_action = strip_hashes(&action) != action;
+            // Explicit savepoints are not implemented: say so where the code
+            // runs rather than treating the tag as something it is not.
+            let no_savepoints = "throw(type=\"Application\", message=\"cftransaction savepoints \
+                (action='setsavepoint', or rollback with savepoint=) are not supported \
+                by RustCFML yet.\");\n";
 
             match action.to_lowercase().as_str() {
                 "commit" => {
                     (format!("__cftransaction_commit();\n"), tag_end - start)
                 }
+                "rollback" if attrs.contains_key("savepoint") => {
+                    (no_savepoints.to_string(), tag_end - start)
+                }
                 "rollback" => {
                     (format!("__cftransaction_rollback();\n"), tag_end - start)
                 }
+                "setsavepoint" => (no_savepoints.to_string(), tag_end - start),
+                // `action="#expr#"` as a statement: the action is only known
+                // at run time, so dispatch on it there.
+                _ if dynamic_action && (nested_action || self_closing) => {
+                    let expr = strip_hashes(&action);
+                    (
+                        format!(
+                            "var __cftxn_action = lCase(trim({expr}));\n\
+                             if (__cftxn_action == \"commit\") {{ __cftransaction_commit(); }}\n\
+                             else if (__cftxn_action == \"rollback\") {{ __cftransaction_rollback(); }}\n\
+                             else if (__cftxn_action == \"setsavepoint\") {{ {no_savepoints} }}\n\
+                             else if (__cftxn_action != \"begin\") {{ throw(type=\"Application\", \
+                             message=\"Invalid cftransaction action [\" & __cftxn_action & \"]: \
+                             valid actions are begin, commit, rollback, setsavepoint.\"); }}\n"
+                        ),
+                        tag_end - start,
+                    )
+                }
+                // A nested `action="begin"`, like a self-closing begin, is a
+                // block with an empty body: nothing to run.
+                _ if nested_action => (String::new(), tag_end - start),
                 // A self-closing `<cftransaction action="begin" />` is a block
                 // with an empty body, as Lucee and Adobe ColdFusion read it:
                 // it has no end tag to find, and nothing to run.
@@ -2211,7 +2267,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cftransaction") {
                         let body: String = chars[tag_end..end_tag_pos].iter().collect();
                         let close_end = find_tag_end(chars, end_tag_pos, len);
-                        let body_script = tags_to_script_impl(&body, imports);
+                        let body_script = {
+                            let _in_txn = TxnTagGuard::enter();
+                            tags_to_script_impl(&body, imports)
+                        };
 
                         // Build args for __cftransaction_start. All THREE
                         // positions are always emitted — action, isolation,
@@ -3874,17 +3933,14 @@ fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) ->
                         // counting it left the outer block unmatched.
                         let tag_end = find_tag_end(chars, i, len);
                         let self_closing = tag_end >= 2 && chars[tag_end - 2] == '/';
-                        let bodyless_action = tag_name.eq_ignore_ascii_case("cftransaction") && {
-                            let text: String = chars[i..tag_end]
-                                .iter()
-                                .filter(|c| !c.is_whitespace())
-                                .collect::<String>()
-                                .to_lowercase();
-                            ["commit", "rollback", "setsavepoint"].iter().any(|a| {
-                                text.contains(&format!("action=\"{}", a))
-                                    || text.contains(&format!("action='{}", a))
-                            })
-                        };
+                        // Lucee's rule (transformer.cfml.attributes.impl.
+                        // Transaction): a cftransaction inside another one is
+                        // bodyless whenever it has an `action` attribute — any
+                        // value, `begin` and `#dynamic#` included, quoted or not.
+                        let bodyless_action = tag_name.eq_ignore_ascii_case("cftransaction")
+                            && parse_tag_attributes_ordered(chars, i + open_target.len(), len)
+                                .0
+                                .contains_key("action");
                         if !self_closing && !bodyless_action {
                             depth += 1;
                         }
