@@ -527,6 +527,10 @@ pub struct Closure {
     /// Function attributes parsed between `)` and `{` — e.g.
     /// `function (x) localMode="modern" { ... }`.
     pub metadata: Vec<(String, String)>,
+    /// A block-bodied arrow function, `(x) => { ... }`. It compiles as a
+    /// closure (it holds statements) but is a lambda, as the expression-bodied
+    /// `(x) => expr` is: `isValid("lambda")`, `isCustomFunction(f, "lambda")`.
+    pub arrow: bool,
 }
 
 #[derive(Debug, Clone)]

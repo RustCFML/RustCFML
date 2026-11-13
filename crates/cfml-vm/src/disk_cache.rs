@@ -46,7 +46,10 @@ use std::sync::Arc;
 ///   variant indices of every later op (serde encodes enums by index)
 /// - 4: `BytecodeOp::ForInElement` removed (never emitted since `ForInStep`),
 ///   shifting every later op's index down by one
-pub const BYTECODE_FORMAT_VERSION: u32 = 4;
+/// - 5: a block-bodied arrow function compiles to `__arrow_N`, not
+///   `__closure_N` (the name is how isClosure/isValid/isCustomFunction tell a
+///   lambda from a closure)
+pub const BYTECODE_FORMAT_VERSION: u32 = 5;
 
 /// Compute cache key for a source file, optionally including the source path.
 /// The path component ensures that the same file compiled via different paths

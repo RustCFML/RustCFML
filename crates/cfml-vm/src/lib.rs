@@ -21619,10 +21619,13 @@ impl CfmlVirtualMachine {
                                 CfmlValue::string(rt.clone()),
                             );
                         }
-                        // Lucee/ACF expose `closure` on function metadata; a
-                        // declared component method / UDF reference is not a
-                        // closure.
-                        meta.insert("closure".to_string(), CfmlValue::Bool(false));
+                        // Lucee/ACF expose `closure` on function metadata:
+                        // true for a closure or an arrow function (a lambda),
+                        // false for a declared UDF or component method.
+                        meta.insert(
+                            "closure".to_string(),
+                            CfmlValue::Bool(Self::is_closure_value(f)),
+                        );
                         let params: Vec<CfmlValue> = f
                             .params
                             .iter()

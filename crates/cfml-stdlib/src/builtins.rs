@@ -5691,36 +5691,69 @@ fn fn_is_binary(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Bool(matches!(args.first(), Some(CfmlValue::Binary(_)))))
 }
 
+/// The kind of a user-defined function value, as Lucee's `Decision.isClosure`
+/// / `isLambda` / `isUserDefinedFunction` tell them apart.
+///
+/// At runtime every function is a `CfmlValue::Function` whose
+/// `captured_scope` may be `Some` (named UDFs carry one too), so the reliable
+/// signal is the compiler-synthesised name: closure expressions compile to
+/// `__closure_N`, arrow functions — expression- or block-bodied — to
+/// `__arrow_N` (cfml-codegen `Expression::Closure` / `ArrowFunction`), and
+/// declared functions keep their own name. The legacy `CfmlValue::Closure`
+/// variant counts as a closure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FnKind {
+    Closure,
+    Lambda,
+    Udf,
+}
+
+fn function_kind(v: Option<&CfmlValue>) -> Option<FnKind> {
+    match v? {
+        CfmlValue::Closure(_) => Some(FnKind::Closure),
+        CfmlValue::Function(f) if f.name.starts_with("__closure_") => Some(FnKind::Closure),
+        CfmlValue::Function(f) if f.name.starts_with("__arrow_") => Some(FnKind::Lambda),
+        CfmlValue::Function(_) => Some(FnKind::Udf),
+        _ => None,
+    }
+}
+
+/// `isCustomFunction( value [, type ] )` — Lucee's IsCustomFunction: any
+/// user-defined function, or with `type` exactly one kind (`closure`, `lambda`,
+/// `udf`); any other type is an error.
 fn fn_is_custom_function(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Bool(matches!(args.first(), Some(CfmlValue::Function(_)))))
+    let Some(kind) = function_kind(args.first()) else {
+        return Ok(CfmlValue::Bool(false));
+    };
+    let wanted = args.get(1).map(|t| t.as_string()).unwrap_or_default();
+    let is = match wanted.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "closure" => kind == FnKind::Closure,
+        "lambda" => kind == FnKind::Lambda,
+        "udf" => kind == FnKind::Udf,
+        other => {
+            return Err(CfmlError::expression(format!(
+                "Invalid call of the function [IsCustomFunction], second Argument [type] is invalid, \
+                 function type [{other}] is invalid, only the following values are valid \
+                 [closure,lambda,udf]"
+            )))
+        }
+    };
+    Ok(CfmlValue::Bool(is))
 }
 
 fn fn_is_closure(args: Vec<CfmlValue>) -> CfmlResult {
-    // Lucee parity: `isClosure()` is true for a closure expression
-    // (`function(){}`) but false for an arrow function (`()=>{}`, a lambda on
-    // Lucee 7.0/7.1, where isCustomFunction() is still true), a plain named UDF
-    // or a component method. At runtime an anonymous function expression is a
-    // `CfmlValue::Function` (like every UDF) whose `captured_scope` is `Some`
-    // — but so is every named UDF's, so that flag can't distinguish them. The
-    // reliable signal is the compiler-synthesized name: closures compile to
-    // `__closure_N` and arrow functions to `__arrow_N` (see cfml-codegen
-    // `Expression::Closure`/`ArrowFunction`); named declarations keep their
-    // real name. `DefineFunction` already keys behavior off the same `__`
-    // prefix convention. (The legacy `CfmlValue::Closure` variant is also
-    // honored for completeness.)
+    // Lucee 7.1.2 (LDEV-4709, matching ACF): true for a closure expression
+    // (`function(){}`) AND an arrow function (a lambda); false for a declared
+    // UDF or component method. `isValid("closure")` and
+    // `isCustomFunction(f, "closure")` still tell closures and lambdas apart.
     //
-    // This being wrong (always false) silently broke Preside/Sticker's
+    // This being wrong (always false) once silently broke Preside/Sticker's
     // `Bundle.addAssets()`: its `if ( !isClosure(match) || match(path) )` guard
     // short-circuited on `!false`, so the `match` closure was never applied and
     // every file (and directory) got registered as an asset — clobbering the
     // core admin CSS/JS bundles and leaving the admin unstyled.
-    let is = match args.first() {
-        Some(CfmlValue::Closure(_)) => true,
-        Some(CfmlValue::Function(f)) => {
-            f.name.starts_with("__closure_")
-        }
-        _ => false,
-    };
+    let is = matches!(function_kind(args.first()), Some(FnKind::Closure | FnKind::Lambda));
     Ok(CfmlValue::Bool(is))
 }
 
@@ -5787,6 +5820,12 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             // Lucee: `object` is anything isObject() accepts (Java objects
             // included); `component`/`class` are CFC instances only.
             "object" => fn_is_object(vec![value.clone()]),
+            // Lucee Decision.isValid: "function" is any user-defined function;
+            // "closure" and "lambda" one kind each (an arrow function is a
+            // lambda, not a closure — unlike isClosure(), LDEV-4709).
+            "function" => Ok(CfmlValue::Bool(function_kind(Some(value)).is_some())),
+            "closure" => Ok(CfmlValue::Bool(function_kind(Some(value)) == Some(FnKind::Closure))),
+            "lambda" => Ok(CfmlValue::Bool(function_kind(Some(value)) == Some(FnKind::Lambda))),
             "component" | "class" => Ok(CfmlValue::Bool(match value {
                 CfmlValue::Component(_) => true,
                 CfmlValue::Struct(s) => s.contains_key("__name") && !s.contains_key("__java_shim"),

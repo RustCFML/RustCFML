@@ -6838,7 +6838,9 @@ impl CfmlCompiler {
                 self.tag_pair_stack = saved_tag_pairs;
         self.catch_var_stack = saved_catch_vars;
 
-                let func_name = format!("__closure_{}", self.program.functions.len());
+                // A block-bodied arrow is still a lambda: name it as one.
+                let prefix = if closure.arrow { "__arrow_" } else { "__closure_" };
+                let func_name = format!("{}{}", prefix, self.program.functions.len());
                 let bc_func = BytecodeFunction {
                     name: func_name.clone(),
                     params: closure.params.iter().map(|p| p.name.clone()).collect(),

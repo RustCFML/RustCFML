@@ -1294,6 +1294,7 @@ impl Parser {
                         body,
                         location: stmt_loc.clone(),
                         metadata: Vec::new(),
+                        arrow: false,
                     }));
                     // Every attribute except the reserved control ones becomes the
                     // thread's `attributes` scope, bound from the parent at spawn —
@@ -7743,6 +7744,7 @@ impl Parser {
                             body,
                             location: self.current_location(),
                             metadata: Vec::new(),
+                            arrow: true,
                         })));
                     }
 
@@ -7805,6 +7807,7 @@ impl Parser {
             body,
             location: self.current_location(),
             metadata,
+            arrow: false,
         })))
     }
 

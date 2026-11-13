@@ -161,13 +161,44 @@ assertFalse("isCustomFunction on struct", isCustomFunction({}));
 // non-functions. Regression guard for Sticker's Bundle.addAssets() match
 // closure (Preside admin asset bundling depends on this).
 assertTrue("isClosure on closure", isClosure(myClosure));
-// Lucee 7.0/7.1: an arrow function is a lambda, not a closure, but it is still
-// a custom function.
-assertFalse("isClosure on arrow function", isClosure(myArrow));
+// Lucee 7.1.2 (LDEV-4709, matching ACF): isClosure() is true for an arrow
+// function (a lambda) too. Lucee 7.0/7.1.0 said false.
+myBlockArrow = (x) => { return x; };
+assertTrue("isClosure on arrow function", isClosure(myArrow));
+assertTrue("isClosure on block-bodied arrow function", isClosure(myBlockArrow));
 assertTrue("isCustomFunction on arrow function", isCustomFunction(myArrow));
 assertFalse("isClosure on named UDF", isClosure(myNamedUdf));
 assertFalse("isClosure on string", isClosure("hello"));
 assertFalse("isClosure on number", isClosure(42));
+suiteEnd();
+
+// isValid and isCustomFunction(f, type) keep closures and lambdas apart.
+suiteBegin("Lucee7: function kinds (closure, lambda, udf)");
+kindClosure = function(){ return 1; };
+kindArrow = () => 1;
+kindBlockArrow = (x) => { return x; };
+kindUdf = myNamedUdf;
+assertTrue("isValid function: closure", isValid("function", kindClosure));
+assertTrue("isValid function: arrow", isValid("function", kindArrow));
+assertTrue("isValid function: udf", isValid("function", kindUdf));
+assertFalse("isValid function: string", isValid("function", "kindUdf"));
+assertTrue("isValid closure: closure", isValid("closure", kindClosure));
+assertFalse("isValid closure: arrow", isValid("closure", kindArrow));
+assertFalse("isValid closure: udf", isValid("closure", kindUdf));
+assertTrue("isValid lambda: arrow", isValid("lambda", kindArrow));
+assertTrue("isValid lambda: block-bodied arrow", isValid("lambda", kindBlockArrow));
+assertFalse("isValid lambda: closure", isValid("lambda", kindClosure));
+assertTrue("isCustomFunction closure type", isCustomFunction(kindClosure, "closure"));
+assertFalse("isCustomFunction closure type on arrow", isCustomFunction(kindArrow, "closure"));
+assertTrue("isCustomFunction lambda type", isCustomFunction(kindBlockArrow, "lambda"));
+assertFalse("isCustomFunction lambda type on udf", isCustomFunction(kindUdf, "lambda"));
+assertTrue("isCustomFunction udf type", isCustomFunction(kindUdf, "udf"));
+assertFalse("isCustomFunction udf type on closure", isCustomFunction(kindClosure, "udf"));
+assertFalse("isCustomFunction with a type on a non-function", isCustomFunction("x", "udf"));
+assertThrows("isCustomFunction rejects an unknown type", function() { isCustomFunction(kindUdf, "method"); });
+assertTrue("metadata closure: closure", getMetadata(kindClosure).closure);
+assertTrue("metadata closure: arrow", getMetadata(kindArrow).closure);
+assertFalse("metadata closure: udf", getMetadata(kindUdf).closure);
 suiteEnd();
 
 // ============================================================
