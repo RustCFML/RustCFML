@@ -129,3 +129,160 @@ pub fn mode(meta: Option<&std::fs::Metadata>) -> String {
     let _ = meta;
     String::new()
 }
+
+/// The `type` argument of `directoryList()` / `<cfdirectory>`: which kinds of
+/// entry a listing keeps. It never stops recursion into a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    All,
+    Dir,
+    File,
+}
+
+impl EntryType {
+    /// Lucee's `Directory.toType`: `all`, `dir`, `directory` or `file`, trimmed
+    /// and case-insensitive; empty means `all`.
+    pub fn parse(raw: &str) -> Result<Self, crate::vm::CfmlError> {
+        let t = raw.trim().to_lowercase();
+        match t.as_str() {
+            "" | "all" => Ok(EntryType::All),
+            "dir" | "directory" => Ok(EntryType::Dir),
+            "file" => Ok(EntryType::File),
+            _ => Err(crate::vm::CfmlError::application(format!(
+                "Invalid type [{t}], valid types are [all, directory, file]"
+            ))),
+        }
+    }
+
+    pub fn admits(self, is_dir: bool) -> bool {
+        match self {
+            EntryType::All => true,
+            EntryType::Dir => is_dir,
+            EntryType::File => !is_dir,
+        }
+    }
+}
+
+/// A `directoryCopy()` filter: called with an entry's path, name and whether it
+/// is a directory; `Ok(false)` rejects it.
+pub type CopyFilter<'a> =
+    dyn FnMut(&std::path::Path, &str, bool) -> Result<bool, crate::vm::CfmlError> + 'a;
+
+/// Lucee's `Directory.actionCopy`, shared by `directoryCopy()` and
+/// `<cfdirectory action="copy">` with a wildcard or a closure filter.
+///
+/// - Without `recurse` only the top-level FILES are copied, filter or not.
+/// - With `recurse` every directory is created and descended into whatever the
+///   filter says; files are copied when the filter accepts them. When there is
+///   a filter, each directory then left empty (`.DS_Store` aside) that the
+///   filter rejects is removed, bottom-up, the destination root included. The
+///   filter sees SOURCE paths while copying and DESTINATION paths while
+///   clearing.
+/// - The filter is consulted for directories too (Lucee evaluates it first in
+///   both of its compound filters).
+/// - A destination without any path separator is a sibling of the source.
+/// - Every failure inside the copy, a filter's own exception included, is an
+///   `application` error carrying the original message.
+pub fn copy_directory(
+    src: &std::path::Path,
+    destination: &str,
+    recurse: bool,
+    create_path: bool,
+    mut filter: Option<&mut CopyFilter<'_>>,
+) -> Result<(), crate::vm::CfmlError> {
+    use crate::vm::CfmlError;
+    use std::path::{Path, PathBuf};
+
+    fn io(e: std::io::Error) -> CfmlError {
+        CfmlError::application(e.to_string())
+    }
+
+    fn copy(
+        src: &Path,
+        dst: &Path,
+        recurse: bool,
+        filter: &mut Option<&mut CopyFilter<'_>>,
+    ) -> Result<(), CfmlError> {
+        std::fs::create_dir_all(dst).map_err(io)?;
+        for entry in std::fs::read_dir(src).map_err(io)? {
+            let entry = entry.map_err(io)?;
+            let from = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = from.is_dir();
+            let accepted = match filter {
+                Some(f) => f(&from, &name, is_dir)?,
+                None => true,
+            };
+            let to = dst.join(&name);
+            if is_dir {
+                if recurse {
+                    copy(&from, &to, recurse, filter)?;
+                }
+            } else if accepted && from.is_file() {
+                std::fs::copy(&from, &to).map_err(io)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `ResourceUtil.removeEmptyFolders(dir, Not(filter))`.
+    fn clear_rejected_empty(dir: &Path, filter: &mut CopyFilter<'_>) -> Result<(), CfmlError> {
+        let children = |d: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .filter(|e| e.file_name() != ".DS_Store")
+                        .map(|e| e.path())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for child in children(dir) {
+            if child.is_dir() {
+                clear_rejected_empty(&child, filter)?;
+            }
+        }
+        if children(dir).is_empty() {
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if !filter(dir, &name, true)? {
+                std::fs::remove_dir_all(dir).map_err(io)?;
+            }
+        }
+        Ok(())
+    }
+
+    if !src.exists() {
+        return Err(CfmlError::application(format!("Directory [{}] doesn't exist", src.display())));
+    }
+    if !src.is_dir() {
+        return Err(CfmlError::application(format!(
+            "File [{}] exists, but isn't a directory",
+            src.display()
+        )));
+    }
+    if destination.is_empty() {
+        return Err(CfmlError::application("Attribute [destination] is not defined".to_string()));
+    }
+    let dst = if destination.contains(['/', '\\']) {
+        PathBuf::from(destination)
+    } else {
+        src.parent().map_or_else(|| PathBuf::from(destination), |p| p.join(destination))
+    };
+    if !create_path && dst.parent().is_some_and(|p| !p.exists()) {
+        return Err(CfmlError::application(format!(
+            "parent directory for [{}] doesn't exist",
+            dst.display()
+        )));
+    }
+
+    let mut run = || -> Result<(), CfmlError> {
+        copy(src, &dst, recurse, &mut filter)?;
+        if recurse {
+            if let Some(f) = filter.as_mut() {
+                clear_rejected_empty(&dst, *f)?;
+            }
+        }
+        Ok(())
+    };
+    run().map_err(|e| CfmlError::application(e.message.clone()))
+}

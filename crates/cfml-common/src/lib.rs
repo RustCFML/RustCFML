@@ -33,3 +33,4 @@ pub mod stack_guard;
 pub mod text;
 pub mod vfs;
 pub mod vm;
+pub mod wildcard;
