@@ -686,6 +686,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_mssql_pool_stale_connection_retry.cfm" />
 <cf_runtest file="database/test_mssql_tls.cfm" />
 <cf_runtest file="database/test_mssql_batches.cfm" />
+<cf_runtest file="database/test_mysql_create_routines.cfm" />
 <cf_runtest file="tags/test_cfquery_quoted_identifier.cfm" />
 <!--- - cfquery_escaped_hash_interpolation: an escaped hash immediately --->
 <!--- followed by an interpolation inside a cfquery-body string literal --->
