@@ -243,7 +243,9 @@ backend.
 ## Working with SQL Server
 
 Microsoft SQL Server connections are **encrypted by default** — the `tiberius`
-driver negotiates TLS (via rustls) — and the server certificate is **validated**
+driver negotiates TLS 1.2 or 1.3 via rustls, the same on macOS, Linux and
+Windows ([known issue §121](known-issues.md#121): a server offering only TLS 1.0
+or 1.1 cannot be reached) — and the server certificate is **validated**
 against the platform trust store, as mssql-jdbc does since 10.2. Azure SQL
 Database and other servers with a publicly trusted certificate need no extra
 configuration:

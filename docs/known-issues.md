@@ -91,6 +91,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | § | Item | Status |
 |---|---|---|
 | [8](#8) | wasm / CLI restrictions | 🌍 |
+| [121](#121) | SQL Server needs TLS 1.2+; rustls on every platform (macOS could not connect over TLS before) | 🌍 |
 
 
 ---
@@ -4462,3 +4463,40 @@ integer `+`, `++`, `+=`, loop steps and `incrementValue` promote to double on
 overflow instead of wrapping; an integer literal past `i64` lexes as a double
 (it was `0`); `2^3^2` is left-associative (64); self-recursion is no longer
 refused at depth 256 (the 2,500-frame ceiling and the native stack guard remain).
+
+<a id="121"></a>
+
+## 121. SQL Server: TLS 1.2 or later required; one TLS stack (rustls) on every platform 🌍
+
+RustCFML's SQL Server driver (tiberius, vendored in `vendor/tiberius`) uses
+**rustls** on every platform. It used to use the operating system's TLS
+(`native-tls`): OpenSSL on Linux, SChannel on Windows, and Apple's Secure
+Transport on macOS. Secure Transport cannot complete a handshake with a stock
+SQL Server 2022: with `trustServerCertificate=true` it aborts ("connection
+closed via error"), and without it Apple rejects the server's self-generated
+certificate for its validity period. So no encrypted connection was possible
+from a Mac. rustls connects to the same server, from every platform.
+
+What that means:
+
+- **TLS 1.0 and 1.1 are not supported.** rustls speaks TLS 1.2 and 1.3 only. A
+  SQL Server that offers nothing newer than TLS 1.1 (an unpatched SQL Server
+  2008 R2–2014, or a server with TLS 1.2 disabled) cannot be reached with
+  encryption. Patch the server, or enable TLS 1.2 on it. Every supported SQL
+  Server version and Azure SQL offer TLS 1.2. The mssql-jdbc driver Lucee and
+  ACF use has also required TLS 1.2 by default since version 10.
+- **Certificates are checked by webpki**, against the platform's root store
+  (loaded by `rustls-native-certs`), or the CA file named in the connection
+  string. webpki is stricter than OpenSSL about old certificate formats. In
+  particular, it rejects X.509 v1 certificates, which is what SQL Server
+  generates for itself when no certificate is configured. Such a server needs
+  `trustServerCertificate=true`, just as it would anywhere else, since no
+  platform trusts a self-generated certificate.
+- **Behaviour is identical on macOS, Linux and Windows.** A connection that
+  works from a developer's Mac works from the Linux server it is deployed to.
+
+The vendored crate is tiberius 0.12.3, the latest release, with its rustls
+backend ported from rustls 0.21 (which carries RUSTSEC advisories) to rustls
+0.23, the version RustCFML already uses for PostgreSQL. See
+`vendor/tiberius/RUSTCFML.txt`.
+

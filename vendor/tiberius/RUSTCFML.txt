@@ -1,0 +1,24 @@
+tiberius 0.12.3, vendored by RustCFML (wired in through [patch.crates-io] in
+the workspace Cargo.toml).
+
+Why: tiberius 0.12.3 is the latest release. Its TLS backends are native-tls
+(Apple's Secure Transport on macOS, which cannot complete a handshake with a
+stock SQL Server 2022) and rustls 0.21 (tokio-rustls 0.24), which carries
+RUSTSEC advisories. RustCFML uses the rustls backend, ported to rustls 0.23.
+
+Changes from the crates.io release:
+  - src/client/tls_stream/rustls_tls_stream.rs: ported to tokio-rustls 0.26 /
+    rustls 0.23 with the aws-lc-rs provider; rustls-pemfile replaced by
+    rustls-pki-types' PEM parser; rustls-native-certs 0.8. Behaviour kept:
+    CA file, trust-all (no certificate or handshake-signature check, as
+    before — SQL Server's self-generated certificate is X.509 v1, which webpki
+    cannot parse), or native roots. A missing native root store is an error,
+    not a panic.
+  - Cargo.toml: the rustls feature's dependencies bumped to match; the
+    [[test]] targets and readme dropped (tests/, examples/, docker files and
+    the *.md files are not vendored).
+  - src/tds/codec/type_info.rs, header.rs, src/tds/numeric.rs: three
+    deprecated std items replaced, so the workspace builds without warnings.
+
+Refresh: copy a newer crates.io release over this directory and re-apply the
+above, or drop the vendoring once tiberius ships a rustls 0.23 backend.

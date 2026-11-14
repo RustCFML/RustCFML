@@ -23,8 +23,9 @@ members = [
 exclude = [
     "examples/native_module_demo/native/greeter",
     "examples/native_markdown/native/md",
-    # Vendored crate patched in below; not a workspace member.
+    # Vendored crates patched in below; not workspace members.
     "vendor/chrono-tz",
+    "vendor/tiberius",
 ]
 
 [workspace.package]
@@ -115,3 +116,9 @@ strip = false
 # without it chrono-tz falls back to the stale 2025b `src/prebuilt/` tables.
 [patch.crates-io]
 chrono-tz = { path = "vendor/chrono-tz" }
+# tiberius (SQL Server) 0.12.3, the latest release, offers native-tls — Apple's
+# Secure Transport on macOS, which cannot complete a TLS handshake with a stock
+# SQL Server 2022 — or rustls 0.21, which carries RUSTSEC advisories. The
+# vendored copy is 0.12.3 with its rustls backend ported to rustls 0.23 (the
+# version RustCFML already ships for PostgreSQL). See vendor/tiberius/RUSTCFML.txt.
+tiberius = { path = "vendor/tiberius" }
