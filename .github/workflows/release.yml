@@ -58,7 +58,13 @@ jobs:
           - os: macos-latest
             name: macos-aarch64
             ext: ""
-          - os: ubuntu-latest
+          # PINNED, not `ubuntu-latest`. A Linux binary needs the glibc of the
+          # runner that built it, and `ubuntu-latest` moved to an image with
+          # glibc 2.43: from v0.746.3 the x86_64 asset would not start on
+          # Ubuntu 24.04 (2.39) or Debian 13 (2.41) — GH #523 — while the arm
+          # build, pinned to 24.04, kept working. Both Linux targets build on
+          # 24.04, and the glibc check below fails the release if that drifts.
+          - os: ubuntu-24.04
             name: linux-x86_64
             ext: ""
           - os: ubuntu-24.04-arm
@@ -122,6 +128,21 @@ jobs:
         env:
           RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo/rustcfml.profdata ${{ matrix.extra_rustflags }}
         run: cargo build --profile release-pgo -p rustcfml-cli
+
+      # The newest glibc symbol version the binary links against must not pass
+      # the baseline (Ubuntu 24.04 LTS = 2.39), or it will not start there.
+      - name: Check the glibc baseline (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          BASELINE=GLIBC_2.39
+          NEEDS=$(objdump -T target/release-pgo/rustcfml | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "binary needs $NEEDS (baseline $BASELINE)"
+          if [ "$(printf '%s\n' "$NEEDS" "$BASELINE" | sort -V | tail -1)" != "$BASELINE" ]; then
+            echo "::error::The ${{ matrix.name }} binary needs $NEEDS, newer than $BASELINE: it will not start on Ubuntu 24.04 or Debian 13 (GH #523)."
+            objdump -T target/release-pgo/rustcfml | grep -E "$NEEDS" | head -20
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
