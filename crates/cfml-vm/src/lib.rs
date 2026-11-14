@@ -272,6 +272,11 @@ const REQUEST_TIMEOUT_ERROR_TYPE: &str = "requesttimeout";
 /// still backs it for a build whose include frames are too big for 200.
 const MAX_INCLUDE_DEPTH: u32 = 200;
 
+/// Name of the stand-in function a call-position `LoadGlobal` pushes when the
+/// callee name resolved to data (GH #516). The `__cf` prefix is reserved for
+/// engine internals, so no user function can share it.
+const NOT_A_FUNCTION_CALLEE: &str = "__cf_not_a_function";
+
 /// `CfmlValue::Custom` tag marking the `--max-memory` hard-tier abort: this
 /// request was the largest allocator when the process crossed its memory
 /// ceiling. Uncatchable for the same reason as the timeout above — a framework's
@@ -13528,6 +13533,19 @@ impl CfmlVirtualMachine {
                         ip = self.raise_expression_message(Self::msg_function_missing(name), &mut stack)?;
                         continue;
                     }
+                    // GH #516: the name resolved to DATA (a local struct
+                    // shadowing a UDF, `x = {}; x()`, `s = "str"; s()`). The
+                    // call fails, but not yet: Lucee evaluates the arguments
+                    // first and only then reports `No matching function [X]
+                    // found`. The `Call` that consumes this value sees only the
+                    // value, so swap it for a stand-in that carries the name.
+                    if matches!(op, BytecodeOp::LoadGlobal(_))
+                        && !matches!(stack.last(), Some(CfmlValue::Function(_)) | None)
+                    {
+                        if let Some(top) = stack.last_mut() {
+                            *top = Self::not_a_function_callee(name);
+                        }
+                    }
                 }
                 BytecodeOp::StoreGlobal(name) => { ops::locals::op_store_global(self, &mut stack, name); }
 
@@ -18922,6 +18940,9 @@ impl CfmlVirtualMachine {
         #[cfg(feature = "call-phases")]
         let _cp_disp = std::time::Instant::now();
         if let CfmlValue::Function(func) = func_ref {
+            if let Some(callee) = Self::not_a_function_callee_name(func) {
+                return Err(self.wrap_error(CfmlError::runtime(Self::msg_function_missing(callee))));
+            }
             // security.disallowedFunctions: enforced at the very top so the
             // user-defined fast path below can't bypass it. Checked once per
             // call; the HashSet lookup is cheap.
@@ -26022,6 +26043,36 @@ impl CfmlVirtualMachine {
         let v = Arc::new(find_arg_sources(&func.instructions, call_ip, arg_count));
         self.arg_sources_memo.insert(key, v.clone());
         v
+    }
+
+    /// Stand-in pushed by a call-position `LoadGlobal` whose name resolved to
+    /// data rather than a function (GH #516). It carries the callee's source
+    /// name in its body so the `Call` that consumes it can report Lucee's
+    /// `No matching function [X] found` after the arguments are evaluated.
+    fn not_a_function_callee(name: &str) -> CfmlValue {
+        CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+            name: NOT_A_FUNCTION_CALLEE.to_string(),
+            params: Vec::new(),
+            body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(CfmlValue::string(name))),
+            return_type: None,
+            access: cfml_common::dynamic::CfmlAccess::Public,
+            captured_scope: None,
+        }))
+    }
+
+    /// The source name carried by a [`Self::not_a_function_callee`] stand-in.
+    fn not_a_function_callee_name(func: &cfml_common::dynamic::CfmlFunction) -> Option<&str> {
+        match &func.body {
+            cfml_common::dynamic::CfmlClosureBody::Expression(body)
+                if func.name == NOT_A_FUNCTION_CALLEE =>
+            {
+                match body.as_ref() {
+                    CfmlValue::String(name) => Some(name.as_str()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn builtin_fn_value(name: &str) -> CfmlValue {

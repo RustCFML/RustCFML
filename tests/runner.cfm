@@ -1306,6 +1306,9 @@ include "harness.cfm";
 <cf_runtest file="core/test_keyword_component_path_case.cfm" />
 <cf_runtest file="core/test_page_this_autocreate.cfm" />
 
+<!--- Calling a non-function variable names it: No matching function [X] found (GH #516). --->
+<cf_runtest file="core/test_call_non_function_message.cfm" />
+
 <!--- <cfapplication> is implemented, not a "tag not implemented" 500 (GH #374). --->
 <cf_runtest file="tags/test_cfapplication_tag.cfm" />
 
