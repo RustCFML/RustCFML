@@ -6,3 +6,7 @@
 /// MySQL return them all; a driver with one result set returns it in a
 /// one-element array. Asked for by the `<cfstoredproc>` lowerings.
 pub const RESULT_SETS_RETURN_TYPE: &str = "__resultsets";
+
+/// A `<cfstoredproc>` with OUT parameters:
+/// `{ resultSets: [query, …], outputs: { variableName: value, … } }`.
+pub const PROC_RESULT_RETURN_TYPE: &str = "__procresult";

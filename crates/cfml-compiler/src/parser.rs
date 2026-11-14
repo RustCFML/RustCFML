@@ -4182,6 +4182,10 @@ impl Parser {
                     operator: AssignOp::Equal,
                     location: loc,
                 }))];
+                // OUT/INOUT procparams with a literal `variable`: their values are
+                // assigned after the call, so the names must be known here.
+                let mut out_vars: Vec<String> = Vec::new();
+                collect_proc_out_vars(&body, &mut out_vars);
                 stmts.extend(body);
 
                 // "?,?," trimmed of its trailing comma — empty when no params.
@@ -4215,50 +4219,57 @@ impl Parser {
                 if let Some(ds) = pick("datasource") {
                     opt_pairs.push((str_lit("datasource"), ds));
                 }
-                if proc_results.is_empty() {
+                let assign = |name: &str, value: Expression| Statement::Assignment(Box::new(Assignment {
+                    target: AssignTarget::Variable(name.to_string()),
+                    value,
+                    operator: AssignOp::Equal,
+                    location: loc,
+                }));
+                if proc_results.is_empty() && out_vars.is_empty() {
                     if !opt_pairs.is_empty() {
                         qe_args.push(Expression::Struct(Struct { pairs: opt_pairs, ordered: false, location: loc }));
                     }
-                    stmts.push(Statement::Assignment(Box::new(Assignment {
-                        target: AssignTarget::Variable("cfresult".to_string()),
-                        value: call("queryExecute", qe_args),
-                        operator: AssignOp::Equal,
-                        location: loc,
-                    })));
+                    stmts.push(assign("cfresult", call("queryExecute", qe_args)));
                 } else {
                     // Fetch every result set; each procresult takes the one its
                     // resultSet names. A set the procedure didn't return leaves
-                    // its variable unset.
-                    opt_pairs.push((
-                        str_lit("returnType"),
-                        str_lit(cfml_common::query_options::RESULT_SETS_RETURN_TYPE),
-                    ));
+                    // its variable unset. With OUT parameters the result is
+                    // `{ resultSets, outputs }` and each `variable` takes its
+                    // value (NULL as "").
+                    let rt = if out_vars.is_empty() {
+                        cfml_common::query_options::RESULT_SETS_RETURN_TYPE
+                    } else {
+                        cfml_common::query_options::PROC_RESULT_RETURN_TYPE
+                    };
+                    opt_pairs.push((str_lit("returnType"), str_lit(rt)));
                     qe_args.push(Expression::Struct(Struct { pairs: opt_pairs, ordered: false, location: loc }));
-                    stmts.push(Statement::Assignment(Box::new(Assignment {
-                        target: AssignTarget::Variable(crate::tag_parser::PROC_RESULT_SETS_VAR.to_string()),
-                        value: call("queryExecute", qe_args),
-                        operator: AssignOp::Equal,
-                        location: loc,
-                    })));
-                    // A driver without multi-set support may hand back one query, and a
-                    // procedure that returns no result set yields the mutation struct.
-                    let rs_or_empty = Expression::Ternary(Box::new(Ternary {
-                        condition: Box::new(call("isQuery", vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)])),
-                        then_expr: Box::new(Expression::Array(Array { elements: vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)], location: loc })),
-                        else_expr: Box::new(Expression::Array(Array { elements: vec![], location: loc })),
-                        location: loc,
-                    }));
-                    stmts.push(Statement::Assignment(Box::new(Assignment {
-                        target: AssignTarget::Variable(crate::tag_parser::PROC_RESULT_SETS_VAR.to_string()),
-                        value: Expression::Ternary(Box::new(Ternary {
+                    if out_vars.is_empty() {
+                        stmts.push(assign(crate::tag_parser::PROC_RESULT_SETS_VAR, call("queryExecute", qe_args)));
+                    } else {
+                        stmts.push(assign(crate::tag_parser::PROC_RESULT_VAR, call("queryExecute", qe_args)));
+                        stmts.push(assign(crate::tag_parser::PROC_RESULT_SETS_VAR, Expression::MemberAccess(Box::new(MemberAccess {
+                            object: Box::new(ident(crate::tag_parser::PROC_RESULT_VAR)),
+                            member: "resultSets".to_string(),
+                            null_safe: false,
+                            location: loc,
+                        }))));
+                    }
+                    if !proc_results.is_empty() {
+                        // A driver without multi-set support may hand back one query, and a
+                        // procedure that returns no result set yields the mutation struct.
+                        let rs_or_empty = Expression::Ternary(Box::new(Ternary {
+                            condition: Box::new(call("isQuery", vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)])),
+                            then_expr: Box::new(Expression::Array(Array { elements: vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)], location: loc })),
+                            else_expr: Box::new(Expression::Array(Array { elements: vec![], location: loc })),
+                            location: loc,
+                        }));
+                        stmts.push(assign(crate::tag_parser::PROC_RESULT_SETS_VAR, Expression::Ternary(Box::new(Ternary {
                             condition: Box::new(call("isArray", vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)])),
                             then_expr: Box::new(ident(crate::tag_parser::PROC_RESULT_SETS_VAR)),
                             else_expr: Box::new(rs_or_empty),
                             location: loc,
-                        })),
-                        operator: AssignOp::Equal,
-                        location: loc,
-                    })));
+                        }))));
+                    }
                     for (name, set) in proc_results {
                         let rs = ident(crate::tag_parser::PROC_RESULT_SETS_VAR);
                         stmts.push(Statement::If(Box::new(If {
@@ -4268,20 +4279,41 @@ impl Parser {
                                 right: Box::new(set.clone()),
                                 location: loc,
                             })),
-                            then_branch: vec![Statement::Assignment(Box::new(Assignment {
-                                target: AssignTarget::Variable(name),
-                                value: Expression::ArrayAccess(Box::new(ArrayAccess {
-                                    array: Box::new(rs),
-                                    index: Box::new(set),
-                                    location: loc,
-                                })),
-                                operator: AssignOp::Equal,
+                            then_branch: vec![assign(&name, Expression::ArrayAccess(Box::new(ArrayAccess {
+                                array: Box::new(rs),
+                                index: Box::new(set),
                                 location: loc,
-                            }))],
+                            })))],
                             else_if: vec![],
                             else_branch: None,
                             location: loc,
                         })));
+                    }
+                    for v in &out_vars {
+                        let value = Expression::Elvis(Box::new(Elvis {
+                            left: Box::new(Expression::ArrayAccess(Box::new(ArrayAccess {
+                                array: Box::new(Expression::MemberAccess(Box::new(MemberAccess {
+                                    object: Box::new(ident(crate::tag_parser::PROC_RESULT_VAR)),
+                                    member: "outputs".to_string(),
+                                    null_safe: false,
+                                    location: loc,
+                                }))),
+                                index: Box::new(str_lit(v)),
+                                location: loc,
+                            }))),
+                            right: Box::new(str_lit("")),
+                            location: loc,
+                        }));
+                        // A dotted or scoped `variable` (`local.x`) goes through
+                        // setVariable; a plain name is an ordinary assignment.
+                        stmts.push(if v.contains('.') {
+                            Statement::Expression(ExpressionStatement {
+                                expr: call("setVariable", vec![str_lit(v), value]),
+                                location: loc,
+                            })
+                        } else {
+                            assign(v, value)
+                        });
                     }
                 }
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
@@ -8252,6 +8284,43 @@ impl TryFrom<CfmlNode> for Statement {
         match node {
             CfmlNode::Statement(s) => Ok(s),
             _ => Err(()),
+        }
+    }
+}
+
+/// The `variable` of each OUT/INOUT `procparam` in a script `storedproc` body,
+/// read from the `arrayAppend(__cfproc_params, { … })` it lowers to. Only a
+/// literal `type` and `variable` count: the variable is an assignment target.
+fn collect_proc_out_vars(stmts: &[Statement], out: &mut Vec<String>) {
+    let literal = |e: &Expression| match e {
+        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+        _ => None,
+    };
+    for st in stmts {
+        match st {
+            Statement::Expression(ExpressionStatement { expr: Expression::FunctionCall(fc), .. }) => {
+                let is_append = matches!(&*fc.name, Expression::Identifier(Identifier { name, .. }) if name.eq_ignore_ascii_case("arrayAppend"));
+                let to_params = matches!(fc.arguments.first(), Some(Expression::Identifier(Identifier { name, .. })) if name == "__cfproc_params");
+                if let (true, true, Some(Expression::Struct(st))) = (is_append, to_params, fc.arguments.get(1)) {
+                    let get = |key: &str| st.pairs.iter().find(|(k, _)| literal(k).is_some_and(|k| k.eq_ignore_ascii_case(key))).and_then(|(_, v)| literal(v));
+                    let mode = get("type").unwrap_or_default().to_ascii_lowercase();
+                    if mode == "out" || mode == "inout" {
+                        if let Some(v) = get("variable").filter(|v| !v.is_empty()) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+            Statement::If(i) => {
+                collect_proc_out_vars(&i.then_branch, out);
+                for e in &i.else_if {
+                    collect_proc_out_vars(&e.body, out);
+                }
+                if let Some(b) = &i.else_branch {
+                    collect_proc_out_vars(b, out);
+                }
+            }
+            _ => {}
         }
     }
 }
