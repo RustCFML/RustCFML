@@ -54,12 +54,12 @@ use ego_tree::{NodeId, NodeRef};
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::{
     BufferQueue, CharacterTokens, EndTag, NullCharacterToken, ParseError, Tag,
-    TagToken, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts, TokenizerResult,
+    TagToken, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
 use html5ever::tree_builder::{
-    ElementFlags, NextParserState, NodeOrText, QuirksMode, TreeBuilder, TreeBuilderOpts, TreeSink,
+    ElementFlags, NodeOrText, QuirksMode, TreeBuilder, TreeBuilderOpts, TreeSink,
 };
-use html5ever::{ns, namespace_url, Attribute, LocalName, QualName};
+use html5ever::{ns, Attribute, LocalName, QualName, TokenizerResult};
 use scraper::{Html, HtmlTreeSink, Node};
 
 // ---------------------------------------------------------------------------
@@ -222,7 +222,7 @@ fn tag(name: &str) -> TagInfo {
 /// (`ParseSettings.htmlDefault`), including the SVG names html5ever re-cases
 /// (`viewBox`, `foreignObject`).
 fn tag_name(name: &QualName) -> String {
-    name.local.as_ref().to_ascii_lowercase()
+    (&*name.local).to_ascii_lowercase()
 }
 
 /// `true` when this unknown-to-jsoup tag name marks a self-closing element.
@@ -409,7 +409,7 @@ fn preserve_whitespace(node: Option<NodeRef<Node>>) -> bool {
 fn attribute(accum: &mut String, name: &QualName, value: &str, valueless: bool, out: &OutputSettings) {
     let key = match &name.prefix {
         Some(p) => format!("{}:{}", p, name.local).to_ascii_lowercase(),
-        None => name.local.as_ref().to_ascii_lowercase(),
+        None => (&*name.local).to_ascii_lowercase(),
     };
     accum.push_str(&key);
     let collapse = (valueless && value.is_empty())
@@ -444,7 +444,7 @@ fn element_head(accum: &mut String, node: &NodeRef<Node>, depth: usize, ctx: &Ct
     let valueless = ctx.meta.valueless.get(&node.id());
     for (k, v) in e.attrs.iter() {
         accum.push(' ');
-        let bare = valueless.is_some_and(|set| set.contains(&k.local.as_ref().to_ascii_lowercase()));
+        let bare = valueless.is_some_and(|set| set.contains(&(&*k.local).to_ascii_lowercase()));
         attribute(accum, k, v, bare, out);
     }
     if !node.has_children() && is_self_closing(node, &name, ctx) {
@@ -658,7 +658,7 @@ impl TreeSink for JsoupSink {
         let pending = self.st.pending.borrow();
         let matched = pending.as_ref().filter(|(p, _, _)| *p == name.local);
         let html_ns = name.ns == ns!(html);
-        let unknown = !is_known(&name.local.as_ref().to_ascii_lowercase());
+        let unknown = !is_known(&(&*name.local).to_ascii_lowercase());
         let local = name.local.clone();
         let id = self.inner.create_element(name, attrs, flags);
         if html_ns && &*local == "html" && self.st.html.get().is_none() {
@@ -764,9 +764,6 @@ impl TreeSink for JsoupSink {
     fn set_current_line(&self, line_number: u64) {
         self.inner.set_current_line(line_number)
     }
-    fn complete_script(&self, node: &NodeId) -> NextParserState {
-        self.inner.complete_script(node)
-    }
 }
 
 /// The token stream between html5ever's tokenizer and tree builder: marks
@@ -813,7 +810,13 @@ impl TokenSink for JsoupTokens {
         match self.st.created.take() {
             Some((_, true)) if closable => {
                 self.st.epoch.set(self.st.epoch.get() + 1);
-                let end = Tag { kind: EndTag, name, self_closing: false, attrs: Vec::new() };
+                let end = Tag {
+                    kind: EndTag,
+                    name,
+                    self_closing: false,
+                    attrs: Vec::new(),
+                    had_duplicate_attributes: false,
+                };
                 self.tb.process_token(TagToken(end), line_number)
             }
             _ => result,
@@ -857,7 +860,7 @@ impl ParseState {
     /// implied, or text html5ever reached differently) — the cursor stays put.
     fn find_tag(&self, name: &LocalName, end: bool) -> Option<HashSet<String>> {
         let src = self.source.as_bytes();
-        let name = name.as_ref().as_bytes();
+        let name = AsRef::<str>::as_ref(name).as_bytes();
         let open: &[u8] = if end { b"</" } else { b"<" };
         let mut i = self.cursor.get();
         while i + open.len() + name.len() <= src.len() {

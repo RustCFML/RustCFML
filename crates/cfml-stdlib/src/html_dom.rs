@@ -45,7 +45,7 @@ use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 
 use crate::html_jsoup::{self, Charset, EscapeMode, JsoupMeta, OutputSettings};
 use ego_tree::NodeId;
-use html5ever::{namespace_url, ns, LocalName, QualName};
+use html5ever::{ns, LocalName, QualName};
 use scraper::{Html, Node, Selector};
 
 pub struct CfmlHtmlDocument {
@@ -271,7 +271,7 @@ impl CfmlHtmlDocument {
             let id = Self::resolve_in(dom, handle)?;
             if let Some(mut node) = dom.tree.get_mut(id) {
                 if let Node::Element(el) = node.value() {
-                    el.attrs.retain(|k, _| k.local.as_ref() != lower);
+                    el.attrs.retain(|k, _| (&*k.local) != lower);
                 }
             }
             Ok(())

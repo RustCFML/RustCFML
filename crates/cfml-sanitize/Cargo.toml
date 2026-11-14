@@ -21,7 +21,7 @@ publish = false
 # applying a policy. Without it `attrs` is a `Vec` and the code does not
 # compile. It was reaching this crate only by feature unification with
 # cfml-stdlib's `html`, so a build that did not enable that feature broke.
-scraper = { version = "0.22", features = ["deterministic"] }
-ego-tree = "0.10"
+scraper = { version = "0.29", features = ["deterministic"] }
+ego-tree = "0.11"
 quick-xml = "0.41"
 regex = "1"

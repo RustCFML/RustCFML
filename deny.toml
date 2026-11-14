@@ -66,7 +66,6 @@ yanked = "warn"
 ignore = [
     # Unmaintained, no known vulnerability. Tracked for replacement.
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; cluster wire format, replace when convenient" },
-    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; no vulnerability" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time macro only" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; no vulnerability" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; no vulnerability" },

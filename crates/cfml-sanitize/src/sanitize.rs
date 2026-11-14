@@ -155,7 +155,7 @@ pub fn sanitize(html: &str, policy: &Policy) -> Result<String, SanitizeError> {
                 let key = el
                     .attrs
                     .keys()
-                    .find(|k| k.local.as_ref().eq_ignore_ascii_case(&name))
+                    .find(|k| (&*k.local).eq_ignore_ascii_case(&name))
                     .cloned();
                 let Some(key) = key else { continue };
                 match replacement {

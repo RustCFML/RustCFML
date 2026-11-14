@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 602 crate(s)
+  MIT License (MIT) — 593 crate(s)
   Apache License 2.0 (Apache-2.0) — 47 crate(s)
   Unicode License v3 (Unicode-3.0) — 20 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -140,13 +140,14 @@ Dependencies
 [ISC]
   libloading 0.8.9 — https://github.com/nagisa/rust_libloading/
 [ISC]
-  ego-tree 0.10.0 — https://github.com/rust-scraper/ego-tree
+  scraper 0.29.0 — https://github.com/rust-scraper/scraper
+[ISC]
+  ego-tree 0.11.1 — https://github.com/rust-scraper/ego-tree
 [ISC]
   rustls-webpki 0.103.16 — https://github.com/rustls/webpki
 [ISC]
   aws-lc-rs 1.18.2 — https://github.com/aws/aws-lc-rs
   aws-lc-sys 0.46.0 — https://github.com/aws/aws-lc-rs
-  scraper 0.22.0 — https://github.com/causal-agent/scraper
 [MIT]
   blowfish 0.9.1 — https://github.com/RustCrypto/block-ciphers
 [MIT]
@@ -162,7 +163,7 @@ Dependencies
   core-foundation-sys 0.8.7 — https://github.com/servo/core-foundation-rs
   core-foundation 0.10.1 — https://github.com/servo/core-foundation-rs
   euclid 0.22.14 — https://github.com/servo/euclid
-  string_cache 0.8.9 — https://github.com/servo/string-cache
+  string_cache 0.11.0 — https://github.com/servo/string-cache
 [MIT]
   hex 0.4.3 — https://github.com/KokaKiwi/rust-hex
 [MIT]
@@ -215,8 +216,9 @@ Dependencies
 [MIT]
   uuid 1.29.0 — https://github.com/uuid-rs/uuid
 [MIT]
-  html5ever 0.29.1 — https://github.com/servo/html5ever
-  markup5ever 0.14.1 — https://github.com/servo/html5ever
+  html5ever 0.40.1 — https://github.com/servo/html5ever
+  markup5ever 0.40.0 — https://github.com/servo/html5ever
+  web_atoms 0.3.0 — https://github.com/servo/html5ever
 [MIT]
   libsqlite3-sys 0.39.1 — https://github.com/rusqlite/rusqlite
   rusqlite 0.41.1 — https://github.com/rusqlite/rusqlite
@@ -237,8 +239,7 @@ Dependencies
 [MIT]
   new_debug_unreachable 1.0.6 — https://github.com/mbrubeck/rust-debug-unreachable
 [MIT]
-  futf 0.1.5 — https://github.com/servo/futf
-  tendril 0.4.3 — https://github.com/servo/tendril
+  tendril 0.5.1 — https://github.com/servo/html5ever
 [MIT]
   among 0.1.8 — https://github.com/al8n/among
   atomic-time 0.2.1 — https://github.com/al8n/atomic-time
@@ -762,12 +763,9 @@ Dependencies
   derivit-core 0.1.5 — https://github.com/al8n/derivit
   engineioxide-core 0.2.2 — https://github.com/totodore/socketioxide
   engineioxide 0.17.7 — https://github.com/totodore/socketioxide
-  fxhash 0.2.1 — https://github.com/cbreeden/fxhash
   hexane 0.2.1 — https://github.com/automerge/automerge
   jsonschema-regex 0.46.10 — https://github.com/Stranger6667/jsonschema
   libm 0.2.16 — https://github.com/rust-lang/compiler-builtins
-  mac 0.1.1 — https://github.com/reem/rust-mac.git
-  match_token 0.1.0 — https://github.com/servo/html5ever
   mysql-common-derive 0.32.2 — https://github.com/blackbeam/rust_mysql_common
   nodecraft 0.9.1 — https://github.com/al8n/nodecraft.git
   num-cmp 0.1.0 — https://github.com/lifthrasiir/num-cmp
@@ -880,7 +878,7 @@ Dependencies
   serde_json 1.0.154 — https://github.com/serde-rs/json
   serde_path_to_error 0.1.20 — https://github.com/dtolnay/path-to-error
   serde_yaml 0.9.34+deprecated — https://github.com/dtolnay/serde-yaml
-  servo_arc 0.4.3 — https://github.com/servo/stylo
+  servo_arc 0.5.0 — https://github.com/servo/stylo
   smol_str 0.3.7 — https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str
   syn 1.0.109 — https://github.com/dtolnay/syn
   syn 2.0.119 — https://github.com/dtolnay/syn
@@ -892,7 +890,6 @@ Dependencies
   typed-path 0.13.0 — https://github.com/chipsenkbeil/typed-path
   unicode-ident 1.0.27 — https://github.com/dtolnay/unicode-ident
   unsafe-libyaml 0.2.11 — https://github.com/dtolnay/unsafe-libyaml
-  utf-8 0.7.6 — https://github.com/SimonSapin/rust-utf8
   zmij 1.0.23 — https://github.com/dtolnay/zmij
 [MIT]
   allocator-api2 0.2.21 — https://github.com/zakarumych/allocator-api2
@@ -919,17 +916,13 @@ Dependencies
 [MIT]
   scheduled-thread-pool 0.2.7 — https://github.com/sfackler/scheduled-thread-pool
 [MIT]
-  phf 0.11.3 — https://github.com/rust-phf/rust-phf
   phf 0.12.1 — https://github.com/rust-phf/rust-phf
   phf 0.13.1 — https://github.com/rust-phf/rust-phf
   phf 0.14.0 — https://github.com/rust-phf/rust-phf
-  phf_generator 0.11.3 — https://github.com/rust-phf/rust-phf
   phf_generator 0.13.1 — https://github.com/rust-phf/rust-phf
   phf_generator 0.14.0 — https://github.com/rust-phf/rust-phf
-  phf_macros 0.11.3 — https://github.com/rust-phf/rust-phf
   phf_macros 0.13.1 — https://github.com/rust-phf/rust-phf
   phf_macros 0.14.0 — https://github.com/rust-phf/rust-phf
-  phf_shared 0.11.3 — https://github.com/rust-phf/rust-phf
   phf_shared 0.12.1 — https://github.com/rust-phf/rust-phf
   phf_shared 0.13.1 — https://github.com/rust-phf/rust-phf
   phf_shared 0.14.0 — https://github.com/rust-phf/rust-phf
@@ -966,7 +959,6 @@ Dependencies
   aws-lc-sys 0.46.0 — https://github.com/aws/aws-lc-rs
 [MIT]
   derive_more-impl 2.1.1 — https://github.com/JelteF/derive_more
-  derive_more 0.99.20 — https://github.com/JelteF/derive_more
   derive_more 2.1.1 — https://github.com/JelteF/derive_more
 [MIT]
   calamine 0.38.0 — https://github.com/tafia/calamine
@@ -1043,14 +1035,14 @@ Dependencies
 [MPL-2.0]
   dtoa-short 0.3.5 — https://github.com/upsuper/dtoa-short
 [MPL-2.0]
-  cssparser-macros 0.6.1 — https://github.com/servo/rust-cssparser
-  cssparser 0.34.0 — https://github.com/servo/rust-cssparser
+  cssparser-macros 0.7.1 — https://github.com/servo/rust-cssparser
+  cssparser 0.38.0 — https://github.com/servo/rust-cssparser
 [MPL-2.0]
   memberlist-core 0.8.5 — https://github.com/al8n/memberlist
   memberlist-net 0.8.5 — https://github.com/al8n/memberlist
   memberlist-proto 0.3.4 — https://github.com/al8n/memberlist
   memberlist 0.8.5 — https://github.com/al8n/memberlist
-  selectors 0.26.0 — https://github.com/servo/stylo
+  selectors 0.41.0 — https://github.com/servo/stylo
 [Unicode-3.0]
   unicode-ident 1.0.27 — https://github.com/dtolnay/unicode-ident
   unicode-normalization 0.1.26 — https://github.com/unicode-rs/unicode-normalization
@@ -4166,10 +4158,34 @@ THIS SOFTWARE.
 ISC License (ISC)
 
 Applies to:
-  - ego-tree 0.10.0
+  - scraper 0.29.0
 ================================================================================
 
 Copyright © 2016, June McEnroe <june@causal.agency>
+Copyright © 2017, Vivek Kushwaha <yoursvivek@gmail.com>
+Copyright © 2024-2025, rust-scraper Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+ISC License (ISC)
+
+Applies to:
+  - ego-tree 0.11.1
+================================================================================
+
+Copyright © 2016, June McEnroe <june@causal.agency>
+Copyright © 2024-2025, rust-scraper Contributors
 
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted, provided that the above
@@ -4216,7 +4232,6 @@ ISC License (ISC)
 Applies to:
   - aws-lc-rs 1.18.2
   - aws-lc-sys 0.46.0
-  - scraper 0.22.0
 ================================================================================
 
 ISC License:
@@ -4367,7 +4382,7 @@ Applies to:
   - core-foundation-sys 0.8.7
   - core-foundation 0.10.1
   - euclid 0.22.14
-  - string_cache 0.8.9
+  - string_cache 0.11.0
 ================================================================================
 
 Copyright (c) 2012-2013 Mozilla Foundation
@@ -4810,8 +4825,9 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - html5ever 0.29.1
-  - markup5ever 0.14.1
+  - html5ever 0.40.1
+  - markup5ever 0.40.0
+  - web_atoms 0.3.0
 ================================================================================
 
 Copyright (c) 2014 The html5ever Project Developers
@@ -5090,8 +5106,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - futf 0.1.5
-  - tendril 0.4.3
+  - tendril 0.5.1
 ================================================================================
 
 Copyright (c) 2015 Keegan McAllister
@@ -11174,12 +11189,9 @@ Applies to:
   - derivit-core 0.1.5
   - engineioxide-core 0.2.2
   - engineioxide 0.17.7
-  - fxhash 0.2.1
   - hexane 0.2.1
   - jsonschema-regex 0.46.10
   - libm 0.2.16
-  - mac 0.1.1
-  - match_token 0.1.0
   - mysql-common-derive 0.32.2
   - nodecraft 0.9.1
   - num-cmp 0.1.0
@@ -11678,7 +11690,7 @@ Applies to:
   - serde_json 1.0.154
   - serde_path_to_error 0.1.20
   - serde_yaml 0.9.34+deprecated
-  - servo_arc 0.4.3
+  - servo_arc 0.5.0
   - smol_str 0.3.7
   - syn 1.0.109
   - syn 2.0.119
@@ -11690,7 +11702,6 @@ Applies to:
   - typed-path 0.13.0
   - unicode-ident 1.0.27
   - unsafe-libyaml 0.2.11
-  - utf-8 0.7.6
   - zmij 1.0.23
 ================================================================================
 
@@ -12022,17 +12033,13 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - phf 0.11.3
   - phf 0.12.1
   - phf 0.13.1
   - phf 0.14.0
-  - phf_generator 0.11.3
   - phf_generator 0.13.1
   - phf_generator 0.14.0
-  - phf_macros 0.11.3
   - phf_macros 0.13.1
   - phf_macros 0.14.0
-  - phf_shared 0.11.3
   - phf_shared 0.12.1
   - phf_shared 0.13.1
   - phf_shared 0.14.0
@@ -12423,7 +12430,6 @@ MIT License (MIT)
 
 Applies to:
   - derive_more-impl 2.1.1
-  - derive_more 0.99.20
   - derive_more 2.1.1
 ================================================================================
 
@@ -13706,8 +13712,8 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 Mozilla Public License 2.0 (MPL-2.0)
 
 Applies to:
-  - cssparser-macros 0.6.1
-  - cssparser 0.34.0
+  - cssparser-macros 0.7.1
+  - cssparser 0.38.0
 ================================================================================
 
 Mozilla Public License Version 2.0
@@ -14092,7 +14098,7 @@ Applies to:
   - memberlist-net 0.8.5
   - memberlist-proto 0.3.4
   - memberlist 0.8.5
-  - selectors 0.26.0
+  - selectors 0.41.0
 ================================================================================
 
 Mozilla Public License Version 2.0
