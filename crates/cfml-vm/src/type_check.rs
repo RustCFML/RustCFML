@@ -20,8 +20,10 @@
 //!    `double`, `decimal`, `long`, `short`, `byte`, `char`, `email`,
 //!    `creditcard`, `url`, `base64`, `usdate`, `eurodate`, `hex`, `path`,
 //!    `node`, `closure`, `lambda` and `udf` all fall in this bucket:
-//!    `function f( integer i )` throws on `f( 5 )`, and `f( email e )` throws
-//!    on `f( "a@b.com" )`. Lucee contradicts its own `isValid( "integer", 5 )`
+//!    `function f( integer i )` throws on `f( 5 )` there, and `f( email e )`
+//!    throws on `f( "a@b.com" )`. RustCFML's one deliberate superset:
+//!    `integer`/`int` ARGUMENTS accept whole numbers, as Adobe ColdFusion does
+//!    (GH #524; `Target::Integer`). Lucee contradicts its own `isValid( "integer", 5 )`
 //!    here, but it is the reference and mirroring it is deliberate — see the
 //!    v0.557.0 type-enforcement work. (Nothing is lost by mirroring: on
 //!    Lucee such a call is unconditionally fatal, so no Lucee-tested app can
@@ -57,8 +59,15 @@ pub enum Target<'a> {
     Void,
     /// `T[]` — an array whose every element satisfies `T`.
     TypedArray(&'a str),
+    /// `integer` / `int` in ARGUMENT position: a whole number, as Adobe
+    /// ColdFusion accepts (GH #524). Lucee has no cast target for it and
+    /// rejects every value; a Lucee app cannot reach such a call, so
+    /// accepting whole numbers breaks nothing and lets Adobe code run. In
+    /// return position it stays a component path (rejects everything), as on
+    /// both Lucee and Adobe — see [`Target::for_return`].
+    Integer,
     /// Anything else: resolved as a component/interface name. Rejects every
-    /// non-instance value, which is what makes `integer`/`email`/… always throw.
+    /// non-instance value, which is what makes `email`/`float`/… always throw.
     ComponentPath,
 }
 
@@ -98,7 +107,35 @@ pub fn resolve<'a>(declared: &'a str) -> Target<'a> {
         b"variablename" => Target::VariableName,
         b"component" | b"object" => Target::AnyComponent,
         b"void" => Target::Void,
+        b"integer" | b"int" => Target::Integer,
         _ => Target::ComponentPath,
+    }
+}
+
+impl Target<'_> {
+    /// The target in RETURN position: `integer` rejects every value there, on
+    /// Lucee and on Adobe ColdFusion alike, so only arguments accept it.
+    pub fn for_return(self) -> Self {
+        match self {
+            Target::Integer => Target::ComponentPath,
+            t => t,
+        }
+    }
+}
+
+/// A whole number, as Adobe ColdFusion's `integer` argument type takes it: an
+/// integer, a float with no fraction, or a string of optionally signed digits
+/// (`"5"`, not `"5.0"`). Booleans and everything else are not.
+fn is_whole_number(value: &CfmlValue) -> bool {
+    match value {
+        CfmlValue::Int(_) => true,
+        CfmlValue::Double(d) => d.is_finite() && d.fract() == 0.0,
+        CfmlValue::String(s) => {
+            let t = s.as_str();
+            let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
     }
 }
 
@@ -132,7 +169,7 @@ pub fn return_type_label(declared: &str) -> String {
         Target::AnyComponent => declared.trim().to_ascii_lowercase(),
         Target::Void => "void".to_string(),
         // `string[]`, `pkg.Widget`, `integer`, … — as written.
-        Target::TypedArray(_) | Target::ComponentPath => declared.trim().to_string(),
+        Target::TypedArray(_) | Target::ComponentPath | Target::Integer => declared.trim().to_string(),
     }
 }
 
@@ -425,6 +462,7 @@ pub fn satisfies_target(value: &CfmlValue, target: Target<'_>, declared: &str, e
             }),
             _ => false,
         },
+        Target::Integer => is_whole_number(value),
         Target::ComponentPath => (env.satisfies_component)(value, declared.trim()),
     }
 }

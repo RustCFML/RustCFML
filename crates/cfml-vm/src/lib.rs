@@ -28653,7 +28653,7 @@ impl CfmlVirtualMachine {
         if matches!(value, CfmlValue::Null) {
             return Ok(value);
         }
-        let target = type_check::resolve(declared);
+        let target = type_check::resolve(declared).for_return();
         if matches!(target, type_check::Target::Any) {
             return Ok(value);
         }

@@ -147,11 +147,20 @@ assert( "any accepts an array", argAny( [] ), "ok" );
 // ------------------------------------------ type names with no cast target
 // Lucee resolves these as component paths, so they reject EVERY value —
 // including values that are plainly of that type. Mirrored deliberately.
+// `integer` is the one exception RustCFML makes: its ARGUMENTS accept whole
+// numbers, as Adobe ColdFusion's do (GH #524, test_fn_integer_argument_adobe.cfm).
+// Lucee still rejects every value, so these two run on Lucee only.
 function argInteger( integer i ) { return "ok"; }
-assertTrue( "integer rejects an integer (Lucee has no integer cast target)",
-    typeFailure( function(){ return argInteger( 5 ); } ) contains "Cannot cast Object type [Number] to a value of type [integer]" );
-assertTrue( "integer rejects an integral string",
-    typeFailure( function(){ return argInteger( "5" ); } ) contains "Cannot cast String [5] to a value of type [integer]" );
+if ( !isRustCFML() ) {
+    assertTrue( "integer rejects an integer (Lucee has no integer cast target)",
+        typeFailure( function(){ return argInteger( 5 ); } ) contains "Cannot cast Object type [Number] to a value of type [integer]" );
+    assertTrue( "integer rejects an integral string",
+        typeFailure( function(){ return argInteger( "5" ); } ) contains "Cannot cast String [5] to a value of type [integer]" );
+}
+// In return position `integer` rejects every value on both engines (and on Adobe).
+function retInteger() returntype="integer" { return 5; }
+assertTrue( "returntype integer rejects a whole number",
+    typeFailure( function(){ return retInteger(); } ) contains "integer" );
 function argFloat( float f ) { return "ok"; }
 assertTrue( "float rejects a float",
     typeFailure( function(){ return argFloat( 1.5 ); } ) contains "to a value of type [float]" );
