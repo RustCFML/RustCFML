@@ -28,15 +28,8 @@ if ( !len( rsDsn ) ) {
     queryExecute( "CREATE PROCEDURE #rsSets#(IN n INT) BEGIN SELECT n AS a, 'x' AS b; SELECT 1 AS c UNION ALL SELECT 2; SELECT 'none' AS e FROM DUAL WHERE 1 = 0; END", [], { datasource: rsDsn } );
     queryExecute( "CREATE PROCEDURE #rsNone#() BEGIN DO 1; END", [], { datasource: rsDsn } );
     try {
-</cfscript>
-<cfstoredproc procedure="#rsSets#" datasource="#rsDsn#">
-    <cfprocparam cfsqltype="cf_sql_integer" value="7">
-    <cfprocresult name="tagSecond" resultSet="2">
-    <cfprocresult name="tagFirst">
-    <cfprocresult name="tagThird" resultSet="3">
-    <cfprocresult name="tagMissing" resultSet="4">
-</cfstoredproc>
-<cfscript>
+        rsOne = 1;
+        include "_cfstoredproc_result_sets_tags.cfm";
         assert("tag: resultSet 1 by default", tagFirst.columnList, "A,B");
         assert("tag: resultSet 1 value", tagFirst.a, 7);
         assert("tag: resultSet 2 is the second SELECT", tagSecond.columnList, "C");
@@ -54,14 +47,6 @@ if ( !len( rsDsn ) ) {
         assert("script: resultSet 2", scriptSecond.recordCount, 2);
 
         // maxRows caps the rows kept; -1 is no limit (Lucee).
-        rsOne = 1;
-</cfscript>
-<cfstoredproc procedure="#rsSets#" datasource="#rsDsn#">
-    <cfprocparam cfsqltype="cf_sql_integer" value="7">
-    <cfprocresult name="tagCapped" resultSet="2" maxRows="#rsOne#">
-    <cfprocresult name="tagUncapped" resultSet="2" maxRows="-1">
-</cfstoredproc>
-<cfscript>
         assert("tag: maxRows caps a result set", tagCapped.recordCount, 1);
         assert("tag: maxRows keeps the first rows", tagCapped.c, 1);
         assert("tag: maxRows=-1 is no limit", tagUncapped.recordCount, 2);
@@ -77,12 +62,6 @@ if ( !len( rsDsn ) ) {
         }
         assert("script: maxRows=0 keeps no rows", scriptNone.recordCount, 0);
         assert("script: maxRows=0 keeps the columns", scriptNone.columnList, "C");
-</cfscript>
-<cfstoredproc procedure="#rsSets#" datasource="#rsDsn#">
-    <cfprocparam cfsqltype="cf_sql_integer" value="7">
-    <cfprocresult name="tagNone" resultSet="2" maxRows="0">
-</cfstoredproc>
-<cfscript>
         assert("tag: maxRows=0 keeps no rows", tagNone.recordCount, 0);
         assert("tag: maxRows=0 keeps the columns", tagNone.columnList, "C");
 
