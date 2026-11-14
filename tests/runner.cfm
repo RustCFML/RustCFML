@@ -357,6 +357,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_encrypt_lucee_vectors.cfm" />
 <cf_runtest file="stdlib/test_password_hashing.cfm" />
 <cf_runtest file="stdlib/test_xml.cfm" />
+<cf_runtest file="stdlib/test_xmlparse_char_refs.cfm" />
 <cf_runtest file="stdlib/test_nesting_limits.cfm" rustcfmlOnly="true" why="Lucee has no fixed JSON/XML depth limit (it runs until the JVM stack overflows), so inputs just over RustCFML's 512/1024 limits do not throw there" />
 <cf_runtest file="stdlib/test_utility.cfm" />
 <cf_runtest file="stdlib/test_encoding_functions.cfm" />

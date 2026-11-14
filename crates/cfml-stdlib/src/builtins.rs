@@ -19242,7 +19242,12 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 let mut attrs = ValueMap::default();
                 for attr in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                    let val = String::from_utf8_lossy(&attr.value).to_string();
+                    // Entity and character references are decoded, as in
+                    // element text (`t="a &amp; b"` reads `a & b`) (GH #519).
+                    let val = attr
+                        .unescape_value()
+                        .map(|v| v.into_owned())
+                        .map_err(|err| CfmlError::runtime(format!("XML parse error: {}", err)))?;
                     attrs.insert(key, CfmlValue::string(val));
                 }
                 element.insert("xmlAttributes".to_string(), CfmlValue::strukt(attrs));
@@ -19272,7 +19277,12 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 let mut attrs = ValueMap::default();
                 for attr in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-                    let val = String::from_utf8_lossy(&attr.value).to_string();
+                    // Entity and character references are decoded, as in
+                    // element text (`t="a &amp; b"` reads `a & b`) (GH #519).
+                    let val = attr
+                        .unescape_value()
+                        .map(|v| v.into_owned())
+                        .map_err(|err| CfmlError::runtime(format!("XML parse error: {}", err)))?;
                     attrs.insert(key, CfmlValue::string(val));
                 }
                 element.insert("xmlAttributes".to_string(), CfmlValue::strukt(attrs));
@@ -19306,9 +19316,21 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 let entity_name = e.decode()
                     .map(|cow| cow.into_owned())
                     .unwrap_or_else(|_| String::new());
-                
+
+                // A character reference (`&#220;`, `&#xDC;`) arrives as a
+                // GeneralRef named `#220` / `#xDC`; it is the character itself,
+                // as XML 1.0 and Lucee have it (GH #519). One that names no
+                // valid character is a well-formedness error, as on Lucee.
+                let char_ref = match e.resolve_char_ref() {
+                    Ok(c) => c.map(String::from),
+                    Err(err) => {
+                        return Err(CfmlError::runtime(format!("XML parse error: {}", err)));
+                    }
+                };
+
                 // Resolve standard XML entities
                 let resolved = match entity_name.as_str() {
+                    _ if char_ref.is_some() => char_ref.as_deref().unwrap_or_default(),
                     "amp" => "&",
                     "lt" => "<",
                     "gt" => ">",
