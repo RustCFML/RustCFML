@@ -1268,14 +1268,30 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // the head of the loop body's scope cascade) — the same
                 // row-into-variables merge `<cfoutput query>` and the grouped
                 // form already do (docs known-issues §13, GitHub PR #318).
+                //
+                // The pseudo-columns resolve too: a bare `currentRow` /
+                // `recordCount` / `columnList` in the body is the looped
+                // query's, as on Lucee (`queryGetRow( q, currentRow )`). They
+                // are set in `variables` for the body and put back as they were
+                // when the loop ends however it ends (a `finally`, so `return`
+                // and `break` restore too): on Lucee they come from the scope
+                // cascade, so a variable of the same name is untouched after
+                // the loop, and none is left defined.
+                let saved = format!("__cfloopq_sv_{}", start);
+                let key = format!("__cfloopq_k_{}", start);
+                const PSEUDO: &str = "[\"currentRow\", \"recordCount\", \"columnList\"]";
                 (
                     format!(
-                        "{window}for (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\nstructAppend(variables, queryGetRow({q}, {i}), true);\n{query} = {q};\n{body}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
+                        "{window}var {saved} = {{}};\nfor (var {key} in {pseudo}) {{ if (structKeyExists(variables, {key})) {{ {saved}[{key}] = variables[{key}]; }} }}\ntry {{\nfor (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\nstructAppend(variables, queryGetRow({q}, {i}), true);\nvariables.currentRow = {i};\nvariables.recordCount = {rc};\nvariables.columnList = {q}.columnlist;\n{query} = {q};\n{body}\n}}\n}} finally {{\nfor (var {key} in {pseudo}) {{ if (structKeyExists({saved}, {key})) {{ variables[{key}] = {saved}[{key}]; }} else {{ structDelete(variables, {key}); }} }}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
                         window = window,
+                        saved = saved,
+                        key = key,
+                        pseudo = PSEUDO,
                         q = q,
                         sr = sr,
                         er = er,
                         i = i,
+                        rc = rc,
                         query = query,
                         body = body_script,
                     ),

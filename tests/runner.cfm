@@ -1206,6 +1206,7 @@ include "harness.cfm";
 <!--- control. Runtime-level (catchable), runner-safe. Reduced from the titan --->
 <!--- (Moopa) codebase port. --->
 <cf_runtest file="tags/test_cfloop_query_bare_column.cfm" />
+<cf_runtest file="tags/test_cfloop_query_pseudo_columns.cfm" />
 <cf_runtest file="tags/test_tags_cfexit_loop.cfm" />
 <cf_runtest file="tags/test_cfcookie_attributecollection.cfm" />
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm" />
