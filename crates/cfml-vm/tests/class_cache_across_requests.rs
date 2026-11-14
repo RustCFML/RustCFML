@@ -220,3 +220,126 @@ fn dev_mode_sees_a_child_edit_on_the_next_request() {
 
     let _ = std::fs::remove_dir_all(&fx.dir);
 }
+
+// ---------------------------------------------------------------------------
+// GH #515: a parent's `__`-prefixed methods after a CHILD edit.
+//
+// The method-table code treated every `__`-prefixed function as an engine
+// entry (`__cfc_body__`, `__cfc_static_init__`) and left it out of the class
+// tables. A first construction never noticed: the body's own map entries
+// carried such methods. But once the child is edited, its chain generation
+// changes and it is rebuilt from scratch against a parent REPLAYED from the
+// cross-request cache — and a replayed parent defines no per-instance method
+// entries, so `__setupThing` was in neither its map nor its tables:
+// "No matching function [__SETUPTHING] found" until restart. Preside's
+// Config.cfc (`__setupEnvironmentVariables()`) hit it on every fwreinit after
+// the site's Config.cfc was edited.
+// ---------------------------------------------------------------------------
+
+const UNDERSCORE_BASE: &str = "component { \
+   public void function configure() { __setupThing(); setupOther(); } \
+   private void function __setupThing() { variables.thing = \"ok\"; } \
+   private void function setupOther() { variables.other = \"ok\"; } \
+   private string function __tag() { return \"base-tag\"; } \
+   public string function getThing() { \
+     return ( variables.thing ?: \"unset\" ) & \"/\" & ( variables.other ?: \"unset\" ); \
+   } \
+ }";
+
+/// The issue's shape: the child only reaches the parent's `__` methods through
+/// inherited code and an unqualified inherited call — no `super.__x()`, which
+/// has its own test below.
+fn underscore_child(marker: &str) -> String {
+    format!(
+        "component extends=\"pkg.UsBase\" {{ \
+           public void function configure() {{ super.configure(); }} \
+           public string function tag() {{ return \"{marker}:\" & __tag(); }} \
+         }}"
+    )
+}
+
+const UNDERSCORE_PAGE: &str = r#"<cfscript>
+try {
+    c = new pkg.UsChild();
+    c.configure();
+    writeOutput( "OK " & c.getThing() & " " & c.tag() );
+} catch ( any e ) {
+    writeOutput( "FAIL " & e.message );
+}
+</cfscript>"#;
+
+fn underscore_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "rustcfml_class_cache_us_{}_{}_{:?}",
+        tag,
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let pkg = dir.join("pkg");
+    std::fs::create_dir_all(&pkg).expect("mkdir");
+    write(&pkg.join("UsBase.cfc"), UNDERSCORE_BASE);
+    let child = pkg.join("UsChild.cfc");
+    write(&child, &underscore_child("v1"));
+    let page = dir.join("index.cfm");
+    std::fs::write(&page, b"").expect("page");
+    (dir, child, page.to_string_lossy().to_string())
+}
+
+#[test]
+fn parent_underscore_methods_survive_a_child_edit_gh515() {
+    let (dir, child, page) = underscore_fixture("child_edit");
+    let ss = ServerState::with_production(false);
+
+    let v1 = "OK ok/ok v1:base-tag";
+    assert_eq!(v1, run_request(&ss, &page, UNDERSCORE_PAGE), "first request");
+    assert_eq!(v1, run_request(&ss, &page, UNDERSCORE_PAGE), "second request (replayed)");
+
+    // Edit ONLY the child. The parent is unchanged, so it replays from the
+    // cross-request cache while the child is rebuilt against it.
+    write(&child, &underscore_child("v2"));
+    let v2 = "OK ok/ok v2:base-tag";
+    assert_eq!(
+        v2,
+        run_request(&ss, &page, UNDERSCORE_PAGE),
+        "the parent's __-prefixed private methods still resolve after a child edit"
+    );
+    assert_eq!(v2, run_request(&ss, &page, UNDERSCORE_PAGE), "and on the request after");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn parent_underscore_methods_resolve_on_replay_in_production_gh515() {
+    let (dir, _child, page) = underscore_fixture("production");
+    let ss = ServerState::with_production(true);
+
+    let v1 = "OK ok/ok v1:base-tag";
+    for n in 1..=3 {
+        assert_eq!(v1, run_request(&ss, &page, UNDERSCORE_PAGE), "request {n}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same `__` rule kept the parent's `__` methods out of `__super`, so
+/// `super.__x()` returned an empty string even on the very first construction.
+#[test]
+fn super_reaches_a_parents_underscore_method_gh515() {
+    let (dir, child, page) = underscore_fixture("super");
+    write(
+        &child,
+        "component extends=\"pkg.UsBase\" { \
+           public string function viaSuper() { return \"super:\" & super.__tag(); } \
+         }",
+    );
+    let ss = ServerState::with_production(false);
+    let page_src = r#"<cfscript>
+try { writeOutput( new pkg.UsChild().viaSuper() ); }
+catch ( any e ) { writeOutput( "FAIL " & e.message ); }
+</cfscript>"#;
+    for n in 1..=2 {
+        assert_eq!("super:base-tag", run_request(&ss, &page, page_src), "request {n}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

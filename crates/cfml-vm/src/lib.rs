@@ -5306,6 +5306,23 @@ struct IncludeHandoff {
     params: Vec<(cfml_common::key::Key, CfmlValue)>,
 }
 
+/// A function the ENGINE stores in a component's scopes: the template frames
+/// codegen synthesises (`__main__`, `__cfc_body__`, `__cfc_static_init__` — the
+/// same set as `is_template_frame` in `cfml-codegen`). These never belong in a
+/// class's method tables, `__super`, or the hoisted method set.
+///
+/// A `__` PREFIX is not this test. A user may name a method `__setup()` —
+/// Preside's `Config.cfc` calls `__setupEnvironmentVariables()` — and the
+/// method-table code used to drop every such method. A first construction still
+/// worked (the body's own map entries carried them), but a class that REPLAYS
+/// from its tables (a parent adopted from the cross-request class cache while an
+/// edited child is rebuilt) had them in neither map nor table (GH #515).
+fn is_engine_function_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("__main__")
+        || name.eq_ignore_ascii_case("__cfc_body__")
+        || name.eq_ignore_ascii_case("__cfc_static_init__")
+}
+
 /// A name the compiler synthesises for a frame's own bookkeeping.
 fn is_frame_temp(name: &str) -> bool {
     const PREFIXES: [&str; 8] = [
@@ -38755,14 +38772,15 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Collect a scope struct's user-method entries (non-`__`, `Function`-valued)
-    /// into a `ValueMap` for the shared class table. Values are the canonicalised
-    /// shared `Arc<CfmlFunction>`s (see `canonicalize_method_arcs`), so the table
-    /// holds one `Arc` per method for the whole class.
+    /// Collect a scope struct's user-method entries (`Function`-valued, not an
+    /// engine template frame — see `is_engine_function_name`) into a `ValueMap`
+    /// for the shared class table. Values are the canonicalised shared
+    /// `Arc<CfmlFunction>`s (see `canonicalize_method_arcs`), so the table holds
+    /// one `Arc` per method for the whole class.
     fn collect_scope_methods(sc: &CfmlStruct) -> cfml_common::dynamic::ValueMap {
         let mut m = cfml_common::dynamic::ValueMap::default();
         for (k, v) in sc.iter() {
-            if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+            if matches!(v, CfmlValue::Function(_)) && !is_engine_function_name(&k) {
                 m.insert(k, v);
             }
         }
@@ -38770,11 +38788,13 @@ impl CfmlVirtualMachine {
     }
 
     /// Remove a scope struct's user-method entries in place (they move to the
-    /// shared table). Keeps `__`-prefixed function entries (e.g.
-    /// `__cfc_static_init__`) and all data.
+    /// shared table). Keeps engine function entries (e.g. `__cfc_static_init__`)
+    /// and all data.
     fn strip_scope_methods(sc: &CfmlStruct) {
         sc.with_write(|m| {
-            m.retain(|k, v| !(matches!(v, CfmlValue::Function(_)) && !k.starts_with("__")));
+            m.retain(|k, v| {
+                !(matches!(v, CfmlValue::Function(_)) && !is_engine_function_name(k.as_str()))
+            });
         });
     }
 
@@ -40308,7 +40328,7 @@ impl CfmlVirtualMachine {
                         .iter()
                         .filter(|bf| {
                             bf.is_component_method
-                                && !bf.name.starts_with("__")
+                                && !is_engine_function_name(&bf.name)
                                 && bf
                                     .source_file
                                     .as_deref()
@@ -41994,7 +42014,7 @@ impl CfmlVirtualMachine {
         // Collect parent methods for __super
         let mut super_methods = ValueMap::default();
         for (k, v) in parent_map.iter() {
-            if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+            if matches!(v, CfmlValue::Function(_)) && !is_engine_function_name(k.as_str()) {
                 super_methods.insert(k.clone(), v.clone());
             }
         }
@@ -42124,7 +42144,7 @@ impl CfmlVirtualMachine {
             parent_map.insert(k.clone(), v.clone());
             // Also update __variables when child overrides a method, so
             // unqualified calls within CFC methods resolve to the override
-            if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+            if matches!(v, CfmlValue::Function(_)) && !is_engine_function_name(k.as_str()) {
                 if let Some(vars) = parent_map.get_mut(&*cfml_common::key::well_known::VARIABLES).and_then(|v| v.as_cfml_struct()) {
                     // A plain insert overwrites a same-cased entry in place. Only
                     // a DIFFERENTLY-cased ancestor entry needs removing first (so
@@ -44685,7 +44705,7 @@ impl CfmlVirtualMachine {
         let body_vars = {
             let mut method_table: ValueMap = parent_vars.unwrap_or_default();
             for bf in self.program.functions.iter() {
-                if !bf.is_component_method || bf.name.starts_with("__") {
+                if !bf.is_component_method || is_engine_function_name(&bf.name) {
                     continue;
                 }
                 let cf = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
@@ -44963,7 +44983,7 @@ impl CfmlVirtualMachine {
             let methods: Vec<(String, CfmlValue)> = app_struct.with_read(|m| {
                 m.iter()
                     .filter_map(|(k, v)| {
-                        if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+                        if matches!(v, CfmlValue::Function(_)) && !is_engine_function_name(k.as_str()) {
                             Some((k.clone(), v.clone()))
                         } else {
                             None
