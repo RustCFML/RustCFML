@@ -26,10 +26,33 @@ assertTrue( "stream().toByteArray() is binary", isBinary( binary ) );
 assert( "and is the requested format", ucase( left( binaryEncode( binary, "hex" ), 8 ) ), "47494638" );
 assert( "at the requested size", imageInfo( imageNew( binary ) ).width, 125 );
 
-// A QR symbol is square, so a non-square request cannot be honoured as asked;
-// the smaller edge wins, keeping the code inside the box the caller reserved.
+// ZXing's QRCodeWriter renders exactly width x height: the square symbol is
+// centred, the rest is white padding (GH #518).
 oblong = qrCode.from( "x" ).to( imageTypes.PNG ).withSize( 200, 80 ).stream().toByteArray();
-assert( "a non-square request uses the smaller edge", imageInfo( imageNew( oblong ) ).width, 80 );
+assert( "a non-square request keeps its width", imageInfo( imageNew( oblong ) ).width, 200 );
+assert( "and its height", imageInfo( imageNew( oblong ) ).height, 80 );
+
+// GH #518: the same BYTES as QRGen 2.2.0 / ZXing 3.2.1 on the JVM. Every MD5
+// below was captured from the real jars on Lucee 7.1 (Java ImageIO's GIF
+// writer). The first two are Preside's own QrCodeGeneratorTest fixtures
+// (helloWorldDefaults.gif, helloWorld300x300.gif). A different EC default
+// (it used to be M; ZXing's is L), a different mask choice, stretching rather
+// than padding, or a different GIF encoder each changes these.
+function qrgenMd5( text, w, h, ec = "", cs = "" ) {
+	var q = qrCode.from( arguments.text ).to( imageTypes.GIF ).withSize( arguments.w, arguments.h );
+	if ( len( arguments.ec ) ) q = q.withErrorCorrection( arguments.ec );
+	if ( len( arguments.cs ) ) q = q.withCharset( arguments.cs );
+	return lcase( hash( q.stream().toByteArray(), "MD5" ) );
+}
+otp = "otpauth://totp/Preside:sysadmin?secret=GEZDGNBVGY3TQOJQ&issuer=Preside";
+assert( "hello world 125x125 is Preside's helloWorldDefaults.gif", qrgenMd5( "hello world", 125, 125 ), "aaafbfc299e51284c8554b0e38a58679" );
+assert( "hello world 300x300 is Preside's helloWorld300x300.gif",  qrgenMd5( "hello world", 300, 300 ), "39bfda8fe3f14635bb2ca63b4f76f47a" );
+assert( "a non-square request is padded, as ZXing pads it",       qrgenMd5( "hello world", 201, 150 ), "155558deb91ad55b001215374ca7ea2a" );
+assert( "a TOTP enrolment URL (byte mode, version 4)",            qrgenMd5( otp, 125, 125 ),           "77bf85f6b3266430fd7faa48b9c1d1ec" );
+assert( "withErrorCorrection( H ) at an uneven size",             qrgenMd5( otp, 250, 250, "H" ),      "f293e71fce0fcbb2f07b9527364eb2e4" );
+assert( "withCharset( UTF-8 ) writes an ECI header",              qrgenMd5( "café", 125, 125, "", "UTF-8" ), "c11891cc0060a579de71f9ad83b3238d" );
+assert( "alphanumeric mode at an odd size",                       qrgenMd5( "HELLO WORLD", 157, 157 ), "9da013a4f99872ae11459a445cf8a54f" );
+assert( "numeric mode, smaller than the symbol: grows to fit",    qrgenMd5( "0123456789012345", 10, 10 ), "f43e8c444ed8e138e00f339a4b0c4a0c" );
 
 // The builder must not compute early, and must not leak between chains.
 b1 = qrCode.from( "one" ).to( imageTypes.PNG ).withSize( 100, 100 ).stream().toByteArray();

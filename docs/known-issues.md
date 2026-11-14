@@ -1569,10 +1569,11 @@ fragments (`<table><tbody><tr>…`) before parsing, as Preside's
 
 | Behaviour | Note |
 |---|---|
-| `QRCode.…withSize( w, h )` with `w != h` | A QR symbol is square. The **smaller** edge is used, so the code stays inside the box the caller reserved for it, rather than being stretched into something a scanner may reject. |
+| Output | Matches QRGen 2.2.0 / ZXing 3.2.1 (GH #518): the same module grid (EC default **L**, ZXing's single-mode/version/mask choice), the same layout (`withSize( w, h )` gives exactly w × h, whole-pixel modules centred with white padding, never stretched), and for **GIF the same bytes** as Java ImageIO. **PNG** (and the other formats) match **pixel for pixel but not byte for byte**: Java's PNG writer deflates with the JVM's zlib at level 4 and its own row-filter heuristic, which depends on the zlib build the JVM links, so byte equality is not a stable target. |
 | `QRCode.…stream()` | Returns a stream whose `toByteArray()` is a **Binary**, not the signed-byte array `java.io.ByteArrayOutputStream`'s shim yields. Both answers are needed elsewhere — the array form is what `String.getBytes()` and the TOTP path rely on — so QRGen's stream is its own type instead of either being made wrong. |
 | `QRCode.…file()` | **Refused**: it writes to a JVM temp `File`. Use `.stream().toByteArray()` and `fileWrite()`. |
-| `QRCode.…withCharset()` / `withHint()` | Accepted and ignored. The encoder emits UTF-8, which is QRGen's own default and what scanners expect. |
+| `QRCode.…withCharset()` | Honoured for ISO-8859-1 (the default, no ECI; characters outside it become `?`, as on the JVM), UTF-8 (with an ECI header, as ZXing writes) and US-ASCII. Other charsets are refused. |
+| `QRCode.…withHint()` | Accepted and ignored: hints need `com.google.zxing.EncodeHintType`, which is not shimmed. |
 | `PNGTranscoder` / `JPEGTranscoder` / `TIFFTranscoder` | Supported. `KEY_WIDTH`/`KEY_HEIGHT` (and the `KEY_MAX_*` forms, treated as a target when no exact size is set) are honoured; other hints are recorded and ignored. |
 | `transcode()` | **File to file.** `TranscoderInput` takes a `file:` URI or path, `TranscoderOutput` must wrap a `java.io.FileOutputStream` — the adapter goes through the image builtins, which need paths. A non-file output raises `TranscoderException`. |
 

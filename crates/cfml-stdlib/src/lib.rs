@@ -5,6 +5,8 @@ pub mod dates;
 pub mod file_handles;
 #[cfg(feature = "image_support")]
 pub mod image;
+#[cfg(feature = "image_support")]
+pub mod qr_zxing;
 #[cfg(feature = "spreadsheet")]
 pub mod spreadsheet;
 #[cfg(feature = "xml")]

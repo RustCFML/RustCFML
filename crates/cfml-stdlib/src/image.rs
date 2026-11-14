@@ -2111,30 +2111,36 @@ pub fn fn_image_read_svg(args: Vec<CfmlValue>) -> CfmlResult {
     .into_value())
 }
 
-/// `qrCodeGenerate( text [, size [, format [, errorCorrection [, quietZone ]]]] )`
+/// `qrCodeGenerate( text [, size [, format [, errorCorrection [, quietZone [, charset [, height ]]]]]] )`
 /// → the encoded image as a **Binary**.
 ///
 /// CFML has no QR primitive, so applications reach for a jar —
-/// `net.glxn.qrgen`, in Preside's case, which uses it to render the enrolment
-/// code an authenticator app scans during two-factor setup. This is that
-/// capability natively; the qrgen shim is a thin adapter over it.
+/// `net.glxn.qrgen` (QRGen 2.2.0 over ZXing 3.2.1), in Preside's case, which
+/// uses it to render the enrolment code an authenticator app scans during
+/// two-factor setup. This is that capability natively, and it draws what that
+/// jar draws (GH #518): the same module grid and the same pixels, and for GIF
+/// the same bytes. The qrgen shim is a thin adapter over it. See `qr_zxing`.
 ///
-/// * `size` (default 125) is the target edge length in **pixels**, and the
-///   result is square. The module grid rarely divides the requested size
-///   exactly, so the grid is drawn at the largest whole-pixel scale that fits
-///   and then nearest-neighbour resized to hit `size` on the nose — scaling a QR
-///   code with a smoothing filter blurs the module edges and can make it
-///   unreadable, which is the one thing this must not do.
+/// * `size` (default 125) is the image width in **pixels**; `height` defaults
+///   to it. As in ZXing, each module is a whole number of pixels — the largest
+///   that fits the symbol plus its quiet zone — and the symbol is centred, the
+///   leftover space being white padding. Nothing is stretched. A size smaller
+///   than the bare symbol plus quiet zone yields that minimum instead.
 /// * `format` (default "png") is any format the image BIFs write: png, gif, jpg,
-///   bmp, webp. Preside asks for gif.
-/// * `errorCorrection` is L, M (default), Q or H — the proportion of the symbol
-///   that can be damaged and still decode. The default matches the qrgen /
-///   ZXing default.
-/// * `quietZone` (default 4) is the mandatory light margin, in modules. The QR
-///   spec requires 4; scanners rely on it, so it is only reducible deliberately.
+///   bmp, webp. Preside asks for gif, which is written exactly as Java ImageIO
+///   writes it; the other formats match pixel for pixel, not byte for byte.
+/// * `errorCorrection` is L (default — ZXing's `QRCodeWriter` default), M, Q or
+///   H: the proportion of the symbol that can be damaged and still decode.
+/// * `quietZone` (default 4) is the light margin, in modules — ZXing's `MARGIN`
+///   hint. The QR spec requires 4; scanners rely on it.
+/// * `charset` is the byte-mode encoding: ISO-8859-1 (ZXing's default, no ECI)
+///   or UTF-8 (written with an ECI header, as ZXing does). Left empty, text that
+///   ISO-8859-1 can represent uses it — ZXing's own result — and anything else
+///   uses UTF-8 rather than ZXing's lossy `?` substitution.
 pub fn fn_qr_code_generate(args: Vec<CfmlValue>) -> CfmlResult {
+    use crate::qr_zxing;
     use image::{Rgb, RgbImage};
-    use qrcode::{EcLevel, QrCode};
+    use qrcode::EcLevel;
 
     let text = args.first().map(|v| v.as_string()).unwrap_or_default();
     if text.is_empty() {
@@ -2142,76 +2148,59 @@ pub fn fn_qr_code_generate(args: Vec<CfmlValue>) -> CfmlResult {
             "qrCodeGenerate: text is required — an empty QR code encodes nothing".to_string(),
         ));
     }
-    let num = |i: usize, default: i64| -> i64 {
+    let str_arg = |i: usize| -> String {
         match args.get(i) {
-            Some(CfmlValue::Null) | None => default,
-            Some(v) => {
-                let s = v.as_string();
-                if s.trim().is_empty() { default } else { s.trim().parse().unwrap_or(default) }
-            }
+            Some(CfmlValue::Null) | None => String::new(),
+            Some(v) => v.as_string().trim().to_string(),
         }
     };
-    let size = num(1, 125).clamp(16, 4096) as u32;
-    let format_name = match args.get(2) {
-        Some(CfmlValue::Null) | None => "png".to_string(),
-        Some(v) => {
-            let s = v.as_string();
-            if s.trim().is_empty() { "png".to_string() } else { s }
-        }
+    let num = |i: usize, default: i64| -> i64 {
+        let s = str_arg(i);
+        if s.is_empty() { default } else { s.parse().unwrap_or(default) }
+    };
+    let width = num(1, 125).clamp(0, 4096) as u32;
+    let height = num(6, width as i64).clamp(0, 4096) as u32;
+    let format_name = match str_arg(2) {
+        s if s.is_empty() => "png".to_string(),
+        s => s,
     };
     let format = format_from_name(&format_name)?;
-    let ec = match args
-        .get(3)
-        .map(|v| v.as_string().trim().to_ascii_uppercase())
-        .unwrap_or_default()
-        .as_str()
-    {
-        "L" => EcLevel::L,
+    let ec = match str_arg(3).to_ascii_uppercase().as_str() {
+        "" | "L" => EcLevel::L,
+        "M" => EcLevel::M,
         "Q" => EcLevel::Q,
         "H" => EcLevel::H,
-        // "" and "M" alike: the qrgen/ZXing default.
-        _ => EcLevel::M,
+        other => {
+            return Err(CfmlError::runtime(format!(
+                "qrCodeGenerate: errorCorrection must be L, M, Q or H, not [{}]",
+                other
+            )))
+        }
     };
-    let quiet = num(4, 4).clamp(0, 32) as u32;
+    let quiet = num(4, qr_zxing::DEFAULT_QUIET_ZONE as i64).clamp(0, 32) as u32;
+    let charset = match str_arg(5) {
+        s if !s.is_empty() => s,
+        _ if text.chars().all(|c| (c as u32) < 0x100) => qr_zxing::DEFAULT_CHARSET.to_string(),
+        _ => "UTF-8".to_string(),
+    };
 
-    let code = QrCode::with_error_correction_level(text.as_bytes(), ec).map_err(|e| {
+    let symbol = qr_zxing::encode(&text, ec, Some(&charset)).map_err(|e| {
         CfmlError::runtime(format!(
-            "qrCodeGenerate: cannot encode this text as a QR code: {}. The most likely cause              is that it is too long for the chosen error-correction level — try \"L\".",
+            "qrCodeGenerate: cannot encode this text as a QR code: {}. The most likely cause \
+             is that it is too long for the chosen error-correction level — try \"L\".",
             e
         ))
     })?;
+    let (w, h, dark) = qr_zxing::render(&symbol, width, height, quiet);
 
-    let modules = code.width() as u32;
-    let grid = modules + quiet * 2;
-    // Largest whole-pixel module that still fits inside the requested size, so
-    // the grid stays crisp; at least 1 so a tiny `size` still produces a symbol.
-    let scale = (size / grid).max(1);
-    let drawn = grid * scale;
-
-    let colors = code.to_colors();
-    let mut img = RgbImage::from_pixel(drawn, drawn, Rgb([255, 255, 255]));
-    for (i, c) in colors.iter().enumerate() {
-        if *c != qrcode::Color::Dark {
-            continue;
-        }
-        let mx = (i as u32) % modules;
-        let my = (i as u32) / modules;
-        let x0 = (mx + quiet) * scale;
-        let y0 = (my + quiet) * scale;
-        for y in y0..y0 + scale {
-            for x in x0..x0 + scale {
-                img.put_pixel(x, y, Rgb([0, 0, 0]));
-            }
-        }
+    if format == ImageFormat::Gif {
+        return Ok(CfmlValue::binary(qr_zxing::encode_gif_bilevel(w, h, &dark)));
     }
-
-    let mut dynamic = image::DynamicImage::ImageRgb8(img);
-    if drawn != size {
-        // Nearest, never a smoothing filter — see the doc note.
-        dynamic = dynamic.resize_exact(size, size, image::imageops::FilterType::Nearest);
-    }
-
-    let encoded = CfmlImage::new(dynamic, String::new(), format).encode(format, None)?;
+    let img = RgbImage::from_fn(w, h, |x, y| {
+        if dark[(y * w + x) as usize] { Rgb([0, 0, 0]) } else { Rgb([255, 255, 255]) }
+    });
+    let encoded = CfmlImage::new(image::DynamicImage::ImageRgb8(img), String::new(), format)
+        .encode(format, None)?;
     Ok(CfmlValue::binary(encoded))
 }
 

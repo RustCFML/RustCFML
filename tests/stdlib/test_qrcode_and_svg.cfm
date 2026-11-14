@@ -41,6 +41,29 @@ assertTrue( "the error-correction level changes the symbol"
           , hash( binaryEncode( qrCodeGenerate( otpUrl, 125, "png", "L" ), "hex" ) )
             != hash( binaryEncode( qrCodeGenerate( otpUrl, 125, "png", "H" ), "hex" ) ) );
 
+// GH #518: qrCodeGenerate draws what QRGen 2.2.0 / ZXing 3.2.1 draws — the
+// same module grid (ZXing's EC default L, its mode/version/mask choice), the
+// same layout (whole-pixel modules, centred, padded rather than stretched) and,
+// for GIF, the same bytes as Java ImageIO. Each MD5 was captured from the real
+// jars on Lucee 7.1; "hello world" at 125 is Preside's helloWorldDefaults.gif.
+function qrMd5( bin ) { return lcase( hash( arguments.bin, "MD5" ) ); }
+assert( "defaults match ZXing (EC L): Preside's helloWorldDefaults.gif"
+      , qrMd5( qrCodeGenerate( "hello world", 125, "gif" ) ), "aaafbfc299e51284c8554b0e38a58679" );
+assert( "300px is Preside's helloWorld300x300.gif"
+      , qrMd5( qrCodeGenerate( "hello world", 300, "gif" ) ), "39bfda8fe3f14635bb2ca63b4f76f47a" );
+assert( "an explicit M matches ZXing's M"
+      , qrMd5( qrCodeGenerate( "hello world", 125, "gif", "M" ) ), "b7c877a1b5c8e9977981da63a08f0e77" );
+assert( "the TOTP URL, Q, 300 wide by 200 high (the height argument)"
+      , qrMd5( qrCodeGenerate( otpUrl, 300, "gif", "Q", "", "", 200 ) ), "f7a88bfecceb23dffa25dcc26bef7644" );
+assert( "Latin-1 text encodes as ISO-8859-1, as ZXing's default does"
+      , qrMd5( qrCodeGenerate( "café", 125, "gif" ) ), "9f9bec0fe28830524ea2330db0bdd41b" );
+assert( "text beyond Latin-1 encodes as UTF-8 with an ECI header (ZXing with CHARACTER_SET=UTF-8)"
+      , qrMd5( qrCodeGenerate( "snowman ☃", 125, "gif" ) ), "1fea19b8ac9d681869ee9a208e28a71d" );
+hw = imageNew( qrCodeGenerate( "hello world", 201, "png", "", "", "", 150 ) );
+assert( "a png honours width", imageInfo( hw ).width, 201 );
+assert( "and height", imageInfo( hw ).height, 150 );
+assertThrows( "an unknown error-correction level is refused", function(){ qrCodeGenerate( "x", 100, "png", "Z" ); } );
+
 assertThrows( "empty text is refused", function(){ qrCodeGenerate( "" ); } );
 assertThrows( "an unknown format is refused", function(){ qrCodeGenerate( "x", 100, "xcf" ); } );
 

@@ -142,9 +142,9 @@ pub fn dispatch(
                 CfmlValue::string(args.first().map(|v| v.as_string()).unwrap_or_default()),
             )],
         )),
-        // withSize( width, height ). A QR symbol is square, so a non-square
-        // request cannot be honoured as asked; the SMALLER edge is used, which
-        // keeps the code inside the box the caller reserved for it.
+        // withSize( width, height ). The image is exactly width × height, as
+        // ZXing's QRCodeWriter renders it: the square symbol is centred and the
+        // rest is white padding.
         "withsize" => {
             let n = |i: usize| -> i64 {
                 args.get(i)
@@ -152,8 +152,13 @@ pub fn dispatch(
                     .unwrap_or(0)
             };
             let (w, h) = (n(0), n(1));
-            let edge = if h > 0 { w.min(h) } else { w };
-            Ok(refine(object, &[("__size", CfmlValue::Int(edge))]))
+            if w < 0 || h < 0 {
+                return Err(CfmlError::new(
+                    format!("Requested dimensions are too small: {}x{}", w, h),
+                    CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
+                ));
+            }
+            Ok(refine(object, &[("__width", CfmlValue::Int(w)), ("__height", CfmlValue::Int(h))]))
         }
         "witherrorcorrection" => Ok(refine(
             object,
@@ -162,10 +167,18 @@ pub fn dispatch(
                 CfmlValue::string(args.first().map(|v| v.as_string()).unwrap_or_default()),
             )],
         )),
-        // Charset only affects how the text is turned into bytes; the builtin
-        // encodes UTF-8, which is what QRGen defaults to and what scanners
-        // expect. Accepted and ignored (docs/known-issues.md).
-        "withcharset" | "withhint" | "withhints" => Ok(object.clone()),
+        // The byte-mode charset (ZXing's CHARACTER_SET hint). Without one,
+        // ZXing encodes ISO-8859-1 — see `stream`.
+        "withcharset" => Ok(refine(
+            object,
+            &[(
+                "__charset",
+                CfmlValue::string(args.first().map(|v| v.as_string()).unwrap_or_default()),
+            )],
+        )),
+        // Arbitrary hints need com.google.zxing.EncodeHintType, which is not
+        // shimmed. Accepted and ignored (docs/known-issues.md).
+        "withhint" | "withhints" => Ok(object.clone()),
         // The one call that actually generates. Returns a populated
         // ByteArrayOutputStream, because `.toByteArray()` is what comes next.
         "stream" | "file" => {
@@ -181,14 +194,26 @@ pub fn dispatch(
                 .filter(|f| !f.is_empty())
                 // QRGen's own default.
                 .unwrap_or_else(|| "png".to_string());
-            let size = get(object, "__size").unwrap_or(CfmlValue::Int(125));
+            // QRGen's defaults: 125 × 125, and ZXing's error correction (L),
+            // quiet zone (4) and byte encoding (ISO-8859-1, which writes `?`
+            // for a character it cannot represent — kept, since that is what
+            // the jar produces).
+            let width = get(object, "__width").unwrap_or(CfmlValue::Int(125));
+            let height = get(object, "__height").unwrap_or(CfmlValue::Int(125));
             let ec = get(object, "__ec").unwrap_or(CfmlValue::Null);
+            let charset = get(object, "__charset")
+                .map(|v| v.as_string())
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| "ISO-8859-1".to_string());
 
             let binary = generate(vec![
                 CfmlValue::string(text),
-                size,
+                width,
                 CfmlValue::string(format),
                 ec,
+                CfmlValue::Null,
+                CfmlValue::string(charset),
+                height,
             ])?;
 
             if method == "file" {
