@@ -12883,6 +12883,17 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
                         trust_cert = !(v.eq_ignore_ascii_case("false") || v == "0");
                     }
                     "encrypt" if v.eq_ignore_ascii_case("strict") => trust_cert = false,
+                    // A named instance without a port (from a translated
+                    // `jdbc:sqlserver://host\\INSTANCE` URL): its port comes
+                    // from the SQL Browser service, which this driver does not
+                    // query. Refuse, rather than reach the default instance.
+                    "instancename" if !v.is_empty() => {
+                        return Err(CfmlError::database(format!(
+                            "SQL Server named instance [{v}] needs a port: RustCFML cannot look \
+                             instance ports up through the SQL Browser service. Give the \
+                             instance's port, e.g. jdbc:sqlserver://{host}\\{v}:<port>"
+                        )));
+                    }
                     _ => {}
                 }
             }

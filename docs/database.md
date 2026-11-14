@@ -271,6 +271,18 @@ queryExecute("select 1", [], { datasource =
 > self-signed server need `trustServerCertificate=true` added when upgrading.
 > `encrypt=strict` is still accepted and still validates.
 
+JDBC connection strings from Lucee/ACF/BoxLang datasources work as declared —
+both `jdbc:sqlserver://host:1433;databaseName=db;…` and jTDS's
+`jdbc:jtds:sqlserver://host:1433/db;…` — with the datasource's `username` /
+`password`. `databaseName`, `encrypt` and `trustServerCertificate` carry over;
+other JDBC properties (timeouts, `applicationIntent`, …) are ignored. A jTDS
+URL keeps jTDS's encryption defaults: no `ssl` (or `ssl=request`) encrypts the
+login only, `ssl=require` encrypts without checking the certificate, and
+`ssl=authenticate` validates it. A named instance needs its port
+(`host\SQLEXPRESS:1500`): without one, the JDBC driver asks the SQL Browser
+service for it, which RustCFML does not, so the connection is refused with
+that explanation rather than reaching the server's default instance.
+
 Credentials in the URL are percent-decoded, like MySQL and PostgreSQL URLs, so
 a password containing `@`, `:`, `/`, `?`, `#` or `%` must be percent-encoded
 (`p%40ss`). A datasource declared with separate `username` / `password` keys in

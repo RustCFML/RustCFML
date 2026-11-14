@@ -686,6 +686,103 @@ fn with_url_credentials(url: &str, creds: &str) -> String {
     format!("{}{}{}", &url[..i + 3], creds, rest)
 }
 
+/// Translate a SQL Server JDBC URL into the `mssql://` form the native driver
+/// reads, or `None` when `cs` is not one. Handles both drivers Lucee/ACF/BoxLang
+/// apps declare:
+///
+/// - Microsoft: `jdbc:sqlserver://host[\instance][:port][;databaseName=db][;prop=v]…`
+/// - jTDS:      `jdbc:jtds:sqlserver://host[:port][/db][;prop=v]…`
+///
+/// Credentials come from the datasource's `username`/`password` (how Lucee
+/// passes them), else from `user`/`password` properties in the URL. `encrypt`
+/// and `trustServerCertificate` carry over; other properties (timeouts, pool
+/// hints, `applicationIntent`, …) have no native equivalent and are dropped.
+pub fn jdbc_sqlserver_url(cs: &str, username: &str, password: &str) -> Option<String> {
+    const MICROSOFT: &str = "jdbc:sqlserver://";
+    const JTDS: &str = "jdbc:jtds:sqlserver://";
+    const DEFAULT_PORT: &str = "1433";
+    const DEFAULT_DATABASE: &str = "master";
+    let (rest, jtds) = if let Some(rest) = strip_prefix_ignore_case(cs, MICROSOFT) {
+        (rest, false)
+    } else {
+        (strip_prefix_ignore_case(cs, JTDS)?, true)
+    };
+    let mut parts = rest.split(';');
+    let server = parts.next().unwrap_or_default();
+    let mut props: Vec<(String, String)> = Vec::new();
+    for p in parts {
+        if let Some((k, v)) = p.split_once('=') {
+            props.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    let prop = |name: &str| props.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    // jTDS puts the database in the path; Microsoft in `databaseName`.
+    let (server, path_db) = match (jtds, server.split_once('/')) {
+        (true, Some((s, db))) => (s, Some(db.to_string())),
+        _ => (server, None),
+    };
+    // `host\instance[:port]` names an instance. An explicit port wins, as in
+    // the JDBC driver. Without one, the JDBC driver asks the SQL Browser
+    // service for the instance's port; the native driver cannot, so the
+    // instance name is carried through and refused at connect time with that
+    // explanation, rather than silently connecting to the default instance.
+    let (server, instance) = match server.split_once('\\') {
+        Some((h, rest)) => match rest.split_once(':') {
+            Some((inst, p)) => (format!("{h}:{p}"), Some(inst.to_string())),
+            None => (h.to_string(), Some(rest.to_string())),
+        },
+        None => (server.to_string(), None),
+    };
+    let explicit_port = server.contains(':');
+    let (host, port) = server.split_once(':').unwrap_or((server.as_str(), DEFAULT_PORT));
+    let database = prop("databasename")
+        .or_else(|| prop("database"))
+        .or(path_db)
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| DEFAULT_DATABASE.to_string());
+    let user = if username.is_empty() { prop("user").unwrap_or_default() } else { username.to_string() };
+    let pass = if password.is_empty() { prop("password").unwrap_or_default() } else { password.to_string() };
+    let mut query: Vec<String> = Vec::new();
+    if jtds {
+        // jTDS encrypts only when asked (`ssl=`), and never validates unless
+        // told to authenticate: off (the default) and `request` → the login
+        // only; `require` → encrypted, certificate not checked;
+        // `authenticate` → encrypted and validated.
+        match prop("ssl").map(|v| v.to_ascii_lowercase()).as_deref() {
+            Some("require") => query.push("trustServerCertificate=true".into()),
+            Some("authenticate") => {}
+            _ => query.push("encrypt=false".into()),
+        }
+    } else {
+        for key in ["encrypt", "trustservercertificate"] {
+            if let Some(v) = prop(key) {
+                let name = if key == "encrypt" { "encrypt" } else { "trustServerCertificate" };
+                query.push(format!("{name}={v}"));
+            }
+        }
+    }
+    if let Some(inst) = instance.filter(|i| !i.is_empty() && !explicit_port) {
+        query.push(format!("instanceName={inst}"));
+    }
+    let query = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
+    // The URL's credentials are percent-decoded when parsed, so encode them.
+    Some(format!(
+        "mssql://{}:{}@{}:{}/{}{}",
+        percent_encode_userinfo(&user),
+        percent_encode_userinfo(&pass),
+        host,
+        port,
+        database,
+        query
+    ))
+}
+
+/// `s` without `prefix`, compared ASCII case-insensitively.
+fn strip_prefix_ignore_case<'s>(s: &'s str, prefix: &str) -> Option<&'s str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
 impl DatasourceCfg {
     /// Build from a CFML datasource struct (`this.datasources` entry or an
     /// inline `datasource={...}`), read through a case-insensitive `get` that
@@ -729,6 +826,11 @@ impl DatasourceCfg {
             format!("{}:{}@", enc(&self.username), enc(&self.password))
         };
         if !self.connection_string.is_empty() {
+            // SQL Server JDBC URLs (Microsoft's and jTDS) use a `;`-delimited
+            // syntax the native driver does not read: translate them.
+            if let Some(url) = jdbc_sqlserver_url(&self.connection_string, &self.username, &self.password) {
+                return Some(url);
+            }
             // Lucee authenticates a JDBC `connectionString` with the separate
             // `username`/`password` keys. Put them into a URL that carries no
             // credentials of its own; one that does is left alone.
@@ -2170,5 +2272,61 @@ mod tests {
         let mut c = DatasourceCfg::default();
         c.class = "org.postgresql.Driver".into();
         assert!(c.is_bundled_driver());
+    }
+}
+
+#[cfg(test)]
+mod jdbc_sqlserver_tests {
+    use super::{jdbc_sqlserver_url, DatasourceCfg};
+
+    #[test]
+    fn microsoft_url_with_datasource_credentials() {
+        let cs = "jdbc:sqlserver://db.example.com:1433;applicationIntent=ReadWrite;databaseName=oldiesdb;loginTimeout=15;trustServerCertificate=true;encrypt=false;SelectMethod=direct";
+        assert_eq!(
+            jdbc_sqlserver_url(cs, "web", "s3cr#t").as_deref(),
+            Some("mssql://web:s3cr%23t@db.example.com:1433/oldiesdb?encrypt=false&trustServerCertificate=true")
+        );
+    }
+
+    #[test]
+    fn jtds_url_with_path_database() {
+        assert_eq!(
+            jdbc_sqlserver_url("jdbc:jtds:sqlserver://10.0.0.1:1433/MAS_NEW;loginTimeout=15;socketTimeout=600", "sa", "pw").as_deref(),
+            Some("mssql://sa:pw@10.0.0.1:1433/MAS_NEW?encrypt=false")
+        );
+    }
+
+    #[test]
+    fn defaults_instance_and_url_credentials() {
+        assert_eq!(
+            jdbc_sqlserver_url("jdbc:sqlserver://host\\SQLEXPRESS;user=u;password=p", "", "").as_deref(),
+            Some("mssql://u:p@host:1433/master?instanceName=SQLEXPRESS")
+        );
+        // An explicit port wins over the instance name, as in the JDBC driver.
+        assert_eq!(
+            jdbc_sqlserver_url("jdbc:sqlserver://host\\SQLEXPRESS:1500;databaseName=d", "u", "p").as_deref(),
+            Some("mssql://u:p@host:1500/d")
+        );
+        assert_eq!(jdbc_sqlserver_url("jdbc:mysql://h/db", "u", "p"), None);
+    }
+
+    #[test]
+    fn jtds_ssl_modes() {
+        let url = |ssl: &str| jdbc_sqlserver_url(&format!("jdbc:jtds:sqlserver://h/d;ssl={ssl}"), "u", "p");
+        assert_eq!(url("request").as_deref(), Some("mssql://u:p@h:1433/d?encrypt=false"));
+        assert_eq!(url("require").as_deref(), Some("mssql://u:p@h:1433/d?trustServerCertificate=true"));
+        assert_eq!(url("authenticate").as_deref(), Some("mssql://u:p@h:1433/d"));
+    }
+
+    #[test]
+    fn lucee_style_datasource_struct_resolves() {
+        let ds = DatasourceCfg {
+            class: "com.microsoft.sqlserver.jdbc.SQLServerDriver".into(),
+            connection_string: "jdbc:sqlserver://h:1444;databaseName=d".into(),
+            username: "u".into(),
+            password: "p".into(),
+            ..DatasourceCfg::default()
+        };
+        assert_eq!(ds.connection_url().as_deref(), Some("mssql://u:p@h:1444/d"));
     }
 }
