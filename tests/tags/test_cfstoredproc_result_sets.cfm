@@ -53,6 +53,39 @@ if ( !len( rsDsn ) ) {
         assert("script: resultSet 1", scriptFirst.a, 8);
         assert("script: resultSet 2", scriptSecond.recordCount, 2);
 
+        // maxRows caps the rows kept; -1 is no limit (Lucee).
+        rsOne = 1;
+</cfscript>
+<cfstoredproc procedure="#rsSets#" datasource="#rsDsn#">
+    <cfprocparam cfsqltype="cf_sql_integer" value="7">
+    <cfprocresult name="tagCapped" resultSet="2" maxRows="#rsOne#">
+    <cfprocresult name="tagUncapped" resultSet="2" maxRows="-1">
+</cfstoredproc>
+<cfscript>
+        assert("tag: maxRows caps a result set", tagCapped.recordCount, 1);
+        assert("tag: maxRows keeps the first rows", tagCapped.c, 1);
+        assert("tag: maxRows=-1 is no limit", tagUncapped.recordCount, 2);
+        cfstoredproc( procedure=rsSets, datasource=rsDsn ) {
+            cfprocparam( cfsqltype="cf_sql_integer", value=8 );
+            cfprocresult( name="scriptCapped", resultSet=2, maxRows=rsOne );
+        }
+        assert("script: maxRows caps a result set", scriptCapped.recordCount, 1);
+        // maxRows=0 keeps no rows, but the columns.
+        cfstoredproc( procedure=rsSets, datasource=rsDsn ) {
+            cfprocparam( cfsqltype="cf_sql_integer", value=8 );
+            cfprocresult( name="scriptNone", resultSet=2, maxRows=0 );
+        }
+        assert("script: maxRows=0 keeps no rows", scriptNone.recordCount, 0);
+        assert("script: maxRows=0 keeps the columns", scriptNone.columnList, "C");
+</cfscript>
+<cfstoredproc procedure="#rsSets#" datasource="#rsDsn#">
+    <cfprocparam cfsqltype="cf_sql_integer" value="7">
+    <cfprocresult name="tagNone" resultSet="2" maxRows="0">
+</cfstoredproc>
+<cfscript>
+        assert("tag: maxRows=0 keeps no rows", tagNone.recordCount, 0);
+        assert("tag: maxRows=0 keeps the columns", tagNone.columnList, "C");
+
         transaction {
             cfstoredproc( procedure=rsSets, datasource=rsDsn ) {
                 cfprocparam( cfsqltype="cf_sql_integer", value=9 );

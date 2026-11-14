@@ -2962,7 +2962,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // path still assign to the right caller variable).
                 let proc_results = parse_cfprocresult_tags(&body);
                 let result_var = proc_results.first()
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _, _)| name.clone())
                     .unwrap_or_else(|| "cfresult".to_string());
 
                 // OUT/INOUT parameters, found statically even when the body
@@ -3017,8 +3017,16 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                             code,
                             "{sets} = isArray({sets}) ? {sets} : (isQuery({sets}) ? [{sets}] : []);"
                         );
-                        for (name, n) in &proc_results {
-                            let _ = writeln!(code, "if (arrayLen({sets}) >= {n}) {{ {name} = {sets}[{n}]; }}");
+                        for (name, n, maxrows) in &proc_results {
+                            // maxRows caps the rows kept (a negative value is no limit).
+                            let cap = match maxrows {
+                                Some(m) => {
+                                    let m = format_attr_value(m, true);
+                                    format!(" if (val({m}) >= 0 AND {name}.recordCount GT val({m})) {{ {name} = val({m}) ? querySlice({name}, 1, val({m})) : queryNew({name}.columnList); }}")
+                                }
+                                None => String::new(),
+                            };
+                            let _ = writeln!(code, "if (arrayLen({sets}) >= {n}) {{ {name} = {sets}[{n}];{cap} }}");
                         }
                     }
                     for v in &out_vars {
@@ -5525,8 +5533,8 @@ fn parse_cfprocparam_tags(body: &str) -> Vec<ProcParam> {
 }
 
 /// Parse <cfprocresult> tags from the body of a <cfstoredproc> tag.
-/// Returns Vec<(result_variable_name, resultset_number)>
-fn parse_cfprocresult_tags(body: &str) -> Vec<(String, usize)> {
+/// Returns Vec<(result_variable_name, resultset_number, maxrows attribute)>
+fn parse_cfprocresult_tags(body: &str) -> Vec<(String, usize, Option<String>)> {
     let mut results = Vec::new();
     let chars: Vec<char> = body.chars().collect();
     let len = chars.len();
@@ -5545,7 +5553,7 @@ fn parse_cfprocresult_tags(body: &str) -> Vec<(String, usize)> {
                     let resultset: usize = tag_attrs.get("resultset")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(1);
-                    results.push((name, resultset));
+                    results.push((name, resultset, tag_attrs.get("maxrows").cloned()));
 
                     while i < len && chars[i] != '>' { i += 1; }
                     if i < len { i += 1; }
