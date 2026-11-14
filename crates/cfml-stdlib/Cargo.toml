@@ -140,7 +140,7 @@ ego-tree = { version = "0.10", optional = true }
 comrak = { version = "0.56", optional = true, default-features = false }
 # Pure-Rust xlsx read+edit+write (POI-model round-trip: styles/charts/images
 # preserved). Primary spreadsheet engine. Native-only (see `spreadsheet` feature).
-umya-spreadsheet = { version = "3", optional = true }
+umya-spreadsheet = { version = "=4.0.0-beta.1", optional = true }
 # Pure-Rust reader for legacy .xls (BIFF), .xlsb and .ods that umya can't open.
 # Data-only (styles dropped) — used for SpreadsheetRead of legacy formats.
 calamine = { version = "0.38", optional = true }

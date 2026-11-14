@@ -5135,9 +5135,8 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
 fn random_v4_uuid() -> u128 {
     #[cfg(not(target_arch = "wasm32"))]
     let bits = {
-        use rand_core::RngCore;
         let mut b = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut b);
+        getrandom::fill(&mut b).expect("OS entropy source unavailable");
         u128::from_be_bytes(b)
     };
     #[cfg(target_arch = "wasm32")]

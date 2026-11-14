@@ -9,13 +9,10 @@
 //! library asking for it gets the same "class is not supported" error as
 //! before, rather than a half-working stub.
 //!
-//! ECDSA signing over P-256 and P-384 is **RFC 6979 deterministic**, so no
-//! entropy is drawn and the wasm targets need no random backend. Two operations
-//! genuinely need an RNG and are therefore native-only, throwing on wasm rather
-//! than inventing a weak key or a weak nonce:
-//! `KeyPairGenerator.generateKeyPair()`, and **P-521 signing** — `p521` 0.13 has
-//! no RFC 6979 implementation yet and uses a random nonce. P-521 *verification*
-//! needs no entropy and works everywhere.
+//! ECDSA signing on all three curves is **RFC 6979 deterministic**, so no
+//! entropy is drawn and the wasm targets need no random backend. The one
+//! operation that genuinely needs an RNG, `KeyPairGenerator.generateKeyPair()`,
+//! is native-only and throws on wasm rather than inventing a weak key.
 //!
 //! Two contracts worth keeping in mind when extending this:
 //!
@@ -36,7 +33,9 @@ use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::traits::PublicKeyParts;
-use rsa::{BigUint, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+use num_bigint::BigUint;
+use crypto_bigint::BoxedUint;
+use rsa::{Pkcs1v15Sign, PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey};
 use sha2::Digest;
 
 pub const SIGNATURE_CLASS: &str = "java.security.signature";
@@ -208,9 +207,19 @@ fn public_key_value(n: &[u8], e: &[u8]) -> CfmlValue {
 }
 
 fn rsa_public_from_key_shim(object: &CfmlValue) -> Result<RsaPublicKey, CfmlError> {
-    let n = BigUint::from_bytes_be(&field_bytes(object, "__n"));
-    let e = BigUint::from_bytes_be(&field_bytes(object, "__e"));
-    RsaPublicKey::new(n, e).map_err(key_error)
+    RsaPublicKey::new(
+        boxed_uint(&field_bytes(object, "__n")),
+        boxed_uint(&field_bytes(object, "__e")),
+    )
+    .map_err(key_error)
+}
+
+/// A public big-endian magnitude (modulus or exponent) as the `BoxedUint` the
+/// `rsa` crate takes. Variable-time is fine: both values are public. An empty
+/// field becomes zero, which `RsaPublicKey::new` then rejects with its own
+/// error rather than the decoder panicking on a zero-width integer.
+fn boxed_uint(bytes: &[u8]) -> BoxedUint {
+    BoxedUint::from_be_slice_vartime(if bytes.is_empty() { &[0] } else { bytes })
 }
 
 fn rsa_private_from_key_shim(object: &CfmlValue) -> Result<RsaPrivateKey, CfmlError> {
@@ -333,22 +342,10 @@ fn ec_sign(pkcs8: &[u8], hashed: &[u8]) -> Result<Vec<u8>, CfmlError> {
         return Ok(sig.to_der().as_bytes().to_vec());
     }
     if let Ok(sk) = p521::SecretKey::from_pkcs8_der(pkcs8) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = sk;
-            return Err(no_p521_signing_on_wasm());
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // p521 wraps its ECDSA keys in newtypes rather than re-exporting
-            // the generic `ecdsa` ones, so it has no `From<&SecretKey>` — go
-            // through the scalar bytes instead.
-            let signer =
-                p521::ecdsa::SigningKey::from_slice(&sk.to_bytes()).map_err(key_error)?;
-            let sig: p521::ecdsa::Signature =
-                signer.sign_prehash(hashed).map_err(signature_error)?;
-            return Ok(sig.to_der().as_bytes().to_vec());
-        }
+        let signer = p521::ecdsa::SigningKey::from(&sk);
+        let sig: p521::ecdsa::Signature =
+            signer.sign_prehash(hashed).map_err(signature_error)?;
+        return Ok(sig.to_der().as_bytes().to_vec());
     }
     Err(key_error("not an EC private key on P-256, P-384 or P-521"))
 }
@@ -378,12 +375,8 @@ fn ec_verify(spki: &[u8], hashed: &[u8], sig_der: &[u8]) -> Result<bool, CfmlErr
             Ok(verifier.verify_prehash(hashed, &sig).is_ok())
         }
         EcCurve::P521 => {
-            use p256::elliptic_curve::sec1::ToEncodedPoint;
             let key = p521::PublicKey::from_public_key_der(spki).map_err(key_error)?;
-            // Same newtype story as signing: build from the SEC1 point.
-            let verifier =
-                p521::ecdsa::VerifyingKey::from_sec1_bytes(key.to_encoded_point(false).as_bytes())
-                    .map_err(key_error)?;
+            let verifier = p521::ecdsa::VerifyingKey::from(&key);
             let Ok(sig) = p521::ecdsa::Signature::from_der(sig_der) else {
                 return Ok(false);
             };
@@ -455,11 +448,12 @@ fn jdk_ec_pkcs8(curve: EcCurve, scalar: &[u8]) -> Vec<u8> {
 /// `KeyPair.getPrivate().getEncoded()` / `getPublic().getEncoded()` return.
 #[cfg(not(target_arch = "wasm32"))]
 fn ec_generate(curve: EcCurve) -> Result<(Vec<u8>, Vec<u8>), CfmlError> {
+    use p256::elliptic_curve::Generate;
     use rsa::pkcs8::EncodePublicKey;
-    let mut rng = rand_core::OsRng;
     macro_rules! gen {
         ($c:ident) => {{
-            let secret = $c::SecretKey::random(&mut rng);
+            let secret = $c::SecretKey::try_generate_from_rng(&mut getrandom::SysRng)
+                .map_err(|e| key_error(format!("EC key generation failed: {}", e)))?;
             let private = jdk_ec_pkcs8(curve, &secret.to_bytes());
             let public = secret
                 .public_key()
@@ -482,8 +476,7 @@ fn ec_generate(curve: EcCurve) -> Result<(Vec<u8>, Vec<u8>), CfmlError> {
 #[cfg(not(target_arch = "wasm32"))]
 fn rsa_generate(bits: usize) -> Result<(Vec<u8>, Vec<u8>), CfmlError> {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
-    let mut rng = rand_core::OsRng;
-    let secret = RsaPrivateKey::new(&mut rng, bits)
+    let secret = RsaPrivateKey::new(&mut getrandom::SysRng, bits)
         .map_err(|e| key_error(format!("RSA key generation failed: {}", e)))?;
     let private = secret.to_pkcs8_der().map_err(key_error)?.as_bytes().to_vec();
     let public = secret
@@ -493,18 +486,6 @@ fn rsa_generate(bits: usize) -> Result<(Vec<u8>, Vec<u8>), CfmlError> {
         .as_bytes()
         .to_vec();
     Ok((private, public))
-}
-
-/// P-521 signing draws a random nonce (see the module header), so it is subject
-/// to the same wasm limitation as key generation.
-#[cfg(target_arch = "wasm32")]
-fn no_p521_signing_on_wasm() -> CfmlError {
-    CfmlError::runtime(
-        "SHA512withECDSA signing over P-521 is not available on the wasm build: \
-         P-521 needs a random nonce and there is no OS entropy source. \
-         Verification, and signing over P-256/P-384, are unaffected."
-            .to_string(),
-    )
 }
 
 /// `KeyPairGenerator.generateKeyPair()` needs real entropy, and wasm builds
@@ -671,10 +652,7 @@ pub fn handle_java_keyfactory(method: &str, args: Vec<CfmlValue>, object: &CfmlV
                         return Ok(ec_public_key_value(der)?);
                     }
                     let key = RsaPublicKey::from_public_key_der(&der).map_err(key_error)?;
-                    Ok(public_key_value(
-                        &key.n().to_bytes_be(),
-                        &key.e().to_bytes_be(),
-                    ))
+                    Ok(public_key_value(&key.n_bytes(), &key.e_bytes()))
                 }
                 RSA_PUBLIC_SPEC_CLASS if !ec => Ok(public_key_value(
                     &field_bytes(&spec, "__n"),
@@ -969,10 +947,7 @@ pub fn handle_java_keypair(method: &str, _args: Vec<CfmlValue>, object: &CfmlVal
                 return ec_public_key_value(der);
             }
             let key = RsaPublicKey::from_public_key_der(&der).map_err(key_error)?;
-            Ok(public_key_value(
-                &key.n().to_bytes_be(),
-                &key.e().to_bytes_be(),
-            ))
+            Ok(public_key_value(&key.n_bytes(), &key.e_bytes()))
         }
         _ => Err(CfmlError::shim_unhandled(method)),
     }
@@ -1155,7 +1130,8 @@ mod tests {
     #[test]
     fn openssl_shaped_ec_pkcs8_still_loads() {
         use rsa::pkcs8::EncodePrivateKey;
-        let secret = p256::SecretKey::random(&mut rand_core::OsRng);
+        use p256::elliptic_curve::Generate;
+        let secret = p256::SecretKey::try_generate_from_rng(&mut getrandom::SysRng).unwrap();
         let openssl_shape = secret.to_pkcs8_der().unwrap().as_bytes().to_vec();
         assert!(openssl_shape.len() > 67, "expected the longer encoding");
         assert_eq!(ec_private_curve(&openssl_shape).unwrap(), EcCurve::P256);
