@@ -3012,14 +3012,18 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Build params array
                 let params_arr: Vec<String> = proc_params.iter().map(|p| {
                     let mut parts = Vec::new();
-                    if let Some(ref v) = p.value {
-                        // cfprocparam value="..." is a quoted attribute; route
-                        // through format_attr_value so mixed literal+#expr# values
-                        // interpolate and embedded quotes are doubled.
-                        parts.push(format!("value: {}", format_attr_value(v, true)));
-                    }
+                    // cfprocparam value="..." is a quoted attribute; route
+                    // through format_attr_value so mixed literal+#expr# values
+                    // interpolate and embedded quotes are doubled. Always
+                    // present, so `null="true"` with no value is still a param.
+                    parts.push(format!("value: {}", format_attr_value(p.value.as_deref().unwrap_or(""), true)));
                     if let Some(ref t) = p.cfsqltype {
                         parts.push(format!("cfsqltype: \"{}\"", t));
+                    }
+                    // `null="true"` binds NULL; it used to be dropped, so the
+                    // value ("" here) went to the database instead.
+                    if let Some(ref n) = p.null {
+                        parts.push(format!("null: {}", format_attr_value(n, true)));
                     }
                     format!("{{ {} }}", parts.join(", "))
                 }).collect();
@@ -5052,11 +5056,15 @@ fn cfprocparam_attrs_to_literal(
     quoted: &std::collections::HashSet<String>,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(v) = tag_attrs.get("value") {
-        parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value"))));
+    match tag_attrs.get("value") {
+        Some(v) => parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value")))),
+        None => parts.push("value: \"\"".to_string()),
     }
     if let Some(t) = tag_attrs.get("cfsqltype") {
         parts.push(format!("cfsqltype: \"{}\"", t));
+    }
+    if let Some(n) = tag_attrs.get("null") {
+        parts.push(format!("null: {}", format_attr_value(n, quoted.contains("null"))));
     }
     format!("{{ {} }}", parts.join(", "))
 }
@@ -5403,6 +5411,7 @@ fn parse_cfmailpart_tags(body: &str) -> (Vec<String>, String) {
 struct ProcParam {
     value: Option<String>,
     cfsqltype: Option<String>,
+    null: Option<String>,
 }
 
 /// Parse <cfprocparam> tags from the body of a <cfstoredproc> tag.
@@ -5424,6 +5433,7 @@ fn parse_cfprocparam_tags(body: &str) -> Vec<ProcParam> {
                     params.push(ProcParam {
                         value: tag_attrs.get("value").cloned(),
                         cfsqltype: tag_attrs.get("cfsqltype").cloned(),
+                        null: tag_attrs.get("null").cloned(),
                     });
 
                     while i < len && chars[i] != '>' { i += 1; }

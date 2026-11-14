@@ -649,6 +649,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_tags_cfcache.cfm" />
 <cf_runtest file="tags/test_tags_cfstoredproc.cfm" />
 <cf_runtest file="tags/test_cfstoredproc_result_sets.cfm" />
+<cf_runtest file="tags/test_cfprocparam_null.cfm" />
 <cf_runtest file="tags/test_tags_cfqueryparam_attribute_collection.cfm" />
 <cf_runtest file="tags/test_cfhttp_multiparam_url.cfm" />
 <cf_runtest file="tags/test_cfqueryparam_interpolated_value.cfm" />
