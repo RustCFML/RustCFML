@@ -13354,6 +13354,63 @@ fn mssql_returns_rows(sql: &str) -> bool {
     }
 }
 
+/// `CALL name(args)` — what `<cfstoredproc>` emits for every driver — and the
+/// ODBC escape `{call name(args)}` are not T-SQL. Translate them to
+/// `EXEC name args` (`CALL p()` → `EXEC p`). Anything else is returned as-is.
+#[cfg(feature = "mssql_db")]
+fn mssql_call_to_exec(sql: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let Some(rest) = strip_call_keyword(sql) else {
+        return Cow::Borrowed(sql);
+    };
+    let rest = rest.strip_suffix(';').unwrap_or(rest).trim_end();
+    let (name, args) = match rest.find('(') {
+        Some(open) if rest.ends_with(')') => (rest[..open].trim(), rest[open + 1..rest.len() - 1].trim()),
+        Some(_) => return Cow::Borrowed(sql),
+        None => (rest, ""),
+    };
+    if name.is_empty() {
+        return Cow::Borrowed(sql);
+    }
+    if args.is_empty() {
+        Cow::Owned(format!("EXEC {name}"))
+    } else {
+        Cow::Owned(format!("EXEC {name} {args}"))
+    }
+}
+
+/// What follows the `CALL` keyword of a stored-procedure call, plain
+/// (`CALL p(?)`) or in the ODBC escape (`{call p(?)}`), trimmed; `None` for
+/// any other statement.
+#[cfg(feature = "mssql_db")]
+fn strip_call_keyword(sql: &str) -> Option<&str> {
+    const CALL: &str = "call ";
+    let body = sql.trim();
+    let body = body.strip_prefix('{').and_then(|b| b.strip_suffix('}')).map_or(body, str::trim);
+    let head = body.get(..CALL.len())?;
+    head.eq_ignore_ascii_case(CALL).then(|| body[CALL.len()..].trim())
+}
+
+#[cfg(all(test, feature = "mssql_db"))]
+mod mssql_call_to_exec_tests {
+    use super::mssql_call_to_exec;
+
+    #[test]
+    fn call_becomes_exec() {
+        assert_eq!(mssql_call_to_exec("CALL dbo.usp_hit(?,?)"), "EXEC dbo.usp_hit ?,?");
+        assert_eq!(mssql_call_to_exec("call dbo.p()"), "EXEC dbo.p");
+        assert_eq!(mssql_call_to_exec("{call dbo.p(?)}"), "EXEC dbo.p ?");
+        assert_eq!(mssql_call_to_exec("  CALL [dbo].[p] ( ?, 'a,b' ) ;"), "EXEC [dbo].[p] ?, 'a,b'");
+    }
+
+    #[test]
+    fn other_sql_is_untouched() {
+        assert_eq!(mssql_call_to_exec("SELECT 1"), "SELECT 1");
+        assert_eq!(mssql_call_to_exec("EXEC dbo.p 1"), "EXEC dbo.p 1");
+        assert_eq!(mssql_call_to_exec("CALLER_ID()"), "CALLER_ID()");
+    }
+}
+
 /// MariaDB (10.5+) returns rows from `INSERT ... RETURNING` and
 /// `DELETE ... RETURNING`. Stock MySQL has no RETURNING (the server rejects it
 /// as a syntax error regardless of routing). Where the server does support it,
@@ -16041,7 +16098,7 @@ fn run_mssql_statement(
     return_type: &str,
 ) -> Result<CfmlValue, MssqlRunError> {
     let bound = mssql_bind_params(params);
-    let rewritten = mssql_rewrite_placeholders(sql);
+    let rewritten = mssql_rewrite_placeholders(&mssql_call_to_exec(sql));
     let is_select = mssql_returns_rows(sql);
 
     mssql_runtime().block_on(async move {
