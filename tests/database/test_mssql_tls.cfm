@@ -31,6 +31,14 @@ if (!len(tlsDsn)) {
     );
     assert("the session is encrypted", uCase(tlsConn.encrypt_option), "TRUE");
 
+    // encrypt=false: TLS for the login only, as the JDBC driver does, and no
+    // certificate check — so the self-generated certificate is fine here.
+    tlsLogin = queryExecute(
+        "SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID",
+        [], { datasource: tlsBase & "?encrypt=false" }
+    );
+    assert("encrypt=false leaves the session unencrypted after the login", uCase(tlsLogin.encrypt_option), "FALSE");
+
     // Without trust, the self-generated certificate must be REJECTED: the
     // certificate is checked, not waved through.
     tlsRejected = false;

@@ -12875,6 +12875,10 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
     // server with a self-signed certificate opts out with
     // `trustServerCertificate=true` in the URL.
     let mut trust_cert = false;
+    // `encrypt=false` (JDBC's spelling, and a translated jTDS URL's default):
+    // as the Microsoft JDBC driver does, TLS protects the login only, and the
+    // certificate is not checked, since nothing after the login is encrypted.
+    let mut login_only = false;
     if let Some(q) = &query {
         for pair in q.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -12883,6 +12887,9 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
                         trust_cert = !(v.eq_ignore_ascii_case("false") || v == "0");
                     }
                     "encrypt" if v.eq_ignore_ascii_case("strict") => trust_cert = false,
+                    "encrypt" if v.eq_ignore_ascii_case("false") || v == "0" || v.eq_ignore_ascii_case("no") => {
+                        login_only = true
+                    }
                     // A named instance without a port (from a translated
                     // `jdbc:sqlserver://host\\INSTANCE` URL): its port comes
                     // from the SQL Browser service, which this driver does not
@@ -12905,7 +12912,10 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
     config.port(port);
     config.database(database);
     config.authentication(AuthMethod::sql_server(user, pass));
-    if trust_cert {
+    if login_only {
+        config.encryption(tiberius::EncryptionLevel::Off);
+        config.trust_cert();
+    } else if trust_cert {
         config.trust_cert();
     }
 

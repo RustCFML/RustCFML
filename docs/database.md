@@ -271,6 +271,11 @@ queryExecute("select 1", [], { datasource =
 > self-signed server need `trustServerCertificate=true` added when upgrading.
 > `encrypt=strict` is still accepted and still validates.
 
+`encrypt=false` encrypts the login only, as the Microsoft JDBC driver does: the
+password crosses the network inside TLS, the rest of the session does not, and
+the certificate is not checked (nothing it protects outlives the login). The
+same on macOS, Linux and Windows.
+
 JDBC connection strings from Lucee/ACF/BoxLang datasources work as declared —
 both `jdbc:sqlserver://host:1433;databaseName=db;…` and jTDS's
 `jdbc:jtds:sqlserver://host:1433/db;…` — with the datasource's `username` /
