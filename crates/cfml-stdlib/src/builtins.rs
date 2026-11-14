@@ -13309,9 +13309,20 @@ fn mssql_returns_rows(sql: &str) -> bool {
         return true;
     }
 
-    matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
-        && sql_has_top_level_keyword(trimmed, "OUTPUT")
-        && !sql_has_top_level_keyword(trimmed, "INTO")
+    if !matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
+        return false;
+    }
+    // `OUTPUT ... INTO @tbl` writes the rows to a table instead. Only an INTO
+    // AFTER the OUTPUT counts: every `INSERT INTO t ...` has one before it, and
+    // testing the whole statement sent each `INSERT ... OUTPUT` down the
+    // mutation path, dropping its rows.
+    match sql_top_level_keyword_at(trimmed, "OUTPUT") {
+        Some(at) => {
+            let after: String = trimmed.chars().skip(at + "OUTPUT".len()).collect();
+            !sql_has_top_level_keyword(&after, "INTO")
+        }
+        None => false,
+    }
 }
 
 /// MariaDB (10.5+) returns rows from `INSERT ... RETURNING` and
@@ -13670,6 +13681,13 @@ mod mysql_load_data_tests {
 
 #[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
 fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
+    sql_top_level_keyword_at(sql, target).is_some()
+}
+
+/// The character index where `target` first appears as a whole word outside
+/// quotes, comments and parentheses, if it does.
+#[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
+fn sql_top_level_keyword_at(sql: &str, target: &str) -> Option<usize> {
     let chars: Vec<char> = sql.chars().collect();
     let mut i = 0usize;
     let mut depth = 0i32;
@@ -13722,7 +13740,7 @@ fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
                     }
                     let word: String = chars[start..i].iter().collect();
                     if word.eq_ignore_ascii_case(target) {
-                        return true;
+                        return Some(start);
                     }
                     continue;
                 }
@@ -13732,7 +13750,7 @@ fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
         i += 1;
     }
 
-    false
+    None
 }
 
 #[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
@@ -22973,6 +22991,24 @@ mod placeholder_comment_scan_tests {
         .unwrap();
         assert_eq!(sql, "select ? as a -- it's :note, not a param");
         assert_eq!(vals.len(), 1);
+    }
+
+    #[cfg(feature = "mssql_db")]
+    #[test]
+    fn mssql_output_rows_route_by_into_after_output() {
+        use super::mssql_returns_rows;
+        // OUTPUT streams rows back...
+        assert!(mssql_returns_rows("INSERT INTO t (id) OUTPUT inserted.id VALUES (1)"));
+        assert!(mssql_returns_rows("UPDATE t SET a = 1 OUTPUT inserted.id WHERE id = 1"));
+        assert!(mssql_returns_rows("DELETE FROM t OUTPUT deleted.id WHERE id = 1"));
+        assert!(mssql_returns_rows("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE OUTPUT deleted.id;"));
+        // ...unless it is OUTPUT ... INTO a table.
+        assert!(!mssql_returns_rows("UPDATE t SET a = 1 OUTPUT inserted.id INTO @c WHERE id = 1"));
+        assert!(!mssql_returns_rows("INSERT INTO t (id) OUTPUT inserted.id INTO @c VALUES (1)"));
+        // No OUTPUT, no rows.
+        assert!(!mssql_returns_rows("INSERT INTO t (id) VALUES (1)"));
+        // A word inside a string or a subquery is not the clause.
+        assert!(!mssql_returns_rows("INSERT INTO t (label) VALUES ('OUTPUT')"));
     }
 
     #[cfg(feature = "mssql_db")]

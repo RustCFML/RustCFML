@@ -27,7 +27,10 @@ try {
 }
 
 mssqlskip = false;
-tbl = "##zz_rcfml_output_" & lCase(left(replace(createUUID(), "-", "", "all"), 8));
+// `####` is SQL Server's `##` (a global temp table, visible to every pooled
+// connection): `##` in a CFML string is one escaped `#`, a connection-local
+// temp table the next pooled statement cannot see.
+tbl = "####zz_rcfml_output_" & lCase(left(replace(createUUID(), "-", "", "all"), 8));
 
 if (mssqldsn == "") {
     mssqlskip = true;
@@ -85,14 +88,16 @@ if (NOT mssqlskip) {
 
         // OUTPUT ... INTO @tablevar does NOT stream rows to the client; it must
         // stay on the mutation path and report rows affected, not return rows.
+        // Like any DML, it returns an empty query; the count is in result=.
         intoResult = queryExecute(
             "DECLARE @captured TABLE (id int);
              UPDATE #tbl# SET touched = 0 OUTPUT inserted.id INTO @captured WHERE id = ?;",
             [1],
-            { datasource: mssqldsn }
+            { datasource: mssqldsn, result: "intoMeta" }
         );
-        assertTrue("queryExecute UPDATE OUTPUT INTO stays on mutation path (not row-returning)",
-            isStruct(intoResult) AND structKeyExists(intoResult, "recordCount"));
+        assertTrue("queryExecute UPDATE OUTPUT INTO streams no rows",
+            isQuery(intoResult) AND intoResult.recordCount == 0);
+        assert("queryExecute UPDATE OUTPUT INTO reports the rows updated", intoMeta.recordCount, 1);
     } catch (any e) {
         assertTrue("SQL Server queryExecute DML OUTPUT failed: " & e.message, false);
     }
