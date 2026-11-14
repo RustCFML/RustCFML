@@ -13331,7 +13331,15 @@ fn mssql_returns_rows(sql: &str) -> bool {
     }
 
     if !matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
-        return false;
+        // A batch that starts with setup and then selects — `DECLARE @now DATE
+        // = GETDATE(); SELECT …`, `SET NOCOUNT ON; SELECT …`, `IF … SELECT …` —
+        // returns the first result set, as on Lucee. The row path skips the
+        // statements that produce none. A SELECT inside parentheses is a
+        // subquery, not a result. Only setup statements open such a batch:
+        // `CREATE PROCEDURE/VIEW/FUNCTION … AS SELECT …` is DDL, which SQL
+        // Server refuses on the row path.
+        return matches!(kw.as_str(), "DECLARE" | "SET" | "IF" | "BEGIN" | "WHILE" | "USE")
+            && sql_has_top_level_keyword(trimmed, "SELECT");
     }
     // `OUTPUT ... INTO @tbl` writes the rows to a table instead. Only an INTO
     // AFTER the OUTPUT counts: every `INSERT INTO t ...` has one before it, and
@@ -23030,6 +23038,28 @@ mod placeholder_comment_scan_tests {
         assert!(!mssql_returns_rows("INSERT INTO t (id) VALUES (1)"));
         // A word inside a string or a subquery is not the clause.
         assert!(!mssql_returns_rows("INSERT INTO t (label) VALUES ('OUTPUT')"));
+    }
+
+    #[cfg(feature = "mssql_db")]
+    #[test]
+    fn mssql_setup_then_select_batches_return_rows() {
+        use super::mssql_returns_rows;
+        assert!(mssql_returns_rows("SELECT 1"));
+        assert!(mssql_returns_rows("  WITH x AS (SELECT 1 a) SELECT a FROM x"));
+        assert!(!mssql_returns_rows("UPDATE t SET a = 1"));
+        assert!(!mssql_returns_rows("INSERT INTO t (a) SELECT a FROM s"));
+        assert!(mssql_returns_rows("DECLARE @now DATE = GETDATE();\nSELECT name FROM t WHERE d <= @now;"));
+        assert!(mssql_returns_rows("SET NOCOUNT ON; SELECT 1"));
+        assert!(mssql_returns_rows("IF OBJECT_ID('t') IS NOT NULL SELECT 1"));
+        // Subqueries and strings are not results.
+        assert!(!mssql_returns_rows("DECLARE @x INT = (SELECT MAX(id) FROM t); UPDATE t SET a = @x"));
+        assert!(!mssql_returns_rows("SET @msg = 'select me'"));
+        assert!(!mssql_returns_rows("IF EXISTS (SELECT 1 FROM t) UPDATE t SET a = 1"));
+        assert!(!mssql_returns_rows("DECLARE @c TABLE (id int); UPDATE t SET a = 0 OUTPUT inserted.id INTO @c WHERE id = 1"));
+        // DDL with a SELECT body stays DDL.
+        assert!(!mssql_returns_rows("CREATE PROCEDURE p @n int AS SELECT @n AS n"));
+        assert!(!mssql_returns_rows("CREATE VIEW v AS SELECT 1 AS one"));
+        assert!(!mssql_returns_rows("ALTER FUNCTION f() RETURNS TABLE AS RETURN SELECT 1 AS one"));
     }
 
     #[cfg(feature = "mssql_db")]
