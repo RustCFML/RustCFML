@@ -523,6 +523,10 @@ pub(crate) const PROC_RESULT_SETS_VAR: &str = "__cfproc_rs";
 /// `{ resultSets, outputs }` result in.
 pub(crate) const PROC_RESULT_VAR: &str = "__cfproc_r";
 
+/// The local a `<cfstoredproc result=…>` keeps its start tick in, for
+/// `executionTime`.
+pub(crate) const PROC_START_TICK_VAR: &str = "__cfproc_t";
+
 thread_local! {
     /// Current `tags_to_script_inner` recursion depth, bounded by
     /// `MAX_TAG_NEST_DEPTH`.
@@ -2978,18 +2982,32 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // procedure didn't return leaves its variable unset. With OUT
                 // parameters the result is `{ resultSets, outputs }`, and each
                 // `variable` takes its value (NULL as "").
-                let (result_var, assign_results) = if proc_results.is_empty() && out_vars.is_empty() {
+                // returnCode="true": the procedure's return value, as
+                // result.statusCode. result="x": { executionTime, statusCode }.
+                // (Lucee sets no `cfstoredproc` variable, so neither do we.)
+                let want_rc = attrs
+                    .get("returncode")
+                    .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"));
+                let result_attr = attrs.get("result").filter(|r| !r.is_empty()).cloned();
+                let proc_mode = !out_vars.is_empty() || want_rc;
+                let timed = want_rc || result_attr.is_some();
+                use std::fmt::Write as _;
+                let pre = if timed { format!("var {PROC_START_TICK_VAR} = getTickCount();\n") } else { String::new() };
+                let (result_var, mut assign_results) = if proc_results.is_empty() && !proc_mode {
                     (result_var, String::new())
                 } else {
-                    use std::fmt::Write as _;
                     let (sets, proc_result) = (PROC_RESULT_SETS_VAR, PROC_RESULT_VAR);
                     let mut code = String::new();
-                    let return_type = if out_vars.is_empty() {
+                    let return_type = if !proc_mode {
                         cfml_common::query_options::RESULT_SETS_RETURN_TYPE
                     } else {
                         // Writing to a String cannot fail.
                         let _ = writeln!(code, "var {sets} = {proc_result}.resultSets;");
-                        cfml_common::query_options::PROC_RESULT_RETURN_TYPE
+                        if want_rc {
+                            cfml_common::query_options::PROC_RESULT_RC_RETURN_TYPE
+                        } else {
+                            cfml_common::query_options::PROC_RESULT_RETURN_TYPE
+                        }
                     };
                     query_opts.push(format!("returnType: \"{return_type}\""));
                     if !proc_results.is_empty() {
@@ -3006,9 +3024,17 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     for v in &out_vars {
                         let _ = writeln!(code, "{v} = {proc_result}.outputs[\"{v}\"] ?: \"\";");
                     }
-                    let target = if out_vars.is_empty() { sets } else { proc_result };
+                    let target = if proc_mode { proc_result } else { sets };
                     (format!("var {target}"), code)
                 };
+                let status = if want_rc { format!("{PROC_RESULT_VAR}.statusCode") } else { "0".to_string() };
+                if let Some(r) = &result_attr {
+                    // Writing to a String cannot fail.
+                    let _ = writeln!(
+                        assign_results,
+                        "{r} = {{ executionTime: getTickCount() - {PROC_START_TICK_VAR}, statusCode: {status} }};"
+                    );
+                }
                 let opts_str = if query_opts.is_empty() {
                     String::new()
                 } else {
@@ -3022,8 +3048,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     // Placeholders are constructed from the runtime list length
                     // — repeatString is a builtin in stdlib.
                     let code = format!(
-                        "var __cfproc_params = [];\n{}var __cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n{}",
-                        body_script, result_var, procedure, opts_str, assign_results
+                        "var __cfproc_params = [];\n{}var __cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{}{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n{}",
+                        body_script, pre, result_var, procedure, opts_str, assign_results
                     );
                     return (code, close_end - start);
                 }
@@ -3057,8 +3083,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     format!("{{ {} }}", parts.join(", "))
                 }).collect();
 
-                (format!("{} = queryExecute(\"{}\", [{}]{});\n{}",
-                    result_var, sql, params_arr.join(", "), opts_str, assign_results), close_end - start)
+                (format!("{}{} = queryExecute(\"{}\", [{}]{});\n{}",
+                    pre, result_var, sql, params_arr.join(", "), opts_str, assign_results), close_end - start)
             } else {
                 // Self-closing (unusual)
                 (format!("queryExecute(\"CALL {}()\");\n", procedure), tag_end - start)

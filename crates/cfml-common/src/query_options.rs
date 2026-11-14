@@ -7,6 +7,10 @@
 /// one-element array. Asked for by the `<cfstoredproc>` lowerings.
 pub const RESULT_SETS_RETURN_TYPE: &str = "__resultsets";
 
-/// A `<cfstoredproc>` with OUT parameters:
-/// `{ resultSets: [query, …], outputs: { variableName: value, … } }`.
+/// A `<cfstoredproc>` with OUT parameters or a return code:
+/// `{ resultSets: [query, …], outputs: { variableName: value, … }, statusCode }`.
 pub const PROC_RESULT_RETURN_TYPE: &str = "__procresult";
+
+/// [`PROC_RESULT_RETURN_TYPE`], also capturing the procedure's return value
+/// (`returnCode="true"`).
+pub const PROC_RESULT_RC_RETURN_TYPE: &str = "__procresult:rc";
