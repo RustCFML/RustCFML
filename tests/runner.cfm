@@ -853,6 +853,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_poi_spreadsheet.cfm" rustcfmlOnly="true" why="asserts the POI-over-native-spreadsheet adapter; Lucee has no POI on the classpath here" />
 <cf_runtest file="java_shims/test_osgi_inert.cfm" rustcfmlOnly="true" why="asserts that RustCFML's OSGi plumbing is inert; on Lucee it is real and installs bundles" />
 <cf_runtest file="java_shims/test_jsoup_html.cfm" rustcfmlOnly="true" why="asserts the jsoup-over-HtmlDocument adapter; Lucee needs the real jsoup jar, which the test does not supply" />
+<cf_runtest file="java_shims/test_jsoup_serialise.cfm" rustcfmlOnly="true" why="asserts jsoup 1.10.1's serialisation (expectations captured from the real jar); Lucee needs that jar, which the test does not supply" />
 <cf_runtest file="java_shims/test_qrgen_batik.cfm" rustcfmlOnly="true" why="asserts the qrgen and batik adapters; Lucee needs the real jars, which the tests deliberately do not supply" />
 <cf_runtest file="java_shims/test_pdfbox.cfm" rustcfmlOnly="true" why="asserts the PDFBox-over-hayro adapter; Lucee needs the real PDFBox jar, which the test does not supply" />
 <cf_runtest file="java_shims/test_optional.cfm" />

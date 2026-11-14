@@ -41,8 +41,9 @@
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use cfml_common::dynamic::{CfmlNative, CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 
+use crate::html_jsoup::{self, Charset, EscapeMode, JsoupMeta, OutputSettings};
 use ego_tree::NodeId;
 use html5ever::{namespace_url, ns, LocalName, QualName};
 use scraper::{Html, Node, Selector};
@@ -58,6 +59,11 @@ pub struct CfmlHtmlDocument {
     /// Whether this was parsed as a fragment — `toString()` then emits the
     /// fragment back, without the scaffolding the parser added.
     fragment: bool,
+    /// jsoup's `Document.OutputSettings`, used by the `jsoup*` serialisers.
+    jsoup_out: OutputSettings,
+    /// Elements jsoup would write as `<tag />` — unknown tags written
+    /// self-closing in the source. Empty unless parsed by [`Self::parse_jsoup`].
+    jsoup_meta: JsoupMeta,
     self_ref: Option<Weak<RwLock<CfmlHtmlDocument>>>,
 }
 
@@ -77,7 +83,32 @@ impl CfmlHtmlDocument {
         } else {
             Html::parse_document(html)
         };
-        CfmlHtmlDocument { dom: Mutex::new(dom), fragment, self_ref: None }
+        CfmlHtmlDocument {
+            dom: Mutex::new(dom),
+            fragment,
+            jsoup_out: OutputSettings::default(),
+            jsoup_meta: JsoupMeta::default(),
+            self_ref: None,
+        }
+    }
+
+    /// Parse the way `Jsoup.parse` does — always a whole document, in jsoup
+    /// 1.10.1's tree shape (see [`crate::html_jsoup`]). `body_fragment` is
+    /// `Jsoup.parseBodyFragment`: the input parsed into the `<body>` of an
+    /// otherwise empty document shell.
+    pub fn parse_jsoup(html: &str, body_fragment: bool) -> CfmlHtmlDocument {
+        let (dom, jsoup_meta) = if body_fragment {
+            html_jsoup::parse(&format!("<body>{}", html), true)
+        } else {
+            html_jsoup::parse(html, false)
+        };
+        CfmlHtmlDocument {
+            dom: Mutex::new(dom),
+            fragment: false,
+            jsoup_out: OutputSettings::default(),
+            jsoup_meta,
+            self_ref: None,
+        }
     }
 
     /// `<html`/`<body` means the caller handed us a whole document; anything
@@ -316,6 +347,112 @@ impl CfmlHtmlDocument {
         })
     }
 
+    /// jsoup's serialisation of a node: `Element.html()` (inner, `outer =
+    /// false`) or `Element.outerHtml()`; handle 0 is the Document, whose
+    /// `html()`/`toString()` is its children's.
+    fn jsoup_serialise(&self, handle: i64, outer: bool) -> Result<String, CfmlError> {
+        self.with_dom(|dom| {
+            let id = Self::resolve_in(dom, handle)?;
+            let node = dom.tree.get(id).ok_or_else(|| {
+                CfmlError::runtime(format!("HtmlDocument: node handle {} is gone", handle))
+            })?;
+            let ctx = html_jsoup::Ctx { out: &self.jsoup_out, meta: &self.jsoup_meta };
+            let is_doc = matches!(node.value(), Node::Document);
+            Ok(if outer && !is_doc {
+                let mut accum = String::new();
+                html_jsoup::outer_html(&mut accum, node, &ctx);
+                accum
+            } else {
+                html_jsoup::inner_html(node, &ctx)
+            })
+        })
+    }
+
+    /// Read (`value` absent) or write one of jsoup's `OutputSettings`.
+    fn jsoup_setting(&mut self, name: &str, value: Option<&CfmlValue>) -> CfmlResult {
+        let out = &mut self.jsoup_out;
+        let bad = |what: &str| {
+            CfmlError::new(
+                format!("org.jsoup.nodes.Document.OutputSettings: {}", what),
+                CfmlErrorType::Custom("java.lang.IllegalArgumentException".to_string()),
+            )
+        };
+        match (name.to_ascii_lowercase().as_str(), value) {
+            ("prettyprint", None) => Ok(CfmlValue::Bool(out.pretty_print)),
+            ("prettyprint", Some(v)) => {
+                out.pretty_print = truthy(v);
+                Ok(CfmlValue::Null)
+            }
+            ("outline", None) => Ok(CfmlValue::Bool(out.outline)),
+            ("outline", Some(v)) => {
+                out.outline = truthy(v);
+                Ok(CfmlValue::Null)
+            }
+            ("indentamount", None) => Ok(CfmlValue::Int(out.indent_amount as i64)),
+            ("indentamount", Some(v)) => {
+                let n = match v {
+                    CfmlValue::Int(n) => *n,
+                    CfmlValue::Double(d) => *d as i64,
+                    other => other.as_string().trim().parse::<i64>().map_err(|_| {
+                        bad(&format!("indentAmount '{}' is not an integer", other.as_string()))
+                    })?,
+                };
+                // Validate.isTrue(indentAmount >= 0)
+                if n < 0 {
+                    return Err(bad("indentAmount must be >= 0"));
+                }
+                out.indent_amount = n as usize;
+                Ok(CfmlValue::Null)
+            }
+            ("charset", None) => Ok(CfmlValue::string(out.charset.name().to_string())),
+            ("charset", Some(v)) => {
+                let cs = v.as_string();
+                out.charset = Charset::for_name(&cs).ok_or_else(|| {
+                    CfmlError::new(
+                        format!(
+                            "{} is not a charset RustCFML's jsoup adapter can encode to \
+                             (US-ASCII, ISO-8859-1 and UTF-* are supported)",
+                            cs
+                        ),
+                        CfmlErrorType::Custom(
+                            "java.nio.charset.UnsupportedCharsetException".to_string(),
+                        ),
+                    )
+                })?;
+                Ok(CfmlValue::Null)
+            }
+            ("escapemode", None) => Ok(CfmlValue::string(
+                match out.escape_mode {
+                    EscapeMode::Base => "base",
+                    EscapeMode::Xhtml => "xhtml",
+                    EscapeMode::Extended => "extended",
+                }
+                .to_string(),
+            )),
+            ("escapemode", Some(v)) => {
+                out.escape_mode = match v.as_string().trim().to_ascii_lowercase().as_str() {
+                    "base" => EscapeMode::Base,
+                    "xhtml" => EscapeMode::Xhtml,
+                    "extended" => EscapeMode::Extended,
+                    other => return Err(bad(&format!("unknown escape mode '{}'", other))),
+                };
+                Ok(CfmlValue::Null)
+            }
+            ("syntax", None) => Ok(CfmlValue::string(
+                if out.xml_syntax { "xml" } else { "html" }.to_string(),
+            )),
+            ("syntax", Some(v)) => {
+                out.xml_syntax = match v.as_string().trim().to_ascii_lowercase().as_str() {
+                    "html" => false,
+                    "xml" => true,
+                    other => return Err(bad(&format!("unknown syntax '{}'", other))),
+                };
+                Ok(CfmlValue::Null)
+            }
+            (other, _) => Err(bad(&format!("no setting '{}'", other))),
+        }
+    }
+
     /// The whole document. A fragment comes back WITHOUT the html/head/body the
     /// parser added, so a round trip through this object does not grow the input.
     fn to_html(&self) -> String {
@@ -342,6 +479,8 @@ impl CfmlNative for CfmlHtmlDocument {
             "allelements" | "attributes" | "text" | "data" | "html" | "innerhtml"
             | "outerhtml" | "tagname" => &["element"][..],
             "tostring" | "documenthtml" => &[][..],
+            "jsouphtml" | "jsoupouterhtml" => &["element"][..],
+            "jsoupsetting" => &["name", "value"][..],
             _ => return None,
         })
     }
@@ -369,6 +508,9 @@ impl CfmlNative for CfmlHtmlDocument {
             "attr" => self.attr(handle(0), &str_arg(1)),
             "setattr" => {
                 self.set_attr(handle(0), &str_arg(1), &str_arg(2))?;
+                if let Ok(id) = self.with_dom(|dom| Self::resolve_in(dom, handle(0))) {
+                    self.jsoup_meta.attribute_set(id, &str_arg(1));
+                }
                 Ok(self.this())
             }
             "removeattr" => {
@@ -386,6 +528,13 @@ impl CfmlNative for CfmlHtmlDocument {
             "outerhtml" => Ok(CfmlValue::string(self.serialise_node(handle(0), true)?)),
             "tagname" => Ok(CfmlValue::string(self.tag_name(handle(0))?)),
             "tostring" | "documenthtml" => Ok(CfmlValue::string(self.to_html())),
+            // jsoup's serialisers and output settings, for the org.jsoup adapter.
+            "jsouphtml" => Ok(CfmlValue::string(self.jsoup_serialise(handle(0), false)?)),
+            "jsoupouterhtml" => Ok(CfmlValue::string(self.jsoup_serialise(handle(0), true)?)),
+            "jsoupsetting" => {
+                let name = str_arg(0);
+                self.jsoup_setting(&name, a.get(1))
+            }
             other => Err(CfmlError::runtime(format!(
                 "HtmlDocument has no method [{}]. Available: select, attr, setAttr, \
                  removeAttr, hasAttr, attributes, text, data, html, outerHtml, tagName, \
@@ -404,10 +553,29 @@ impl CfmlNative for CfmlHtmlDocument {
 /// otherwise appear in the output of a round trip over an HTML *snippet*.
 pub fn fn_html_document(args: Vec<CfmlValue>) -> CfmlResult {
     let html = args.first().map(|v| v.as_string()).unwrap_or_default();
+    // The org.jsoup adapter's modes: Jsoup.parse / Jsoup.parseBodyFragment.
+    match args.get(1).map(|v| v.as_string()).unwrap_or_default().to_ascii_lowercase().as_str() {
+        "jsoup" => return Ok(CfmlHtmlDocument::parse_jsoup(&html, false).into_value()),
+        "jsoupbodyfragment" => return Ok(CfmlHtmlDocument::parse_jsoup(&html, true).into_value()),
+        _ => {}
+    }
     let fragment = match args.get(1).map(|v| v.as_string()).unwrap_or_default() {
         m if m.eq_ignore_ascii_case("fragment") => true,
         m if m.eq_ignore_ascii_case("document") => false,
         _ => !CfmlHtmlDocument::looks_like_document(&html),
     };
     Ok(CfmlHtmlDocument::parse(&html, fragment).into_value())
+}
+
+/// A Java boolean argument as CFML passes it: `true`/`false`, `yes`/`no`, or a number.
+fn truthy(v: &CfmlValue) -> bool {
+    match v {
+        CfmlValue::Bool(b) => *b,
+        CfmlValue::Int(n) => *n != 0,
+        CfmlValue::Double(d) => *d != 0.0,
+        other => matches!(
+            other.as_string().trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1"
+        ),
+    }
 }

@@ -13,6 +13,8 @@ pub mod spreadsheet;
 pub mod xmp;
 #[cfg(feature = "html")]
 pub mod html_dom;
+#[cfg(feature = "html")]
+pub mod html_jsoup;
 #[cfg(feature = "markdown")]
 pub mod markdown;
 #[cfg(feature = "pdf")]

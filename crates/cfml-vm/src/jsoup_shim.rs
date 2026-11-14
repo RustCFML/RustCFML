@@ -103,7 +103,7 @@ fn element(
     m.insert("__doc".to_string(), doc.clone());
     m.insert("__node".to_string(), CfmlValue::Int(node));
     if class == ELEMENT_CLASS {
-        let html = call(doc, "outerHtml", vec![CfmlValue::Int(node)])?;
+        let html = call(doc, "jsoupOuterHtml", vec![CfmlValue::Int(node)])?;
         m.insert("__value".to_string(), html);
     }
     Ok(CfmlValue::strukt(m))
@@ -135,9 +135,11 @@ pub fn dispatch(
             "init" => Ok(CfmlValue::strukt(shim(JSOUP_CLASS))),
             // parse( html ) / parse( html, baseUri ) — the base URI is only used
             // for resolving relative links, which this adapter does not do.
+            // Both always build a whole document (html/head/body), as jsoup
+            // does; parseBodyFragment parses its input into the <body>.
             "parse" | "parsebodyfragment" => {
                 let html = args.first().map(|v| v.as_string()).unwrap_or_default();
-                let mode = if method == "parsebodyfragment" { "fragment" } else { "" };
+                let mode = if method == "parsebodyfragment" { "jsoupBodyFragment" } else { "jsoup" };
                 let doc = parse(vec![
                     CfmlValue::string(html),
                     CfmlValue::string(mode.to_string()),
@@ -261,22 +263,14 @@ pub fn dispatch(
                 // whitespace-collapsed and NOT escaped: collapsing it would
                 // change what the stylesheet means.
                 "data" | "getwholedata" => call(&doc, "data", vec![CfmlValue::Int(node)]),
-                // Document.html() is the whole document; Element.html() is the
-                // element's INNER html. jsoup draws exactly that distinction.
-                "html" => {
-                    if is_doc {
-                        call(&doc, "toString", vec![])
-                    } else {
-                        call(&doc, "html", vec![CfmlValue::Int(node)])
-                    }
-                }
-                "outerhtml" => call(&doc, "outerHtml", vec![CfmlValue::Int(node)]),
-                "tostring" => {
-                    if is_doc {
-                        call(&doc, "toString", vec![])
-                    } else {
-                        call(&doc, "outerHtml", vec![CfmlValue::Int(node)])
-                    }
+                // Element.html() is the element's INNER html, Element.outerHtml()
+                // and toString() include the element. For the Document all
+                // three are its children's html — jsoup's Document.outerHtml()
+                // is html(). Serialised as jsoup 1.10.1 writes it, under the
+                // document's OutputSettings (pretty-printed by default).
+                "html" => call(&doc, "jsoupHtml", vec![CfmlValue::Int(node)]),
+                "outerhtml" | "tostring" => {
+                    call(&doc, "jsoupOuterHtml", vec![CfmlValue::Int(node)])
                 }
                 "tagname" | "nodename" => call(&doc, "tagName", vec![CfmlValue::Int(node)]),
                 // Identity: stable for one element, distinct between two — the
@@ -286,12 +280,13 @@ pub fn dispatch(
                     let other = args.first().cloned().unwrap_or(CfmlValue::Null);
                     Ok(CfmlValue::Bool(get_int(&other, "__node") == node))
                 }
-                // Output settings are presentation knobs (charset, pretty-print,
-                // escape mode) over a serialiser that has none of them: this
-                // adapter emits the document as parsed, in UTF-8. Accepted and
-                // ignored, fluently, because callers chain off them — and
-                // recorded in docs/known-issues.md rather than left silent.
-                "outputsettings" => Ok(CfmlValue::strukt(shim(OUTPUT_SETTINGS_CLASS))),
+                // The document's live OutputSettings: changing them changes what
+                // every later html()/toString() on this document writes.
+                "outputsettings" => {
+                    let mut m = shim(OUTPUT_SETTINGS_CLASS);
+                    m.insert("__doc".to_string(), doc.clone());
+                    Ok(CfmlValue::strukt(m))
+                }
                 "body" | "head" | "root" => {
                     let tag = if method == "head" { "head" } else { "body" };
                     let handles = call(&doc, "select", vec![CfmlValue::string(tag.to_string())])?;
@@ -345,10 +340,23 @@ pub fn dispatch(
             }
         }
 
-        // ---- Document.OutputSettings (fluent, inert) ------------------------
+        // ---- Document.OutputSettings ---------------------------------------
+        // charset/prettyPrint/indentAmount/outline/escapeMode/syntax: with an
+        // argument a fluent setter (returns the settings), without one a getter.
         OUTPUT_SETTINGS_CLASS => match method {
             "charset" | "prettyprint" | "escapemode" | "indentamount" | "syntax"
-            | "outline" => Ok(object.clone()),
+            | "outline" => {
+                let doc = doc_of(object)?;
+                let mut a = vec![CfmlValue::string(method.to_string())];
+                match args.first() {
+                    Some(v) => {
+                        a.push(v.clone());
+                        call(&doc, "jsoupSetting", a)?;
+                        Ok(object.clone())
+                    }
+                    None => call(&doc, "jsoupSetting", a),
+                }
+            }
             other => Err(unsupported("org.jsoup.nodes.Document.OutputSettings", other)),
         },
 

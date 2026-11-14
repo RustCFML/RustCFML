@@ -48,10 +48,11 @@ assertTrue( "the mutation is visible in the document output", findNoCase( "https
 assertTrue( "the relative link was left alone", findNoCase( 'href="/relative"', out ) > 0 );
 assertFalse( "and the original absolute href is gone", findNoCase( 'href="https://example.com/a"', out ) > 0 );
 
-// outputSettings() is a fluent presentation knob this serialiser does not have;
-// it is accepted and ignored so the caller's chain still runs (known-issues §66).
-doc.outputSettings().charset( "ASCII" );
-assertTrue( "outputSettings().charset() is inert but chainable", len( doc.html() ) > 0 );
+// outputSettings() is fluent and live: it changes what the document writes.
+// (Exact output under each setting is asserted in test_jsoup_serialise.cfm.)
+doc.outputSettings().charset( "ASCII" ).prettyPrint( false );
+assert( "outputSettings() chains and reads back", doc.outputSettings().charset(), "US-ASCII" );
+assertFalse( "prettyPrint( false ) took effect", find( chr(10), doc.html() ) > 0 );
 
 // ---- the style-inlining path ----------------------------------------------
 styleHtml = '<html><head><style>a { color: blue; } p { margin: 0; }</style></head>'
@@ -101,11 +102,12 @@ assertTrue( "so two different stylesheets produce different cache keys"
           , hash( blue.select( "style" ).toString() ) != hash( green.select( "style" ).toString() ) );
 
 // ---- fragments ------------------------------------------------------------
-// A widget is often a bare <td> or <tr>. Parsing it as a document would wrap it
-// in html/head/body and hand back more than it was given.
-frag = jsoup.parseBodyFragment( '<td class="cell">only me</td>' );
-assertFalse( "a fragment does not gain html/body scaffolding"
-           , findNoCase( "<body", frag.toString() ) > 0 );
+// jsoup's parseBodyFragment builds a whole document and parses the fragment into
+// its <body>; callers read the fragment back with body().html().
+frag = jsoup.parseBodyFragment( '<p class="cell">only me</p>' );
+assertTrue( "a body fragment sits inside the document shell"
+          , findNoCase( "<body>", frag.toString() ) > 0 );
+assert( "and body().html() is the fragment", frag.body().html(), '<p class="cell">only me</p>' );
 
 // ---- refusals -------------------------------------------------------------
 // Jsoup.clean() is a sanitiser with a Whitelist policy model that has no
