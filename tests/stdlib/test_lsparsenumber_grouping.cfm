@@ -10,7 +10,7 @@
 <cfscript>
 suiteBegin( "LSParseNumber: grouping separator" );
 
-setLocale( "English (US)" );
+lsPrevLocale = setLocale( "English (US)" );
 
 assert( "plain integer", lsParseNumber( "5000" ), 5000 );
 assert( "one grouping separator", lsParseNumber( "5,000" ), 5000 );
@@ -27,5 +27,6 @@ assert( "German plain decimal", lsParseNumber( "2,5", "German (Standard)" ), 2.5
 assertThrows( "letters", function() { lsParseNumber( "abc" ); } );
 assertThrows( "empty string", function() { lsParseNumber( "" ); } );
 
+setLocale( lsPrevLocale );
 suiteEnd();
 </cfscript>
