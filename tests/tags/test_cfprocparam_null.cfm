@@ -22,23 +22,7 @@ if ( !len( pnDsn ) ) {
     queryExecute( "CREATE PROCEDURE #pnProc#(IN a INT, IN b VARCHAR(20)) BEGIN SELECT a IS NULL AS a_null, b IS NULL AS b_null, a AS a_value; END", [], { datasource: pnDsn } );
     try {
         pnEmpty = "";
-</cfscript>
-<cfstoredproc procedure="#pnProc#" datasource="#pnDsn#">
-    <cfprocparam cfsqltype="cf_sql_integer" value="#pnEmpty#" null="#( NOT len( pnEmpty ) )#">
-    <cfprocparam cfsqltype="cf_sql_varchar" null="true">
-    <cfprocresult name="tagNull">
-</cfstoredproc>
-<cfstoredproc procedure="#pnProc#" datasource="#pnDsn#">
-    <cfprocparam cfsqltype="cf_sql_integer" value="5" null="false">
-    <cfprocparam cfsqltype="cf_sql_varchar" value="x" null="no">
-    <cfprocresult name="tagValue">
-</cfstoredproc>
-<cfstoredproc procedure="#pnProc#" datasource="#pnDsn#">
-    <cfif true><cfprocparam cfsqltype="cf_sql_integer" value="" null="yes"></cfif>
-    <cfprocparam cfsqltype="cf_sql_varchar" null="1">
-    <cfprocresult name="runtimeNull">
-</cfstoredproc>
-<cfscript>
+        include "_test_cfprocparam_null_tags1.cfm";
         assert("tag: null=expression true binds NULL", tagNull.a_null, 1);
         assert("tag: null=true with no value binds NULL", tagNull.b_null, 1);
         assert("tag: null=false binds the value", tagValue.a_value, 5);

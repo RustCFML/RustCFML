@@ -35,23 +35,7 @@ if ( !len( poDsn ) ) {
     }
 
     try {
-</cfscript>
-<cfstoredproc procedure="#poProc#" datasource="#poDsn#">
-    <cfprocparam cfsqltype="cf_sql_integer" value="5">
-    <cfprocparam type="out" cfsqltype="cf_sql_integer" variable="tagDoubled">
-    <cfprocparam type="inout" cfsqltype="cf_sql_integer" value="41" variable="tagCounter">
-    <cfprocparam type="out" cfsqltype="cf_sql_varchar" variable="tagLabel">
-    <cfprocparam type="out" cfsqltype="cf_sql_integer" variable="tagNothing">
-    <cfprocresult name="tagRows">
-</cfstoredproc>
-<cfstoredproc procedure="#poProc#" datasource="#poDsn#">
-    <cfif true><cfprocparam cfsqltype="cf_sql_integer" value="7"></cfif>
-    <cfprocparam type="OUT" cfsqltype="cf_sql_integer" variable="runtimeDoubled">
-    <cfprocparam type="inout" cfsqltype="cf_sql_integer" value="1" variable="runtimeCounter">
-    <cfprocparam type="out" cfsqltype="cf_sql_varchar" variable="runtimeLabel">
-    <cfprocparam type="out" cfsqltype="cf_sql_integer" variable="runtimeNothing">
-</cfstoredproc>
-<cfscript>
+        include "_test_cfprocparam_out_tags1.cfm";
         assert("tag: OUT value", tagDoubled, 10);
         assert("tag: INOUT value goes in and comes back", tagCounter, 42);
         assert("tag: OUT string", tagLabel, "hi");

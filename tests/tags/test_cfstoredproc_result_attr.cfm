@@ -25,17 +25,7 @@ if ( !len( raDsn ) ) {
     queryExecute( "CREATE PROCEDURE #raProc#(IN a INT, OUT b INT) BEGIN SET b = a + 1; SELECT a AS a_in; END", [], { datasource: raDsn } );
     try {
         raHolder = {};
-</cfscript>
-<cfstoredproc procedure="#raProc#" datasource="#raDsn#" result="tagResult" returnCode="true">
-    <cfprocparam cfsqltype="cf_sql_integer" value="1">
-    <cfprocparam type="out" cfsqltype="cf_sql_integer" variable="tagB">
-    <cfprocresult name="tagRows">
-</cfstoredproc>
-<cfstoredproc procedure="#raProc#" datasource="#raDsn#" result="raHolder.sproc">
-    <cfprocparam cfsqltype="cf_sql_integer" value="2">
-    <cfprocparam type="out" cfsqltype="cf_sql_integer" variable="plainB">
-</cfstoredproc>
-<cfscript>
+        include "_test_cfstoredproc_result_attr_tags1.cfm";
         assert("tag: result.statusCode", tagResult.statusCode, 0);
         assertTrue("tag: result.executionTime is a number", isNumeric( tagResult.executionTime ));
         assert("no cfstoredproc variable, as on Lucee", isNull( variables.cfstoredproc ), true);
