@@ -13354,6 +13354,16 @@ fn mssql_returns_rows(sql: &str) -> bool {
     }
 }
 
+/// A CREATE or ALTER statement: SQL Server runs the module-defining ones
+/// (PROCEDURE, VIEW, FUNCTION, TRIGGER, `CREATE OR ALTER …`) only as the first
+/// statement of an unparameterised batch.
+#[cfg(feature = "mssql_db")]
+fn mssql_is_batch_only_ddl(sql: &str) -> bool {
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    matches!(trimmed[..kw_len].to_ascii_uppercase().as_str(), "CREATE" | "ALTER")
+}
+
 /// `CALL name(args)` — what `<cfstoredproc>` emits for every driver — and the
 /// ODBC escape `{call name(args)}` are not T-SQL. Translate them to
 /// `EXEC name args` (`CALL p()` → `EXEC p`). Anything else is returned as-is.
@@ -16142,6 +16152,18 @@ fn run_mssql_statement(
                 .collect();
 
             build_query_result_columnar(columns, data, sql, return_type).map_err(MssqlRunError::from_cfml)
+        } else if bound.is_empty() && mssql_is_batch_only_ddl(sql) {
+            // tiberius sends every statement as a PARAMETERISED sp_executesql
+            // (an `@params` argument, even when empty), and SQL Server refuses
+            // CREATE/ALTER PROCEDURE, VIEW, FUNCTION and TRIGGER there
+            // ("Incorrect syntax near the keyword 'PROCEDURE'"). The JDBC
+            // driver runs a statement with no parameters as a plain batch;
+            // so does this. DDL reports no row count.
+            client.simple_query(rewritten.as_str()).await
+                .map_err(|e| MssqlRunError::from_tiberius("error", e, false))?
+                .into_results().await
+                .map_err(|e| MssqlRunError::from_tiberius("error", e, false))?;
+            build_mutation_result(0, 0, sql).map_err(MssqlRunError::from_cfml)
         } else {
             // execute() returns the real rows-affected total (the previous
             // simple_query path mis-reported INSERT/UPDATE as 0 rows).
