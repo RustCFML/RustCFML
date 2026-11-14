@@ -1622,6 +1622,7 @@ dependencies = [
  "des",
  "ego-tree",
  "fancy-regex",
+ "futures-util",
  "hayro",
  "hmac 0.12.1",
  "html5ever",

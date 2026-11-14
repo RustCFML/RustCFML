@@ -1851,6 +1851,7 @@ impl Parser {
                     self.advance(); // (
                 }
                 let mut name_expr: Option<Expression> = None;
+                let mut set_expr: Option<Expression> = None;
                 while !self.check(&Token::Semicolon)
                     && !self.check(&Token::RBrace)
                     && !self.check(&Token::RParen)
@@ -1862,6 +1863,8 @@ impl Parser {
                         let pvalue = self.parse_expression()?;
                         if pname.eq_ignore_ascii_case("name") {
                             name_expr = Some(pvalue);
+                        } else if pname.eq_ignore_ascii_case("resultset") {
+                            set_expr = Some(pvalue);
                         }
                         if paren {
                             self.match_token(&Token::Comma);
@@ -1874,12 +1877,23 @@ impl Parser {
                     self.match_token(&Token::RParen);
                 }
                 self.match_token(&Token::Semicolon);
+                // The marker carries [name, resultSet]; resultSet defaults to 1.
+                let marker = Expression::Array(Array {
+                    elements: vec![
+                        name_expr.unwrap_or(Expression::Literal(Literal {
+                            value: LiteralValue::String(String::new()),
+                            location: stmt_loc,
+                        })),
+                        set_expr.unwrap_or(Expression::Literal(Literal {
+                            value: LiteralValue::Int(1),
+                            location: stmt_loc,
+                        })),
+                    ],
+                    location: stmt_loc,
+                });
                 return Ok(CfmlNode::Statement(Statement::Assignment(Box::new(Assignment {
                     target: AssignTarget::Variable(PROC_RESULT_MARKER.to_string()),
-                    value: name_expr.unwrap_or(Expression::Literal(Literal {
-                        value: LiteralValue::String(String::new()),
-                        location: stmt_loc,
-                    })),
+                    value: marker,
                     operator: AssignOp::Equal,
                     location: stmt_loc,
                 }))));
@@ -4133,14 +4147,18 @@ impl Parser {
                 // `procresult name="x"` lowers to a marker assignment the body
                 // carries; lift the name out of it and drop the marker, so the
                 // result lands in the variable the author named.
-                let mut result_var: Option<String> = None;
+                let mut proc_results: Vec<(String, Expression)> = Vec::new();
                 let body: Vec<Statement> = body
                     .into_iter()
                     .filter(|st| {
                         if let Statement::Assignment(a) = st {
                             if matches!(&a.target, AssignTarget::Variable(n) if n == PROC_RESULT_MARKER) {
-                                if let Expression::Literal(Literal { value: LiteralValue::String(nm), .. }) = &a.value {
-                                    result_var = Some(nm.clone());
+                                if let Expression::Array(arr) = &a.value {
+                                    if let [Expression::Literal(Literal { value: LiteralValue::String(nm), .. }), set] = arr.elements.as_slice() {
+                                        if !nm.is_empty() {
+                                            proc_results.push((nm.clone(), set.clone()));
+                                        }
+                                    }
                                 }
                                 return false;
                             }
@@ -4185,21 +4203,79 @@ impl Parser {
                 );
 
                 let mut qe_args = vec![sql, ident("__cfproc_params")];
+                let mut opt_pairs = Vec::new();
                 if let Some(ds) = pick("datasource") {
-                    qe_args.push(Expression::Struct(Struct {
-                        pairs: vec![(str_lit("datasource"), ds)],
-                        ordered: false,
+                    opt_pairs.push((str_lit("datasource"), ds));
+                }
+                if proc_results.is_empty() {
+                    if !opt_pairs.is_empty() {
+                        qe_args.push(Expression::Struct(Struct { pairs: opt_pairs, ordered: false, location: loc }));
+                    }
+                    stmts.push(Statement::Assignment(Box::new(Assignment {
+                        target: AssignTarget::Variable("cfresult".to_string()),
+                        value: call("queryExecute", qe_args),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    })));
+                } else {
+                    // Fetch every result set; each procresult takes the one its
+                    // resultSet names. A set the procedure didn't return leaves
+                    // its variable unset.
+                    opt_pairs.push((
+                        str_lit("returnType"),
+                        str_lit(cfml_common::query_options::RESULT_SETS_RETURN_TYPE),
+                    ));
+                    qe_args.push(Expression::Struct(Struct { pairs: opt_pairs, ordered: false, location: loc }));
+                    stmts.push(Statement::Assignment(Box::new(Assignment {
+                        target: AssignTarget::Variable(crate::tag_parser::PROC_RESULT_SETS_VAR.to_string()),
+                        value: call("queryExecute", qe_args),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    })));
+                    // A driver without multi-set support may hand back one query, and a
+                    // procedure that returns no result set yields the mutation struct.
+                    let rs_or_empty = Expression::Ternary(Box::new(Ternary {
+                        condition: Box::new(call("isQuery", vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)])),
+                        then_expr: Box::new(Expression::Array(Array { elements: vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)], location: loc })),
+                        else_expr: Box::new(Expression::Array(Array { elements: vec![], location: loc })),
                         location: loc,
                     }));
+                    stmts.push(Statement::Assignment(Box::new(Assignment {
+                        target: AssignTarget::Variable(crate::tag_parser::PROC_RESULT_SETS_VAR.to_string()),
+                        value: Expression::Ternary(Box::new(Ternary {
+                            condition: Box::new(call("isArray", vec![ident(crate::tag_parser::PROC_RESULT_SETS_VAR)])),
+                            then_expr: Box::new(ident(crate::tag_parser::PROC_RESULT_SETS_VAR)),
+                            else_expr: Box::new(rs_or_empty),
+                            location: loc,
+                        })),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    })));
+                    for (name, set) in proc_results {
+                        let rs = ident(crate::tag_parser::PROC_RESULT_SETS_VAR);
+                        stmts.push(Statement::If(Box::new(If {
+                            condition: Expression::BinaryOp(Box::new(BinaryOp {
+                                left: Box::new(call("arrayLen", vec![rs.clone()])),
+                                operator: BinaryOpType::GreaterEqual,
+                                right: Box::new(set.clone()),
+                                location: loc,
+                            })),
+                            then_branch: vec![Statement::Assignment(Box::new(Assignment {
+                                target: AssignTarget::Variable(name),
+                                value: Expression::ArrayAccess(Box::new(ArrayAccess {
+                                    array: Box::new(rs),
+                                    index: Box::new(set),
+                                    location: loc,
+                                })),
+                                operator: AssignOp::Equal,
+                                location: loc,
+                            }))],
+                            else_if: vec![],
+                            else_branch: None,
+                            location: loc,
+                        })));
+                    }
                 }
-                stmts.push(Statement::Assignment(Box::new(Assignment {
-                    target: AssignTarget::Variable(
-                        result_var.filter(|n| !n.is_empty()).unwrap_or_else(|| "cfresult".to_string()),
-                    ),
-                    value: call("queryExecute", qe_args),
-                    operator: AssignOp::Equal,
-                    location: loc,
-                })));
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }
             // Script `cfinvoke( component=…, method=… ) { cfinvokeArgument(…); }`.

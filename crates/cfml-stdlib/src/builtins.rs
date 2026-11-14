@@ -14302,6 +14302,8 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(apply_query_maxrows(result, max_rows))
 }
 
+pub use cfml_common::query_options::RESULT_SETS_RETURN_TYPE;
+
 /// Cap a query result to `max_rows` (Lucee `maxrows`), applied after execution
 /// so it is driver-independent. Handles the query and array return shapes; the
 /// struct (keyColumn) shape is left as-is (row order there is not meaningful).
@@ -14970,6 +14972,12 @@ fn execute_mysql_on_conn(
         CfmlError::database(format!("queryExecute: MySQL {}: {}", ctx, e)).with_extras(extras)
     };
 
+    if return_type == RESULT_SETS_RETURN_TYPE {
+        let result = conn.exec_iter(sql, &params).map_err(|e| map_err(e, "query error"))?;
+        let sets = mysql_result_sets(result, sql, &|e| map_err(e, "query error"))?;
+        return Ok(CfmlValue::array(sets));
+    }
+
     if mysql_returns_rows(sql) {
         // Use a streaming QueryResult so the column metadata is read from the
         // result set itself — NOT inferred from the first row. A zero-row result
@@ -15019,6 +15027,43 @@ fn execute_mysql_on_conn(
         let last_id = conn.last_insert_id() as i64;
         build_mutation_result(affected, last_id, sql)
     }
+}
+
+/// Every result set of a MySQL reply, as queries: a procedure with several
+/// SELECTs returns one per SELECT. The status packet that ends a CALL has no
+/// columns and is not a result set.
+#[cfg(feature = "mysql_db")]
+fn mysql_result_sets<T: mysql::prelude::Protocol>(
+    mut result: mysql::QueryResult<'_, '_, '_, T>,
+    sql: &str,
+    map_err: &dyn Fn(mysql::Error) -> CfmlError,
+) -> Result<Vec<CfmlValue>, CfmlError> {
+    let mut out = Vec::new();
+    while let Some(set) = result.iter() {
+        let (raw_columns, col_types): (Vec<String>, Vec<mysql::consts::ColumnType>) = set
+            .columns()
+            .as_ref()
+            .iter()
+            .map(|c| (c.name_str().to_string(), c.column_type()))
+            .unzip();
+        if raw_columns.is_empty() {
+            for row in set {
+                row.map_err(map_err)?;
+            }
+            continue;
+        }
+        let (columns, keep) = dedup_result_columns(raw_columns);
+        let mut data: Vec<Vec<CfmlValue>> = keep.iter().map(|_| Vec::new()).collect();
+        for row in set {
+            let mut row = row.map_err(map_err)?;
+            for (out_i, &src_i) in keep.iter().enumerate() {
+                let val: mysql::Value = row.take(src_i).unwrap_or(mysql::Value::NULL);
+                data[out_i].push(mysql_value_to_cfml_typed(val, col_types.get(src_i).copied()));
+            }
+        }
+        out.push(build_query_result_columnar(columns, data, sql, "query")?);
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "mysql_db")]
@@ -16129,6 +16174,43 @@ fn run_mssql_statement(
     let rewritten = mssql_rewrite_placeholders(&mssql_call_to_exec(sql));
     let is_select = mssql_returns_rows(sql);
 
+    if return_type == RESULT_SETS_RETURN_TYPE {
+        return mssql_runtime().block_on(async move {
+            use futures_util::TryStreamExt;
+            let param_refs: Vec<&dyn tiberius::ToSql> =
+                bound.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+            let mut stream = client.query(rewritten.as_str(), &param_refs).await
+                .map_err(|e| MssqlRunError::from_tiberius("query error", e, true))?;
+            // Each result set opens with its column metadata, even an empty one,
+            // so a set with no rows still gets its columns and keeps its position.
+            let mut sets: Vec<(Vec<String>, Vec<tiberius::Row>)> = Vec::new();
+            while let Some(item) = stream.try_next().await
+                .map_err(|e| MssqlRunError::from_tiberius("result error", e, true))?
+            {
+                if let Some(meta) = item.as_metadata() {
+                    sets.push((meta.columns().iter().map(|c| c.name().to_string()).collect(), Vec::new()));
+                } else if let Some(row) = item.into_row() {
+                    if sets.is_empty() {
+                        sets.push((row.columns().iter().map(|c| c.name().to_string()).collect(), Vec::new()));
+                    }
+                    if let Some(last) = sets.last_mut() {
+                        last.1.push(row);
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(sets.len());
+            for (raw_columns, rows) in sets {
+                let (columns, keep) = dedup_result_columns(raw_columns);
+                let data: Vec<Vec<CfmlValue>> = keep
+                    .iter()
+                    .map(|&src_i| rows.iter().map(|row| mssql_column_to_cfml(row, src_i)).collect())
+                    .collect();
+                out.push(build_query_result_columnar(columns, data, sql, "query").map_err(MssqlRunError::from_cfml)?);
+            }
+            Ok(CfmlValue::array(out))
+        });
+    }
+
     mssql_runtime().block_on(async move {
         let param_refs: Vec<&dyn tiberius::ToSql> =
             bound.iter().map(|p| p as &dyn tiberius::ToSql).collect();
@@ -16854,6 +16936,13 @@ fn execute_mysql_with_conn(conn: &mut MysqlPooledConn, sql: &str, params_arg: &C
     };
     let sql: &str = &final_sql;
 
+    if return_type == RESULT_SETS_RETURN_TYPE {
+        let query_error = |e: mysql::Error| CfmlError::database(format!("queryExecute: MySQL query error: {}", e));
+        let result = conn.exec_iter(sql, &params).map_err(query_error)?;
+        let sets = mysql_result_sets(result, sql, &query_error)?;
+        return Ok(CfmlValue::array(sets));
+    }
+
     if mysql_returns_rows(sql) {
         // Columns come from the RESULT-SET metadata, exactly as on the
         // non-transaction path (execute_mysql_on_conn). Deriving them from the
@@ -16956,6 +17045,9 @@ pub fn build_query_result_columnar(
     sql: &str,
     return_type: &str,
 ) -> CfmlResult {
+    if return_type == RESULT_SETS_RETURN_TYPE {
+        return Ok(CfmlValue::array(vec![build_query_result_columnar(columns, data, sql, "query")?]));
+    }
     if return_type == "array" || return_type == "struct" || return_type.starts_with("struct:") {
         let keys: Vec<cfml_common::key::Key> = columns.iter().map(cfml_common::key::Key::new).collect();
         let nrows = data.first().map_or(0, |c| c.len());

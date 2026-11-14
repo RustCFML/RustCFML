@@ -27,6 +27,7 @@ pub mod numeric;
 pub mod objcodec;
 pub mod perf_counters;
 pub mod position;
+pub mod query_options;
 pub mod session_cookie;
 pub mod stack_guard;
 pub mod text;
