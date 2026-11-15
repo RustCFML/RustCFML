@@ -381,6 +381,7 @@ include "harness.cfm";
 <cf_runtest file="database/test_query_error_catch_type_database.cfm" />
 <cf_runtest file="database/test_transaction_statement_datasource.cfm" rustcfmlOnly="true" why="the Lucee harness has no SQLite JDBC driver (Lucee 7.1 behaviour probed on PostgreSQL: each datasource runs in the transaction on its own connection)" />
 <cf_runtest file="database/test_transaction_multi_datasource.cfm" rustcfmlOnly="true" why="the Lucee harness has no SQLite JDBC driver" />
+<cf_runtest file="database/test_transaction_commit_nested.cfm" rustcfmlOnly="true" why="requires RUSTCFML_TEST_PG_URL" />
 <cf_runtest file="database/test_query_error_sqlstate_members.cfm" />
 <cf_runtest file="database/test_mysql_jdbc_connection_string.cfm" />
 <cf_runtest file="database/test_pg_comment_placeholder_scan.cfm" />

@@ -16752,6 +16752,77 @@ impl Drop for MysqlTxnConn {
     }
 }
 
+/// A PostgreSQL transaction connection plus tracking for whether an explicit
+/// transaction is still open. Preside's PostgreSQL adapter runs a raw `COMMIT`
+/// after inserts (requiresManualCommitForTransactions()=true); when that happens
+/// inside a `transaction {}` block, it ends the transaction RustCFML opened with
+/// BEGIN. A nested `transaction {}` then issues SAVEPOINT, and PostgreSQL fails:
+/// "SAVEPOINT can only be used in transaction blocks". Lucee with pgjdbc (autocommit
+/// off) lazily re-issues BEGIN before the next statement, so this works.
+///
+/// `open` tracks whether the transaction is (still) open: set at BEGIN, cleared
+/// by COMMIT or bare ROLLBACK. When a SAVEPOINT is about to be issued on a closed
+/// transaction, a new BEGIN is lazily issued first to restore the transaction block.
+#[cfg(feature = "postgres_db")]
+struct PostgresTxnConn {
+    conn: r2d2::PooledConnection<PostgresConnectionManager>,
+    open: bool,
+}
+
+#[cfg(feature = "postgres_db")]
+impl PostgresTxnConn {
+    /// Update `open` for a statement about to run on this connection.
+    /// Transaction-control statements steer `open`; savepoint operations are
+    /// transaction-scoped and neutral; everything else is neutral.
+    fn note_sql(&mut self, sql: &str) {
+        let trimmed = strip_leading_sql_noise(sql);
+        let kw_len = trimmed
+            .as_bytes()
+            .iter()
+            .take_while(|b| b.is_ascii_alphabetic())
+            .count();
+        let kw = trimmed[..kw_len].to_ascii_uppercase();
+        match kw.as_str() {
+            "BEGIN" | "START" => self.open = true,
+            "COMMIT" => self.open = false,
+            "ROLLBACK" => {
+                let rest = trimmed[kw_len..].trim_start();
+                let to = rest
+                    .get(..2)
+                    .map(|s| s.eq_ignore_ascii_case("to"))
+                    .unwrap_or(false);
+                if !to {
+                    self.open = false;
+                }
+            }
+            "SAVEPOINT" | "RELEASE" => {}
+            _ => {}
+        }
+    }
+
+    /// Lazily re-BEGIN if the transaction was closed by a raw COMMIT or ROLLBACK.
+    /// Called before SAVEPOINT operations to ensure the transaction block exists.
+    fn ensure_transaction_open(&mut self) -> Result<(), CfmlError> {
+        if !self.open {
+            let pg = &mut *self.conn;
+            match pg.client.simple_query("BEGIN") {
+                Ok(_) => {
+                    self.open = true;
+                    Ok(())
+                }
+                Err(e) => {
+                    if e.is_closed() {
+                        pg.broken = true;
+                    }
+                    Err(CfmlError::database(format!("cftransaction: lazy BEGIN error: {}", e)))
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Enum to hold driver-specific transaction connections
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 enum TransactionConn {
@@ -16760,7 +16831,7 @@ enum TransactionConn {
     #[cfg(feature = "mysql_db")]
     Mysql(MysqlTxnConn),
     #[cfg(feature = "postgres_db")]
-    Postgres(r2d2::PooledConnection<PostgresConnectionManager>),
+    Postgres(PostgresTxnConn),
     #[cfg(feature = "mssql_db")]
     Mssql(r2d2::PooledConnection<MssqlConnectionManager>),
     /// A transaction owned by an extension-supplied driver. Deliberately NOT
@@ -16860,7 +16931,10 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
                 }
                 return Err(CfmlError::database(format!("cftransaction: BEGIN error: {}", e)));
             }
-            Ok(TransactionConn::Postgres(conn))
+            Ok(TransactionConn::Postgres(PostgresTxnConn {
+                conn,
+                open: true,
+            }))
         }
         #[cfg(feature = "mssql_db")]
         DbDriver::Mssql(url) => {
@@ -16903,9 +16977,12 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
-            let pg = &mut **c;
+            let pg = &mut *c.conn;
             match pg.client.simple_query("COMMIT") {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    c.open = false;
+                    Ok(())
+                }
                 Err(e) => {
                     if e.is_closed() {
                         pg.broken = true;
@@ -16945,9 +17022,12 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
-            let pg = &mut **c;
+            let pg = &mut *c.conn;
             match pg.client.simple_query("ROLLBACK") {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    c.open = false;
+                    Ok(())
+                }
                 Err(e) => {
                     if e.is_closed() {
                         pg.broken = true;
@@ -17041,12 +17121,13 @@ fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
+            c.ensure_transaction_open()?;
             let sql = match op {
                 SavepointOp::Create => format!("SAVEPOINT {}", name),
                 SavepointOp::Release => format!("RELEASE SAVEPOINT {}", name),
                 SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
             };
-            let pg = &mut **c;
+            let pg = &mut *c.conn;
             match pg.client.simple_query(&sql) {
                 Ok(_) => Ok(()),
                 Err(e) => {
@@ -17119,7 +17200,8 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
-            execute_postgres_with_conn(&mut **c, sql, params_arg, return_type)
+            c.note_sql(sql);
+            execute_postgres_with_conn(&mut *c.conn, sql, params_arg, return_type)
         }
         #[cfg(feature = "mssql_db")]
         TransactionConn::Mssql(c) => {
