@@ -80,6 +80,25 @@ try {
 		assert("C: surviving row is ID 40", qRows.id[1], 40);
 	}
 
+	// Test B2: statement form (no braces) - COMMIT, INSERT, rollback statement
+	queryExecute("DELETE FROM rcfml_tx_probe", [], {datasource:ds});
+	try {
+		transaction {
+			queryExecute("INSERT INTO rcfml_tx_probe VALUES (10)", [], {datasource:ds});
+			queryExecute("COMMIT", [], {datasource:ds});
+			queryExecute("INSERT INTO rcfml_tx_probe VALUES (20)", [], {datasource:ds});
+			transaction action="rollback";
+		}
+	} catch (any e) {
+		// ignore
+	}
+	qCount = queryExecute("SELECT COUNT(*) AS cnt FROM rcfml_tx_probe", [], {datasource:ds});
+	qRows = queryExecute("SELECT id FROM rcfml_tx_probe ORDER BY id", [], {datasource:ds});
+	assert("B2: statement form - only row 10 survives", qCount.cnt, 1);
+	if (qRows.recordCount > 0) {
+		assert("B2: surviving row is ID 10", qRows.id[1], 10);
+	}
+
 	// Test D: nested transaction with savepoint after commit
 	queryExecute("DELETE FROM rcfml_tx_probe", [], {datasource:ds});
 	try {
@@ -98,6 +117,25 @@ try {
 		assert("D: all three rows inserted", qCount.cnt, 3);
 	} catch (any e) {
 		assert("D: should not throw", "", "ERROR: " & e.message);
+	}
+
+	// Test E: statements after action="rollback" (Lucee parity achieved)
+	// Row 100 is rolled back by action="rollback", row 200 is committed by block end
+	queryExecute("DELETE FROM rcfml_tx_probe", [], {datasource:ds});
+	try {
+		transaction {
+			queryExecute("INSERT INTO rcfml_tx_probe VALUES (100)", [], {datasource:ds});
+			transaction action="rollback";
+			queryExecute("INSERT INTO rcfml_tx_probe VALUES (200)", [], {datasource:ds});
+		}
+		qCount = queryExecute("SELECT COUNT(*) AS cnt FROM rcfml_tx_probe", [], {datasource:ds});
+		qRows = queryExecute("SELECT id FROM rcfml_tx_probe ORDER BY id", [], {datasource:ds});
+		assert("E: only row 200 survives (Lucee parity)", qCount.cnt, 1);
+		if (qRows.recordCount > 0) {
+			assert("E: surviving row is ID 200", qRows.id[1], 200);
+		}
+	} catch (any e) {
+		assert("E: should not throw", "", "ERROR: " & e.message);
 	}
 
 } finally {

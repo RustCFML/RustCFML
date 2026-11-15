@@ -1018,6 +1018,7 @@ include "harness.cfm";
 <!--- above (which has a body). A bare transaction{} block is the in-suite --->
 <!--- control. --->
 <cf_runtest file="tags/test_transaction_action_statement.cfm" />
+<cf_runtest file="tags/test_transaction_action_braces.cfm" />
 <!--- - nested_transaction: a transaction{} block nested inside another --->
 <!--- transaction{} block. Lucee/ACF/BoxLang run the inner as a savepoint and --->
 <!--- complete; RustCFML throws "nested transactions are not supported". Wheels --->
