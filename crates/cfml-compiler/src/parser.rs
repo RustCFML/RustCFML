@@ -4594,6 +4594,39 @@ impl Parser {
                         value: LiteralValue::String("begin".to_string()),
                         location: loc,
                     }));
+                
+                // Special case: `transaction action="commit" {}` or `transaction action="rollback" {}`
+                // should emit the single statement, not a full transaction block, matching the
+                // tag form <cftransaction action="commit"></cftransaction> and the bodyless
+                // CFScript form `transaction action="commit";`.
+                if let Expression::Literal(Literal { value: LiteralValue::String(action_str), .. }) = &action_expr {
+                    let action_lower = action_str.to_lowercase();
+                    if action_lower == "commit" {
+                        return CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                            expr: Expression::FunctionCall(Box::new(FunctionCall {
+                                name: Box::new(Expression::Identifier(Identifier {
+                                    name: "__cftransaction_commit".to_string(),
+                                    location: loc,
+                                })),
+                                arguments: vec![],
+                                location: loc,
+                            })),
+                            location: loc,
+                        }));
+                    } else if action_lower == "rollback" {
+                        return CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                            expr: Expression::FunctionCall(Box::new(FunctionCall {
+                                name: Box::new(Expression::Identifier(Identifier {
+                                    name: "__cftransaction_rollback".to_string(),
+                                    location: loc,
+                                })),
+                                arguments: vec![],
+                                location: loc,
+                            })),
+                            location: loc,
+                        }));
+                    }
+                }
                 // `isolation` and `datasource` used to be dropped here — the
                 // BLOCK form `transaction datasource="other" { … }` silently ran
                 // on the DEFAULT datasource while the tag form honoured the

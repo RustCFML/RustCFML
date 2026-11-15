@@ -37063,6 +37063,11 @@ impl CfmlVirtualMachine {
 
     /// `__cftransaction_commit` — close the innermost open level.
     fn cftransaction_commit(&mut self) -> CfmlResult {
+        // If depth is 0, the transaction was already completed (committed or
+        // rolled back) by an explicit action="commit" or action="rollback".
+        if self.transaction_depth == 0 {
+            return Ok(CfmlValue::Null);
+        }
         // Committing a nested block releases its savepoint and leaves
         // the outer transaction open (Lucee/ACF/BoxLang semantics).
         if self.transaction_depth >= 2 {

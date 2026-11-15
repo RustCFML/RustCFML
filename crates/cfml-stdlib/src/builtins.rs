@@ -17200,6 +17200,7 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         }
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
+            c.ensure_transaction_open()?;
             c.note_sql(sql);
             execute_postgres_with_conn(&mut *c.conn, sql, params_arg, return_type)
         }

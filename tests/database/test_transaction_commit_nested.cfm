@@ -54,7 +54,11 @@ try {
 		// ignore rollback errors
 	}
 	qCount = queryExecute("SELECT COUNT(*) AS cnt FROM rcfml_tx_probe", [], {datasource:ds});
-	assert("B: row 10 survives after commit", qCount.cnt >= 1, true);
+	qRows = queryExecute("SELECT id FROM rcfml_tx_probe ORDER BY id", [], {datasource:ds});
+	assert("B: only row 10 survives (committed before COMMIT)", qCount.cnt, 1);
+	if (qRows.recordCount > 0) {
+		assert("B: surviving row is ID 10", qRows.id[1], 10);
+	}
 
 	// Test C: bare rollback mid-transaction
 	queryExecute("DELETE FROM rcfml_tx_probe", [], {datasource:ds});
@@ -68,9 +72,13 @@ try {
 		// ignore any errors
 	}
 	qCount = queryExecute("SELECT COUNT(*) AS cnt FROM rcfml_tx_probe", [], {datasource:ds});
+	qRows = queryExecute("SELECT id FROM rcfml_tx_probe ORDER BY id", [], {datasource:ds});
 	// After ROLLBACK, the transaction is closed, so the next INSERT runs outside
-	// a transaction and commits immediately
-	assert("C: row 40 exists after bare ROLLBACK", qCount.cnt >= 1, true);
+	// a transaction (after lazy re-BEGIN) and commits immediately
+	assert("C: only row 40 survives (inserted after ROLLBACK)", qCount.cnt, 1);
+	if (qRows.recordCount > 0) {
+		assert("C: surviving row is ID 40", qRows.id[1], 40);
+	}
 
 	// Test D: nested transaction with savepoint after commit
 	queryExecute("DELETE FROM rcfml_tx_probe", [], {datasource:ds});
