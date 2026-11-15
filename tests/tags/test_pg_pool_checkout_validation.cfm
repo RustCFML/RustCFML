@@ -77,7 +77,7 @@ if (NOT pgskip) {
     // forms. Any such call after the reset can only come from the pool's
     // per-checkout is_valid — the test issues no bare `SELECT 1` itself.
     q = queryExecute(
-        "SELECT COALESCE(SUM(calls), 0)::int AS n FROM pg_stat_statements "
+        "SELECT COALESCE(SUM(calls), 0)::::int AS n FROM pg_stat_statements "
         & "WHERE query IN ('SELECT $1', 'SELECT 1')",
         [],
         { datasource: pgdsn }

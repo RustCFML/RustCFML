@@ -49,7 +49,10 @@ use std::sync::Arc;
 /// - 5: a block-bodied arrow function compiles to `__arrow_N`, not
 ///   `__closure_N` (the name is how isClosure/isValid/isCustomFunction tell a
 ///   lambda from a closure)
-pub const BYTECODE_FORMAT_VERSION: u32 = 5;
+/// - 6: in-block transaction actions compile to `__cftransaction_action`;
+///   `__cftransaction_commit`/`_rollback` now only end a block (bytecode from
+///   the old lowering would run an in-block rollback as a block end)
+pub const BYTECODE_FORMAT_VERSION: u32 = 6;
 
 /// Compute cache key for a source file, optionally including the source path.
 /// The path component ensures that the same file compiled via different paths

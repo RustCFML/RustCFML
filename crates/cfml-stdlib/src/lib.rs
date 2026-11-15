@@ -21,6 +21,7 @@ pub mod markdown;
 pub mod pdf;
 pub mod db_driver;
 pub mod pg_sql;
+pub mod txn_sql;
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub mod dbinfo;
 #[cfg(feature = "s3")]

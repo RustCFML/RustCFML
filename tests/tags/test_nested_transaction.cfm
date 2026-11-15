@@ -1,13 +1,14 @@
 <cfscript>
-suiteBegin("Tags: nested cftransaction blocks (savepoint semantics)");
+suiteBegin("Tags: nested cftransaction blocks run to completion");
 
 // ============================================================
 // Background  (gap surfaced laddering the Wheels framework test suite on RustCFML 0.220.0–0.228.0)
 // ============================================================
 // A `transaction { ... }` block may be NESTED inside another `transaction { ... }`
-// block. Lucee/ACF/BoxLang implement the inner block as a SAVEPOINT on the
-// already-open outer transaction, so the code runs to completion. RustCFML
-// instead throws at the inner block:
+// block. Lucee 7.1 runs the inner block as part of the already-open outer
+// transaction (it joins it; see test_transaction_lucee_semantics.cfm for the
+// data-level semantics), so the code runs to completion. RustCFML used to
+// throw at the inner block:
 //   "cftransaction: nested transactions are not supported"
 //
 // Wheels relies on this heavily: model save()/create() and the migrator wrap
@@ -18,7 +19,7 @@ suiteBegin("Tags: nested cftransaction blocks (savepoint semantics)");
 // transaction aborts here.
 //
 // No datasource is required: with no query inside, the outer begin and the
-// inner savepoint are no-ops on Lucee/ACF/BoxLang, so the surrounding code
+// inner block are no-ops on Lucee/ACF/BoxLang, so the surrounding code
 // simply runs (same rationale as test_transaction_action_statement.cfm).
 //
 // catch-body locals don't persist on every engine (BoxLang discards a nested

@@ -29,6 +29,7 @@ pub mod perf_counters;
 pub mod position;
 pub mod query_options;
 pub mod session_cookie;
+pub mod sql_colons;
 pub mod stack_guard;
 pub mod text;
 pub mod vfs;

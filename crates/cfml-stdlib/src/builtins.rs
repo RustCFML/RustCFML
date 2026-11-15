@@ -1093,6 +1093,13 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cftransaction_commit".to_string(), fn_cftransaction_commit_stub);
     f.insert("__cftransaction_rollback".to_string(), fn_cftransaction_rollback_stub);
     f.insert("__cftransaction_end".to_string(), fn_cftransaction_end_stub);
+    // In-block transaction actions and their script BIFs (Lucee): they act on
+    // the open transaction the VM holds, so they only work as VM intercepts.
+    f.insert("__cftransaction_action".to_string(), fn_cftransaction_action_stub);
+    f.insert("transactioncommit".to_string(), fn_cftransaction_action_stub);
+    f.insert("transactionrollback".to_string(), fn_cftransaction_action_stub);
+    f.insert("transactionsetsavepoint".to_string(), fn_cftransaction_action_stub);
+    f.insert("iswithintransaction".to_string(), fn_cftransaction_action_stub);
     f.insert("cfdirectory".to_string(), fn_cfdirectory);
     f.insert("cffile".to_string(), fn_cffile);
     f.insert("cfadmin".to_string(), fn_cfadmin_stub);
@@ -14890,7 +14897,7 @@ fn sqlite_to_cfml(val: rusqlite::types::Value) -> CfmlValue {
 /// the named path must do the same. Coercion mirrors coerce_by_sqltype_value:
 /// cf_sql_bit/boolean "true"/"false"/"1"/"0" -> Bool (bound as 1/0), the integer/
 /// float families parse the string, everything else is left as-is.
-#[cfg(feature = "mysql_db")]
+#[cfg(any(feature = "mysql_db", feature = "mssql_db"))]
 fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
     let unwrapped = cfqueryparam_unwrap(v);
     if matches!(unwrapped, CfmlValue::Null) {
@@ -14912,7 +14919,7 @@ fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
 /// the positional-array path does in `normalize_query_params`, so the named
 /// (`:name`) path produces the same `IN (?,?,…)` binding instead of stuffing a
 /// chr(31)-joined list into a single placeholder.
-#[cfg(feature = "mysql_db")]
+#[cfg(any(feature = "mysql_db", feature = "mssql_db"))]
 fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
     if let CfmlValue::Struct(s) = v {
         let has_value_key = s.data_contains_key("value");
@@ -14959,9 +14966,14 @@ fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
 /// literals and `--` / `/* */` comments are skipped so a `:` (or an apostrophe
 /// that would open a phantom string) inside them is not treated as a
 /// placeholder. `list=true` params expand to `?,?,…` (one per element). Mirrors
-/// build_sqlite_params' rewrite.
-#[cfg(feature = "mysql_db")]
-fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> Result<(String, Vec<CfmlValue>), CfmlError> {
+/// build_sqlite_params' rewrite. Used by MySQL and SQL Server.
+///
+/// A `::` is never the start of a placeholder: it is a cast (`x::int`) or a
+/// SQL Server static method (`geography::Point`), which a `params` call spells
+/// `::::` (see `cfml_common::sql_colons`). SQL Server `[bracketed]`
+/// identifiers are skipped like quoted ones.
+#[cfg(any(feature = "mysql_db", feature = "mssql_db"))]
+fn named_to_positional(sql: &str, map: &CfmlStruct) -> Result<(String, Vec<CfmlValue>), CfmlError> {
     let mut result = Vec::new();
     let mut out_sql = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -14969,6 +14981,10 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> Result<(String, Vec
     let mut i = 0;
     let mut seg_start = 0; // byte offset of unflushed literal text
     while i < len {
+        if bytes[i] == b':' && i + 1 < len && bytes[i + 1] == b':' {
+            i += 2;
+            continue;
+        }
         if bytes[i] == b':' && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
             let start = i + 1;
             let mut end = start;
@@ -15002,9 +15018,9 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> Result<(String, Vec
                 continue;
             }
         }
-        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+        if matches!(bytes[i], b'\'' | b'"' | b'`' | b'[') {
             // Quoted string or identifier: a `:` inside is not a placeholder.
-            let quote = bytes[i];
+            let quote = if bytes[i] == b'[' { b']' } else { bytes[i] };
             i += 1;
             while i < len && bytes[i] != quote {
                 i += 1;
@@ -15179,7 +15195,7 @@ fn execute_mysql_on_conn(
         // placeholder-free SQL). Lucee treats empty params as no params.
         CfmlValue::Struct(map) if map.is_empty() => (std::borrow::Cow::Borrowed(sql), Params::Empty),
         CfmlValue::Struct(map) => {
-            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map)?;
+            let (rewritten, vals_cfml) = named_to_positional(sql, map)?;
             let vals: Vec<mysql::Value> =
                 vals_cfml.iter().map(|v| cfml_to_mysql_value(v)).collect();
             let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
@@ -16181,10 +16197,31 @@ fn postgres_row_to_cfml_typed(row: &postgres::Row, col_idx: usize) -> CfmlValue 
 // MSSQL driver (tiberius)
 // -----------------------------------------------
 
+/// Named `:name` params for SQL Server: rewritten to positional `?` (which the
+/// statement runner turns into `@P1…`), as on MySQL. tiberius has no named
+/// binding, and the struct used to fall through as "no params", so every
+/// `queryExecute(sql, { … })` sent a literal `:name` to the server ("Incorrect
+/// syntax near ':'"). An empty struct means no params, as on Lucee.
+#[cfg(feature = "mssql_db")]
+fn mssql_bind_named<'a>(
+    sql: &'a str,
+    params_arg: &'a CfmlValue,
+) -> Result<(std::borrow::Cow<'a, str>, std::borrow::Cow<'a, CfmlValue>), CfmlError> {
+    match params_arg {
+        CfmlValue::Struct(map) if !map.is_empty() => {
+            let (rewritten, values) = named_to_positional(sql, map)?;
+            Ok((std::borrow::Cow::Owned(rewritten), std::borrow::Cow::Owned(CfmlValue::array(values))))
+        }
+        _ => Ok((std::borrow::Cow::Borrowed(sql), std::borrow::Cow::Borrowed(params_arg))),
+    }
+}
+
 #[cfg(feature = "mssql_db")]
 fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     // Normalize params before touching the pool.
-    let (effective_params, _type_hints) = normalize_query_params(params_arg);
+    let (sql, params_arg) = mssql_bind_named(sql, params_arg)?;
+    let sql: &str = &sql;
+    let (effective_params, _type_hints) = normalize_query_params(&params_arg);
 
     let pool = get_mssql_pool(url)?;
 
@@ -16498,13 +16535,19 @@ fn run_mssql_statement(
                 .collect();
 
             build_query_result_columnar(columns, data, sql, return_type).map_err(MssqlRunError::from_cfml)
-        } else if bound.is_empty() && mssql_is_batch_only_ddl(sql) {
+        } else if bound.is_empty()
+            && (mssql_is_batch_only_ddl(sql) || crate::txn_sql::is_mssql_txn_control(sql))
+        {
             // tiberius sends every statement as a PARAMETERISED sp_executesql
             // (an `@params` argument, even when empty), and SQL Server refuses
             // CREATE/ALTER PROCEDURE, VIEW, FUNCTION and TRIGGER there
-            // ("Incorrect syntax near the keyword 'PROCEDURE'"). The JDBC
-            // driver runs a statement with no parameters as a plain batch;
-            // so does this. DDL reports no row count.
+            // ("Incorrect syntax near the keyword 'PROCEDURE'"). A raw
+            // COMMIT/ROLLBACK/BEGIN/SAVE TRANSACTION fails there too, because
+            // it changes @@TRANCOUNT inside the EXECUTE ("Transaction count
+            // after EXECUTE indicates a mismatching number of BEGIN and COMMIT
+            // statements"). The JDBC driver runs a statement with no
+            // parameters as a plain batch; so does this. These report no row
+            // count.
             client.simple_query(rewritten.as_str()).await
                 .map_err(|e| MssqlRunError::from_tiberius("error", e, false))?
                 .into_results().await
@@ -16680,81 +16723,40 @@ fn mssql_column_to_cfml_typed(row: &tiberius::Row, col_idx: usize) -> CfmlValue 
 // Transaction support (public functions called by VM)
 // -----------------------------------------------
 
-/// A MySQL transaction connection plus the state deciding whether it must be
-/// reset (COM_RESET_CONNECTION) when it returns to the pool. A reset wipes the
+/// A MySQL transaction connection plus whether it must be reset
+/// (COM_RESET_CONNECTION) when it returns to the pool. A reset wipes the
 /// connection's server-side prepared statements, so a fleet of per-write
 /// `cftransaction` blocks (Preside wraps most writes in one) would otherwise
 /// re-prepare its statements on every single transaction.
 ///
-/// `open` tracks whether an explicit transaction is (still) open: set at BEGIN,
-/// cleared only by a SUCCESSFUL commit/rollback. `dirty` tracks session-state
-/// mutation via the same `mysql_sql_is_session_risky` classifier as the
-/// request-held path. On drop, a connection that is provably closed and clean
-/// skips the reset (one-shot `reset_connection(false)`); every other state —
-/// abandoned BEGIN, failed commit, risky SQL — keeps the pool-default full
-/// reset, which also rolls the transaction back (GH #275 / #308 safety).
+/// `dirty` tracks session-state mutation via the same
+/// `mysql_sql_is_session_risky` classifier as the request-held path. On drop
+/// (see `TransactionConn`'s `Drop`), a connection that is provably closed and
+/// clean skips the reset (one-shot `reset_connection(false)`); every other
+/// state — abandoned BEGIN, failed commit, risky SQL — keeps the pool-default
+/// full reset, which also rolls the transaction back (GH #275 / #308 safety).
 #[cfg(feature = "mysql_db")]
 struct MysqlTxnConn {
     conn: MysqlPooledConn,
-    open: bool,
     dirty: bool,
 }
 
+/// True for the transaction-control keywords that leave no session state
+/// behind once the transaction is closed, so they never make a MySQL
+/// connection dirty.
 #[cfg(feature = "mysql_db")]
-impl MysqlTxnConn {
-    /// Update `open`/`dirty` for a statement about to run on this connection.
-    /// Transaction-control statements steer `open` and are NOT dirty (they
-    /// leave no session state behind once the transaction is closed); savepoint
-    /// operations are transaction-scoped and neutral; everything else goes
-    /// through the session-risk classifier.
-    fn note_sql(&mut self, sql: &str) {
-        let trimmed = strip_leading_sql_noise(sql);
-        let kw_len = trimmed
-            .as_bytes()
-            .iter()
-            .take_while(|b| b.is_ascii_alphabetic())
-            .count();
-        let kw = trimmed[..kw_len].to_ascii_uppercase();
-        match kw.as_str() {
-            "BEGIN" | "START" => self.open = true,
-            "COMMIT" => self.open = false,
-            // `ROLLBACK TO SAVEPOINT x` keeps the transaction open; a bare
-            // ROLLBACK closes it.
-            "ROLLBACK" => {
-                let rest = trimmed[kw_len..].trim_start();
-                let to = rest
-                    .get(..2)
-                    .map(|s| s.eq_ignore_ascii_case("to"))
-                    .unwrap_or(false);
-                if !to {
-                    self.open = false;
-                }
-            }
-            "SAVEPOINT" | "RELEASE" => {}
-            _ => {
-                if mysql_sql_is_session_risky(sql) {
-                    self.dirty = true;
-                }
-            }
-        }
-    }
+fn mysql_is_txn_control(sql: &str) -> bool {
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    matches!(
+        trimmed[..kw_len].to_ascii_uppercase().as_str(),
+        "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
+    )
 }
 
-#[cfg(feature = "mysql_db")]
-impl Drop for MysqlTxnConn {
-    fn drop(&mut self) {
-        if !self.open && !self.dirty {
-            // Closed and clean: disarm COM_RESET_CONNECTION for this return so
-            // the prepared-statement cache survives for the next transaction.
-            // One-shot — the return path re-arms it.
-            self.conn.needs_reset = false;
-        }
-    }
-}
-
-/// Enum to hold driver-specific transaction connections
+/// The driver-specific half of a transaction connection.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-enum TransactionConn {
+enum TxnKind {
     #[cfg(feature = "sqlite")]
     Sqlite(r2d2::PooledConnection<SqliteConnectionManager>),
     #[cfg(feature = "mysql_db")]
@@ -16765,7 +16767,227 @@ enum TransactionConn {
     Mssql(r2d2::PooledConnection<MssqlConnectionManager>),
     /// A transaction owned by an extension-supplied driver. Deliberately NOT
     /// feature-gated — a build with no bundled driver can still have one.
-    Dynamic(Box<dyn crate::db_driver::DynamicTransaction>),
+    /// `datasource` is kept so the transaction can be begun again after an
+    /// in-block commit or rollback.
+    Dynamic {
+        txn: Box<dyn crate::db_driver::DynamicTransaction>,
+        datasource: String,
+    },
+}
+
+/// A connection held for the life of a `cftransaction`.
+///
+/// `open` says whether a database transaction is open on the connection right
+/// now. A `cftransaction` outlives the database transactions inside it: an
+/// in-block `action="commit"`/`"rollback"`, a raw `COMMIT`/`ROLLBACK` sent
+/// through `queryExecute`, or (on MySQL) a DDL statement's implicit commit all
+/// end the database transaction, and the next statement or savepoint begins a
+/// new one. That is what Lucee does by running the block with JDBC autocommit
+/// off (GH #536, #537). A commit or rollback with nothing open does nothing.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+struct TransactionConn {
+    kind: TxnKind,
+    open: bool,
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+impl Drop for TransactionConn {
+    fn drop(&mut self) {
+        #[cfg(feature = "mysql_db")]
+        if let TxnKind::Mysql(c) = &mut self.kind {
+            if !self.open && !c.dirty {
+                // Closed and clean: disarm COM_RESET_CONNECTION for this return
+                // so the prepared-statement cache survives for the next
+                // transaction. One-shot — the return path re-arms it.
+                c.conn.needs_reset = false;
+            }
+        }
+    }
+}
+
+/// Run a transaction-control statement on a pooled PostgreSQL connection,
+/// marking the connection broken if the server has gone away.
+#[cfg(feature = "postgres_db")]
+fn pg_txn_control(pg: &mut PgConn, sql: &str, label: &str) -> Result<(), CfmlError> {
+    match pg.client.simple_query(sql) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.is_closed() {
+                pg.broken = true;
+            }
+            // The cause chain carries the server's message; the bare error
+            // reads only "db error".
+            Err(CfmlError::database(format_pg_error(&format!("cftransaction: {} error", label), &e)))
+        }
+    }
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+impl TransactionConn {
+    fn new(kind: TxnKind) -> Self {
+        TransactionConn { kind, open: true }
+    }
+
+    /// The SQL dialect of the connection; `None` for an extension driver,
+    /// whose SQL RustCFML does not interpret.
+    fn dialect(&self) -> Option<crate::txn_sql::TxnDialect> {
+        use crate::txn_sql::TxnDialect;
+        match &self.kind {
+            TxnKind::Dynamic { .. } => None,
+            #[cfg(feature = "sqlite")]
+            TxnKind::Sqlite(_) => Some(TxnDialect::Sqlite),
+            #[cfg(feature = "mysql_db")]
+            TxnKind::Mysql(_) => Some(TxnDialect::Mysql),
+            #[cfg(feature = "postgres_db")]
+            TxnKind::Postgres(_) => Some(TxnDialect::Postgres),
+            #[cfg(feature = "mssql_db")]
+            TxnKind::Mssql(_) => Some(TxnDialect::Mssql),
+        }
+    }
+
+    /// Begin a database transaction if none is open on the connection.
+    fn ensure_open(&mut self) -> Result<(), CfmlError> {
+        if self.open {
+            return Ok(());
+        }
+        match &mut self.kind {
+            TxnKind::Dynamic { txn, datasource } => {
+                let driver = crate::db_driver::lookup_dynamic_datasource(datasource).ok_or_else(|| {
+                    CfmlError::database(format!(
+                        "cftransaction: datasource '{}' is no longer registered",
+                        datasource
+                    ))
+                })?;
+                *txn = driver.begin("")?;
+            }
+            #[cfg(feature = "sqlite")]
+            TxnKind::Sqlite(c) => c
+                .execute_batch("BEGIN")
+                .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?,
+            #[cfg(feature = "mysql_db")]
+            TxnKind::Mysql(c) => {
+                use mysql::prelude::Queryable;
+                c.conn
+                    .query_drop("BEGIN")
+                    .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?
+            }
+            #[cfg(feature = "postgres_db")]
+            TxnKind::Postgres(c) => pg_txn_control(&mut **c, "BEGIN", "BEGIN")?,
+            #[cfg(feature = "mssql_db")]
+            TxnKind::Mssql(c) => {
+                // SQL Server nests BEGIN TRANSACTION by @@TRANCOUNT, so only
+                // begin when nothing is open: user SQL may have begun one.
+                let m = &mut **c;
+                mssql_txn_control(&mut m.client, &mut m.broken, "IF @@TRANCOUNT = 0 BEGIN TRANSACTION", "BEGIN")?
+            }
+        }
+        self.open = true;
+        Ok(())
+    }
+
+    /// Commit the open database transaction, if there is one.
+    fn commit(&mut self) -> Result<(), CfmlError> {
+        if !self.open {
+            return Ok(());
+        }
+        match &mut self.kind {
+            TxnKind::Dynamic { txn, .. } => txn.commit()?,
+            #[cfg(feature = "sqlite")]
+            TxnKind::Sqlite(c) => c
+                .execute_batch("COMMIT")
+                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))?,
+            #[cfg(feature = "mysql_db")]
+            TxnKind::Mysql(c) => {
+                use mysql::prelude::Queryable;
+                // On error `open` stays true, so the drop path keeps the full
+                // pool reset (which rolls back).
+                c.conn
+                    .query_drop("COMMIT")
+                    .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))?
+            }
+            #[cfg(feature = "postgres_db")]
+            TxnKind::Postgres(c) => pg_txn_control(&mut **c, "COMMIT", "COMMIT")?,
+            #[cfg(feature = "mssql_db")]
+            TxnKind::Mssql(c) => {
+                let m = &mut **c;
+                mssql_txn_control(&mut m.client, &mut m.broken, "IF @@TRANCOUNT > 0 COMMIT TRANSACTION", "COMMIT")?
+            }
+        }
+        self.open = false;
+        Ok(())
+    }
+
+    /// Roll back the open database transaction, if there is one.
+    fn rollback(&mut self) -> Result<(), CfmlError> {
+        if !self.open {
+            return Ok(());
+        }
+        match &mut self.kind {
+            TxnKind::Dynamic { txn, .. } => txn.rollback()?,
+            #[cfg(feature = "sqlite")]
+            TxnKind::Sqlite(c) => c
+                .execute_batch("ROLLBACK")
+                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))?,
+            #[cfg(feature = "mysql_db")]
+            TxnKind::Mysql(c) => {
+                use mysql::prelude::Queryable;
+                c.conn
+                    .query_drop("ROLLBACK")
+                    .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))?
+            }
+            #[cfg(feature = "postgres_db")]
+            TxnKind::Postgres(c) => pg_txn_control(&mut **c, "ROLLBACK", "ROLLBACK")?,
+            #[cfg(feature = "mssql_db")]
+            TxnKind::Mssql(c) => {
+                let m = &mut **c;
+                mssql_txn_control(&mut m.client, &mut m.broken, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", "ROLLBACK")?
+            }
+        }
+        self.open = false;
+        Ok(())
+    }
+
+    /// Set a named savepoint, or roll back to one. A savepoint needs an open
+    /// transaction, so one is begun first if an earlier commit closed it —
+    /// rolling back to a savepoint from before that commit then fails with the
+    /// database's own "does not exist" error, as it does on Lucee.
+    fn savepoint(&mut self, op: SavepointOp, name: &str) -> Result<(), CfmlError> {
+        self.ensure_open()?;
+        let quoted = self
+            .dialect()
+            .map(|d| crate::txn_sql::quote_savepoint(name, d))
+            .unwrap_or_default();
+        let ansi = |op: &SavepointOp| match op {
+            SavepointOp::Create => format!("SAVEPOINT {}", quoted),
+            SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", quoted),
+        };
+        let err = |e: &dyn std::fmt::Display| CfmlError::database(format!("cftransaction: savepoint error: {}", e));
+        match &mut self.kind {
+            TxnKind::Dynamic { txn, .. } => match op {
+                SavepointOp::Create => txn.savepoint(name),
+                SavepointOp::RollbackTo => txn.rollback_to_savepoint(name),
+            },
+            #[cfg(feature = "sqlite")]
+            TxnKind::Sqlite(c) => c.execute_batch(&ansi(&op)).map_err(|e| err(&e)),
+            #[cfg(feature = "mysql_db")]
+            TxnKind::Mysql(c) => {
+                use mysql::prelude::Queryable;
+                // Savepoint ops are transaction-scoped: no dirty change.
+                c.conn.query_drop(ansi(&op)).map_err(|e| err(&e))
+            }
+            #[cfg(feature = "postgres_db")]
+            TxnKind::Postgres(c) => pg_txn_control(&mut **c, &ansi(&op), "savepoint"),
+            #[cfg(feature = "mssql_db")]
+            TxnKind::Mssql(c) => {
+                let m = &mut **c;
+                let sql = match op {
+                    SavepointOp::Create => format!("SAVE TRANSACTION {}", quoted),
+                    SavepointOp::RollbackTo => format!("ROLLBACK TRANSACTION {}", quoted),
+                };
+                mssql_txn_control(&mut m.client, &mut m.broken, &sql, "savepoint")
+            }
+        }
+    }
 }
 
 // ---- Public wrappers using Box<dyn Any> for VM interop ----
@@ -16779,7 +17001,10 @@ pub fn txn_begin_boxed(datasource: &str) -> Result<Box<dyn std::any::Any>, CfmlE
     // transactions is not blocked by a blanket check.
     if let Some(driver) = crate::db_driver::lookup_dynamic_datasource(datasource) {
         let txn = driver.begin("")?;
-        return Ok(Box::new(TransactionConn::Dynamic(txn)));
+        return Ok(Box::new(TransactionConn::new(TxnKind::Dynamic {
+            txn,
+            datasource: datasource.to_string(),
+        })));
     }
     // Resolve the NAME the same way the query path does. `parse_datasource`
     // treats an unregistered bare name as a SQLite FILE, so a transaction on a
@@ -16792,34 +17017,42 @@ pub fn txn_begin_boxed(datasource: &str) -> Result<Box<dyn std::any::Any>, CfmlE
     Ok(Box::new(conn))
 }
 
-/// Commit a transaction via type-erased connection
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-pub fn txn_commit_boxed(conn: &mut Box<dyn std::any::Any>) -> Result<(), CfmlError> {
-    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
-        transaction_commit(tc)
-    } else {
-        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
-    }
+fn txn_conn(conn: &mut Box<dyn std::any::Any>) -> Result<&mut TransactionConn, CfmlError> {
+    conn.downcast_mut::<TransactionConn>()
+        .ok_or_else(|| CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
 }
 
-/// Rollback a transaction via type-erased connection
+/// Commit the open database transaction on a type-erased connection. The
+/// connection stays usable: the next statement begins a new transaction.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub fn txn_commit_boxed(conn: &mut Box<dyn std::any::Any>) -> Result<(), CfmlError> {
+    txn_conn(conn)?.commit()
+}
+
+/// Roll back the open database transaction on a type-erased connection. The
+/// connection stays usable: the next statement begins a new transaction.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn txn_rollback_boxed(conn: &mut Box<dyn std::any::Any>) -> Result<(), CfmlError> {
-    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
-        transaction_rollback(tc)
-    } else {
-        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
-    }
+    txn_conn(conn)?.rollback()
 }
 
 /// Execute a query within a transaction via type-erased connection
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn txn_execute_boxed(conn: &mut Box<dyn std::any::Any>, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
-    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
-        execute_with_transaction(tc, sql, params_arg, return_type)
-    } else {
-        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
-    }
+    execute_with_transaction(txn_conn(conn)?, sql, params_arg, return_type)
+}
+
+/// Set a named savepoint on a transaction conn (type-erased)
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub fn txn_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
+    txn_conn(conn)?.savepoint(SavepointOp::Create, name)
+}
+
+/// Roll back to a named savepoint on a transaction conn (type-erased)
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub fn txn_rollback_to_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
+    txn_conn(conn)?.savepoint(SavepointOp::RollbackTo, name)
 }
 
 /// Begin a transaction — returns a held connection
@@ -16833,7 +17066,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
                 .map_err(|e| CfmlError::database(format!("cftransaction: SQLite pool error: {}", e)))?;
             conn.execute_batch("BEGIN")
                 .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?;
-            Ok(TransactionConn::Sqlite(conn))
+            Ok(TransactionConn::new(TxnKind::Sqlite(conn)))
         }
         #[cfg(feature = "mysql_db")]
         DbDriver::Mysql(url) => {
@@ -16842,25 +17075,15 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
             use mysql::prelude::Queryable;
             conn.query_drop("BEGIN")
                 .map_err(|e| CfmlError::database(format!("cftransaction: BEGIN error: {}", e)))?;
-            Ok(TransactionConn::Mysql(MysqlTxnConn {
-                conn,
-                open: true,
-                dirty: false,
-            }))
+            Ok(TransactionConn::new(TxnKind::Mysql(MysqlTxnConn { conn, dirty: false })))
         }
         #[cfg(feature = "postgres_db")]
         DbDriver::Postgres(url) => {
             let pool = get_postgres_pool(&url)?;
             let mut conn = pool.get()
                 .map_err(|e| CfmlError::database(format!("cftransaction: PostgreSQL pool error: {}", e)))?;
-            let pg = &mut *conn;
-            if let Err(e) = pg.client.simple_query("BEGIN") {
-                if e.is_closed() {
-                    pg.broken = true;
-                }
-                return Err(CfmlError::database(format!("cftransaction: BEGIN error: {}", e)));
-            }
-            Ok(TransactionConn::Postgres(conn))
+            pg_txn_control(&mut *conn, "BEGIN", "BEGIN")?;
+            Ok(TransactionConn::new(TxnKind::Postgres(conn)))
         }
         #[cfg(feature = "mssql_db")]
         DbDriver::Mssql(url) => {
@@ -16869,7 +17092,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
                 .map_err(|e| CfmlError::database(format!("cftransaction: MSSQL pool error: {}", e)))?;
             let m = &mut *conn;
             mssql_txn_control(&mut m.client, &mut m.broken, "BEGIN TRANSACTION", "BEGIN")?;
-            Ok(TransactionConn::Mssql(conn))
+            Ok(TransactionConn::new(TxnKind::Mssql(conn)))
         }
         DbDriver::Unsupported(sub) => Err(unsupported_jdbc_driver_error(&sub)),
         #[allow(unreachable_patterns)]
@@ -16879,201 +17102,10 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
     }
 }
 
-/// Commit a transaction
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
-    match conn {
-        TransactionConn::Dynamic(t) => t.commit(),
-        #[cfg(feature = "sqlite")]
-        TransactionConn::Sqlite(c) => {
-            c.execute_batch("COMMIT")
-                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))
-        }
-        #[cfg(feature = "mysql_db")]
-        TransactionConn::Mysql(c) => {
-            use mysql::prelude::Queryable;
-            c.conn
-                .query_drop("COMMIT")
-                .map_err(|e| CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))?;
-            // Only a SUCCESSFUL commit closes the transaction; on error `open`
-            // stays true and the drop path keeps the full pool reset (which
-            // rolls back).
-            c.open = false;
-            Ok(())
-        }
-        #[cfg(feature = "postgres_db")]
-        TransactionConn::Postgres(c) => {
-            let pg = &mut **c;
-            match pg.client.simple_query("COMMIT") {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    if e.is_closed() {
-                        pg.broken = true;
-                    }
-                    Err(CfmlError::database(format!("cftransaction: COMMIT error: {}", e)))
-                }
-            }
-        }
-        #[cfg(feature = "mssql_db")]
-        TransactionConn::Mssql(c) => {
-            let m = &mut **c;
-            mssql_txn_control(&mut m.client, &mut m.broken, "COMMIT TRANSACTION", "COMMIT")
-        }
-        #[allow(unreachable_patterns)]
-        _ => Ok(()),
-    }
-}
-
-/// Rollback a transaction
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
-    match conn {
-        TransactionConn::Dynamic(t) => t.rollback(),
-        #[cfg(feature = "sqlite")]
-        TransactionConn::Sqlite(c) => {
-            c.execute_batch("ROLLBACK")
-                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))
-        }
-        #[cfg(feature = "mysql_db")]
-        TransactionConn::Mysql(c) => {
-            use mysql::prelude::Queryable;
-            c.conn
-                .query_drop("ROLLBACK")
-                .map_err(|e| CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))?;
-            c.open = false;
-            Ok(())
-        }
-        #[cfg(feature = "postgres_db")]
-        TransactionConn::Postgres(c) => {
-            let pg = &mut **c;
-            match pg.client.simple_query("ROLLBACK") {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    if e.is_closed() {
-                        pg.broken = true;
-                    }
-                    Err(CfmlError::database(format!("cftransaction: ROLLBACK error: {}", e)))
-                }
-            }
-        }
-        #[cfg(feature = "mssql_db")]
-        TransactionConn::Mssql(c) => {
-            let m = &mut **c;
-            mssql_txn_control(&mut m.client, &mut m.broken, "ROLLBACK TRANSACTION", "ROLLBACK")
-        }
-        #[allow(unreachable_patterns)]
-        _ => Ok(()),
-    }
-}
-
-/// Create a savepoint on an existing transaction conn (type-erased)
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-pub fn txn_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
-    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
-        transaction_savepoint(tc, SavepointOp::Create, name)
-    } else {
-        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
-    }
-}
-
-/// Release a savepoint on an existing transaction conn (type-erased)
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-pub fn txn_release_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
-    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
-        transaction_savepoint(tc, SavepointOp::Release, name)
-    } else {
-        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
-    }
-}
-
-/// Rollback to a savepoint on an existing transaction conn (type-erased)
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-pub fn txn_rollback_to_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
-    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
-        transaction_savepoint(tc, SavepointOp::RollbackTo, name)
-    } else {
-        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
-    }
-}
-
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 enum SavepointOp {
     Create,
-    Release,
     RollbackTo,
-}
-
-/// Issue a SAVEPOINT / RELEASE / ROLLBACK TO statement on a transaction conn.
-/// SQL dialects differ: ANSI engines use `SAVEPOINT`/`RELEASE SAVEPOINT`/
-/// `ROLLBACK TO SAVEPOINT`; SQL Server uses `SAVE TRANSACTION` and
-/// `ROLLBACK TRANSACTION <name>` and has no explicit release (a savepoint is
-/// simply freed when the enclosing transaction commits), so Release is a no-op.
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str) -> Result<(), CfmlError> {
-    match conn {
-        TransactionConn::Dynamic(t) => match op {
-            SavepointOp::Create => t.savepoint(name),
-            SavepointOp::Release => t.release_savepoint(name),
-            SavepointOp::RollbackTo => t.rollback_to_savepoint(name),
-        },
-        #[cfg(feature = "sqlite")]
-        TransactionConn::Sqlite(c) => {
-            let sql = match op {
-                SavepointOp::Create => format!("SAVEPOINT {}", name),
-                SavepointOp::Release => format!("RELEASE {}", name),
-                SavepointOp::RollbackTo => format!("ROLLBACK TO {}", name),
-            };
-            c.execute_batch(&sql)
-                .map_err(|e| CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
-        }
-        #[cfg(feature = "mysql_db")]
-        TransactionConn::Mysql(c) => {
-            use mysql::prelude::Queryable;
-            let sql = match op {
-                SavepointOp::Create => format!("SAVEPOINT {}", name),
-                SavepointOp::Release => format!("RELEASE SAVEPOINT {}", name),
-                SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
-            };
-            // Savepoint ops are transaction-scoped: no open/dirty change.
-            c.conn
-                .query_drop(&sql)
-                .map_err(|e| CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
-        }
-        #[cfg(feature = "postgres_db")]
-        TransactionConn::Postgres(c) => {
-            let sql = match op {
-                SavepointOp::Create => format!("SAVEPOINT {}", name),
-                SavepointOp::Release => format!("RELEASE SAVEPOINT {}", name),
-                SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
-            };
-            let pg = &mut **c;
-            match pg.client.simple_query(&sql) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    if e.is_closed() {
-                        pg.broken = true;
-                    }
-                    Err(CfmlError::database(format!("cftransaction: savepoint error: {}", e)))
-                }
-            }
-        }
-        #[cfg(feature = "mssql_db")]
-        TransactionConn::Mssql(c) => {
-            let m = &mut **c;
-            match op {
-                SavepointOp::Create => {
-                    mssql_txn_control(&mut m.client, &mut m.broken, &format!("SAVE TRANSACTION {}", name), "SAVEPOINT")
-                }
-                // SQL Server frees savepoints implicitly at commit — nothing to do.
-                SavepointOp::Release => Ok(()),
-                SavepointOp::RollbackTo => {
-                    mssql_txn_control(&mut m.client, &mut m.broken, &format!("ROLLBACK TRANSACTION {}", name), "ROLLBACK TO SAVEPOINT")
-                }
-            }
-        }
-        #[allow(unreachable_patterns)]
-        _ => Ok(()),
-    }
 }
 
 /// Execute a query using an existing transaction connection
@@ -17085,11 +17117,11 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         let return_code = ProcReturnCode::for_return_type(return_type);
         let (bound, outs, total) = split_proc_params(params_arg);
         let (sql, values) = normalize_positional_params(sql.to_string(), &bound);
-        let dialect = match conn {
+        let dialect = match &conn.kind {
             #[cfg(feature = "mssql_db")]
-            TransactionConn::Mssql(_) => ProcDialect::Mssql,
+            TxnKind::Mssql(_) => ProcDialect::Mssql,
             #[cfg(feature = "mysql_db")]
-            TransactionConn::Mysql(_) => ProcDialect::Mysql,
+            TxnKind::Mysql(_) => ProcDialect::Mysql,
             #[allow(unreachable_patterns)]
             _ => ProcDialect::Other,
         };
@@ -17103,35 +17135,54 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
     let (sql, params_arg) = normalize_positional_params(sql.to_string(), params_arg);
     let sql = sql.as_str();
     let params_arg = &params_arg;
-    match conn {
-        TransactionConn::Dynamic(t) => t.execute(sql, params_arg, return_type),
+    // What this statement does to the database transaction (GH #536). Anything
+    // but a BEGIN of its own runs inside a transaction, so begin one first if
+    // an earlier COMMIT/ROLLBACK closed it.
+    use crate::txn_sql::TxnEffect;
+    let effect = conn
+        .dialect()
+        .map(|d| crate::txn_sql::txn_effect(sql, d))
+        .unwrap_or(TxnEffect::Neutral);
+    if effect != TxnEffect::Opens {
+        conn.ensure_open()?;
+    }
+    let result = match &mut conn.kind {
+        TxnKind::Dynamic { txn, .. } => txn.execute(sql, params_arg, return_type),
         #[cfg(feature = "sqlite")]
-        TransactionConn::Sqlite(c) => {
+        TxnKind::Sqlite(c) => {
             execute_sqlite_with_conn(c, sql, params_arg, return_type)
         }
         #[cfg(feature = "mysql_db")]
-        TransactionConn::Mysql(c) => {
-            // Track manual transaction control (`queryExecute("COMMIT")`) and
-            // session-state-risky SQL so the drop path knows whether this
-            // connection can skip the pool reset.
-            c.note_sql(sql);
+        TxnKind::Mysql(c) => {
+            // Session-state-risky SQL means the drop path cannot skip the
+            // pool reset.
+            if !mysql_is_txn_control(sql) && mysql_sql_is_session_risky(sql) {
+                c.dirty = true;
+            }
             execute_mysql_with_conn(&mut c.conn, sql, params_arg, return_type)
         }
         #[cfg(feature = "postgres_db")]
-        TransactionConn::Postgres(c) => {
+        TxnKind::Postgres(c) => {
             execute_postgres_with_conn(&mut **c, sql, params_arg, return_type)
         }
         #[cfg(feature = "mssql_db")]
-        TransactionConn::Mssql(c) => {
+        TxnKind::Mssql(c) => {
             // Transaction path: do not retry inside a transaction, but still mark
             // a closed connection as broken so the pool discards it on return.
-            let (effective_params, _type_hints) = normalize_query_params(params_arg);
-            run_mssql_on_conn(&mut **c, sql, &effective_params, return_type)
+            let (sql, params_arg) = mssql_bind_named(sql, params_arg)?;
+            let (effective_params, _type_hints) = normalize_query_params(&params_arg);
+            run_mssql_on_conn(&mut **c, &sql, &effective_params, return_type)
                 .map_err(|err| err.error)
         }
-        #[allow(unreachable_patterns)]
-        _ => Err(CfmlError::runtime("Transaction: unsupported driver".to_string())),
+    };
+    if result.is_ok() {
+        match effect {
+            TxnEffect::Opens => conn.open = true,
+            TxnEffect::Closes => conn.open = false,
+            TxnEffect::Neutral => {}
+        }
     }
+    result
 }
 
 #[cfg(feature = "sqlite")]
@@ -17177,7 +17228,7 @@ fn execute_mysql_with_conn(conn: &mut MysqlPooledConn, sql: &str, params_arg: &C
     use mysql::prelude::*;
 
     // Same camelCase-safe `:name` -> positional `?` rewrite as execute_mysql
-    // (see mysql_named_to_positional): the mysql crate's named-param parser
+    // (see named_to_positional): the mysql crate's named-param parser
     // truncates camelCase placeholders at the first uppercase char.
     let (final_sql, params): (std::borrow::Cow<str>, Params) = match params_arg {
         CfmlValue::Array(arr) => {
@@ -17189,7 +17240,7 @@ fn execute_mysql_with_conn(conn: &mut MysqlPooledConn, sql: &str, params_arg: &C
         // placeholder-free SQL). Lucee treats empty params as no params.
         CfmlValue::Struct(map) if map.is_empty() => (std::borrow::Cow::Borrowed(sql), Params::Empty),
         CfmlValue::Struct(map) => {
-            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map)?;
+            let (rewritten, vals_cfml) = named_to_positional(sql, map)?;
             let vals: Vec<mysql::Value> =
                 vals_cfml.iter().map(|v| cfml_to_mysql_value(v)).collect();
             let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
@@ -17541,6 +17592,10 @@ fn fn_cftransaction_rollback_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cftransaction_end_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cftransaction_end requires VM intercept".into()))
+}
+
+fn fn_cftransaction_action_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("transaction functions require the VM's transaction state".into()))
 }
 
 // -----------------------------------------------
@@ -23182,9 +23237,9 @@ mod db_tls_tests {
 /// crashing Preside's object SQL with a MySQL syntax error. We rewrite `:name`
 /// to positional `?` ourselves instead. Run with:
 ///   cargo test -p cfml-stdlib --features mysql_db
-#[cfg(all(test, feature = "mysql_db"))]
+#[cfg(all(test, any(feature = "mysql_db", feature = "mssql_db")))]
 mod mysql_named_param_tests {
-    use super::{cfqueryparam_unwrap_typed, mysql_named_to_positional};
+    use super::{cfqueryparam_unwrap_typed, named_to_positional};
     use cfml_common::dynamic::{CfmlStruct, CfmlValue, ValueMap};
 
     fn struct_of(pairs: &[(&str, CfmlValue)]) -> CfmlStruct {
@@ -23249,7 +23304,7 @@ mod mysql_named_param_tests {
     fn camelcase_placeholder_is_captured_whole() {
         // The exact shape that broke Preside: a camelCase named param.
         let map = struct_of(&[("dateCreated", CfmlValue::string("2026-06-27"))]);
-        let (sql, vals) = mysql_named_to_positional(
+        let (sql, vals) = named_to_positional(
             "insert into t ( datecreated ) values ( :dateCreated )",
             &map,
         ).unwrap();
@@ -23263,7 +23318,7 @@ mod mysql_named_param_tests {
     #[test]
     fn repeated_named_param_binds_once_per_occurrence() {
         let map = struct_of(&[("id", CfmlValue::Int(7))]);
-        let (sql, vals) = mysql_named_to_positional(
+        let (sql, vals) = named_to_positional(
             "update t set parent = :id where id = :id",
             &map,
         ).unwrap();
@@ -23276,7 +23331,7 @@ mod mysql_named_param_tests {
     #[test]
     fn name_is_matched_case_insensitively() {
         let map = struct_of(&[("DateCreated", CfmlValue::string("x"))]);
-        let (sql, vals) = mysql_named_to_positional("select :datecreated", &map).unwrap();
+        let (sql, vals) = named_to_positional("select :datecreated", &map).unwrap();
         assert_eq!(sql, "select ?");
         assert_eq!(vals.len(), 1);
         assert_eq!(vals[0].as_string(), "x");
@@ -23285,7 +23340,7 @@ mod mysql_named_param_tests {
     #[test]
     fn colon_inside_string_literal_is_not_a_placeholder() {
         let map = struct_of(&[("x", CfmlValue::Int(1))]);
-        let (sql, vals) = mysql_named_to_positional(
+        let (sql, vals) = named_to_positional(
             "select ':notAParam', :x",
             &map,
         ).unwrap();
@@ -23297,15 +23352,27 @@ mod mysql_named_param_tests {
     #[test]
     fn missing_named_param_is_an_error() {
         let map = struct_of(&[("present", CfmlValue::Int(1))]);
-        let err = mysql_named_to_positional("select :missing", &map).unwrap_err();
+        let err = named_to_positional("select :missing", &map).unwrap_err();
         assert!(err.message.contains("param [missing] not found"), "{}", err.message);
+    }
+
+    /// `::` (what `::::` becomes, GH #513) is a cast or a SQL Server static
+    /// method, never the start of a placeholder; `[bracketed]` SQL Server
+    /// identifiers are skipped like quoted ones.
+    #[test]
+    fn double_colons_and_bracketed_identifiers_are_not_params() {
+        let map = struct_of(&[("lat", CfmlValue::Int(1)), ("x", CfmlValue::Int(2))]);
+        let (sql, vals) =
+            named_to_positional("select geography::Point(:lat, 0, 4326), :x::int, [a:b]", &map).unwrap();
+        assert_eq!(sql, "select geography::Point(?, 0, 4326), ?::int, [a:b]");
+        assert_eq!(vals.len(), 2);
     }
 
     #[test]
     fn colon_inside_double_quotes_or_backticks_is_not_a_param() {
         let map = struct_of(&[("a", CfmlValue::Int(1))]);
         let (sql, vals) =
-            mysql_named_to_positional("select \"x:y\" as `c:d`, :a", &map).unwrap();
+            named_to_positional("select \"x:y\" as `c:d`, :a", &map).unwrap();
         assert_eq!(sql, "select \"x:y\" as `c:d`, ?");
         assert_eq!(vals.len(), 1);
     }
@@ -23327,7 +23394,7 @@ mod mysql_named_param_tests {
                 ("separator", CfmlValue::string("\u{1f}")),
             ])),
         )]);
-        let (sql, vals) = mysql_named_to_positional("select * from t where id in (:ids)", &map).unwrap();
+        let (sql, vals) = named_to_positional("select * from t where id in (:ids)", &map).unwrap();
         assert_eq!(sql, "select * from t where id in (?,?,?)");
         assert_eq!(vals.len(), 3);
         assert!(matches!(vals[0], CfmlValue::Int(1)));
@@ -23345,7 +23412,7 @@ mod mysql_named_param_tests {
                 ("list", CfmlValue::Bool(true)),
             ])),
         )]);
-        let (sql, vals) = mysql_named_to_positional("where x in (:vals)", &map).unwrap();
+        let (sql, vals) = named_to_positional("where x in (:vals)", &map).unwrap();
         assert_eq!(sql, "where x in (?,?,?)");
         assert_eq!(vals.len(), 3);
         assert_eq!(vals[0].as_string(), "a");
@@ -23357,7 +23424,7 @@ mod mysql_named_param_tests {
     #[test]
     fn word_after_colon_in_line_comment_is_not_a_placeholder() {
         let map = struct_of(&[("id", CfmlValue::Int(5))]);
-        let (sql, vals) = mysql_named_to_positional(
+        let (sql, vals) = named_to_positional(
             "select * from t where id = :id -- see :note for details",
             &map,
         ).unwrap();
@@ -23368,7 +23435,7 @@ mod mysql_named_param_tests {
     #[test]
     fn apostrophe_in_line_comment_does_not_open_string() {
         let map = struct_of(&[("a", CfmlValue::Int(1)), ("b", CfmlValue::Int(2))]);
-        let (sql, vals) = mysql_named_to_positional(
+        let (sql, vals) = named_to_positional(
             "select :a as a -- it's a comment\n, :b as b",
             &map,
         ).unwrap();
@@ -23379,7 +23446,7 @@ mod mysql_named_param_tests {
     #[test]
     fn apostrophe_in_block_comment_does_not_open_string() {
         let map = struct_of(&[("a", CfmlValue::Int(1)), ("b", CfmlValue::Int(2))]);
-        let (sql, vals) = mysql_named_to_positional(
+        let (sql, vals) = named_to_positional(
             "select :a as a, /* don't panic */ :b as b",
             &map,
         ).unwrap();

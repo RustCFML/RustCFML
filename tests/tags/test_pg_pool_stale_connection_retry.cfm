@@ -59,7 +59,7 @@ if (NOT pgskip) {
         recovered = 0;
         for (round = 1; round <= 3; round++) {
             before = queryExecute("SELECT pg_backend_pid() AS pid", [], { datasource: pgdsn });
-            queryExecute("SELECT pg_terminate_backend(?::int)", [before.pid[1]], { datasource: killerDsn });
+            queryExecute("SELECT pg_terminate_backend(?::::int)", [before.pid[1]], { datasource: killerDsn });
             after = queryExecute("SELECT 40 + " & round & " AS n", [], { datasource: pgdsn });
             if (after.n[1] == 40 + round) recovered++;
         }

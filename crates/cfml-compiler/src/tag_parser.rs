@@ -2249,40 +2249,40 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 attrs.contains_key("action") && TXN_TAG_DEPTH.with(|d| d.get()) > 0;
             let self_closing = tag_end >= 2 && chars[tag_end - 2] == '/';
             let dynamic_action = strip_hashes(&action) != action;
-            // Explicit savepoints are not implemented: say so where the code
-            // runs rather than treating the tag as something it is not.
-            let no_savepoints = "throw(type=\"Application\", message=\"cftransaction savepoints \
-                (action='setsavepoint', or rollback with savepoint=) are not supported \
-                by RustCFML yet.\");\n";
+            // An attribute value as a CFML expression: `#expr#` is the
+            // expression, anything else a string literal.
+            let attr_expr = |v: &str| {
+                let stripped = strip_hashes(v);
+                if stripped != v {
+                    stripped
+                } else {
+                    format!("\"{}\"", v.replace('"', "\"\""))
+                }
+            };
+            let savepoint_arg = attrs.get("savepoint").map(|v| attr_expr(v)).unwrap_or_else(|| "\"\"".to_string());
+            // commit / rollback / setsavepoint (or a `#dynamic#` action) act on
+            // the open transaction at run time: Lucee 7.1 semantics, see
+            // `cftransaction_action` in the VM.
+            let action_lower = action.trim().to_lowercase();
+            let is_action = dynamic_action
+                || matches!(action_lower.as_str(), "commit" | "rollback" | "setsavepoint");
+            let action_call = format!(
+                "__cftransaction_action({}, {});\n",
+                attr_expr(&action),
+                savepoint_arg
+            );
+            // A top-level action tag with a body is a transaction block whose
+            // body starts with the action (Lucee: `<cftransaction
+            // action="commit">…</cftransaction>` with no enclosing
+            // transaction). Nested, or with no end tag, it is a statement.
+            let top_level_block_end = if is_action && !nested_action && !self_closing {
+                find_closing_tag(chars, tag_end, len, "cftransaction")
+            } else {
+                None
+            };
 
-            match action.to_lowercase().as_str() {
-                "commit" => {
-                    (format!("__cftransaction_commit();\n"), tag_end - start)
-                }
-                "rollback" if attrs.contains_key("savepoint") => {
-                    (no_savepoints.to_string(), tag_end - start)
-                }
-                "rollback" => {
-                    (format!("__cftransaction_rollback();\n"), tag_end - start)
-                }
-                "setsavepoint" => (no_savepoints.to_string(), tag_end - start),
-                // `action="#expr#"` as a statement: the action is only known
-                // at run time, so dispatch on it there.
-                _ if dynamic_action && (nested_action || self_closing) => {
-                    let expr = strip_hashes(&action);
-                    (
-                        format!(
-                            "var __cftxn_action = lCase(trim({expr}));\n\
-                             if (__cftxn_action == \"commit\") {{ __cftransaction_commit(); }}\n\
-                             else if (__cftxn_action == \"rollback\") {{ __cftransaction_rollback(); }}\n\
-                             else if (__cftxn_action == \"setsavepoint\") {{ {no_savepoints} }}\n\
-                             else if (__cftxn_action != \"begin\") {{ throw(type=\"Application\", \
-                             message=\"Invalid cftransaction action [\" & __cftxn_action & \"]: \
-                             valid actions are begin, commit, rollback, setsavepoint.\"); }}\n"
-                        ),
-                        tag_end - start,
-                    )
-                }
+            match action_lower.as_str() {
+                _ if is_action && top_level_block_end.is_none() => (action_call, tag_end - start),
                 // A nested `action="begin"`, like a self-closing begin, is a
                 // block with an empty body: nothing to run.
                 _ if nested_action => (String::new(), tag_end - start),
@@ -2298,6 +2298,11 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                         let body_script = {
                             let _in_txn = TxnTagGuard::enter();
                             tags_to_script_impl(&body, imports)
+                        };
+                        let body_script = if top_level_block_end.is_some() {
+                            format!("{}{}", action_call, body_script)
+                        } else {
+                            body_script
                         };
 
                         // Build args for __cftransaction_start. All THREE

@@ -381,6 +381,8 @@ include "harness.cfm";
 <cf_runtest file="database/test_query_error_catch_type_database.cfm" />
 <cf_runtest file="database/test_transaction_statement_datasource.cfm" rustcfmlOnly="true" why="the Lucee harness has no SQLite JDBC driver (Lucee 7.1 behaviour probed on PostgreSQL: each datasource runs in the transaction on its own connection)" />
 <cf_runtest file="database/test_transaction_multi_datasource.cfm" rustcfmlOnly="true" why="the Lucee harness has no SQLite JDBC driver" />
+<cf_runtest file="database/test_query_params_lucee_parity.cfm" rustcfmlOnly="true" why="SQLite plus URL-string live datasources; every expected value was probed on Lucee 7.1.2.191 against PostgreSQL, MySQL and SQL Server" />
+<cf_runtest file="database/test_transaction_lucee_semantics.cfm" rustcfmlOnly="true" why="SQLite plus URL-string live datasources; every expected value was probed on Lucee 7.1.2.191 against PostgreSQL, MySQL and SQL Server" />
 <cf_runtest file="database/test_query_error_sqlstate_members.cfm" />
 <cf_runtest file="database/test_mysql_jdbc_connection_string.cfm" />
 <cf_runtest file="database/test_pg_comment_placeholder_scan.cfm" />
@@ -686,6 +688,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_mssql_dml_output.cfm" />
 <cf_runtest file="tags/test_mysql_dml_returning.cfm" />
 <cf_runtest file="tags/test_dbinfo_mysql_column_types.cfm" />
+<cf_runtest file="tags/test_dbinfo_pg_columns_pgjdbc.cfm" rustcfmlOnly="true" why="SQLite plus a URL-string PostgreSQL datasource; expected values were probed on Lucee 7.1.2.191 with pgjdbc" />
 <cf_runtest file="tags/test_db_null_column_empty_string.cfm" />
 <cf_runtest file="tags/test_pg_extended_param_binds.cfm" />
 <cf_runtest file="tags/test_pg_pool_checkout_validation.cfm" />

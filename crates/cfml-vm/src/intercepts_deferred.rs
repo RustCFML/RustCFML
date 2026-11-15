@@ -36,6 +36,8 @@ pub(crate) const DEFERRED_TO_VM: &[&str] = &[
     "setencoding", "__cfparam", "queryexecute", "cfdbinfo",
     "dbinfo", "cfhttp", "queryregisterfunction", "__cftransaction_start",
     "__cftransaction_commit", "__cftransaction_rollback", "__cftransaction_end", "__writetext",
+    "__cftransaction_action", "transactioncommit", "transactionrollback", "transactionsetsavepoint",
+    "iswithintransaction",
     "__cflog", "writelog", "__cfsetting", "__cflock_start",
     "__cflock_end", "__cfcookie",
     "sessioninvalidate", "sessionrotate", "sessioncommit",

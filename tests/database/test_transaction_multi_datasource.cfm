@@ -52,8 +52,11 @@ try {
 	assert( "commit keeps the first datasource's write", rowsIn( dsB ), 1 );
 	assert( "commit keeps the second datasource's write", rowsIn( dsA ), 1 );
 
-	// A datasource that first joins INSIDE a nested block: rolling the nested
-	// block back must reach it too, and the outer commit keeps the rest.
+	// A datasource that first joins INSIDE a nested block. A nested block joins
+	// the outer transaction, so an in-block rollback there undoes the work on
+	// EVERY datasource, and the transaction stays open for the statements after
+	// it (Lucee 7.1.2, probed with PostgreSQL + MySQL as the two datasources:
+	// first datasource empty, second keeps only 6).
 	clearBoth();
 	transaction {
 		queryExecute( "INSERT INTO t VALUES (4)", {}, { datasource: dsB } );
@@ -65,7 +68,7 @@ try {
 	}
 	assert( "nested rollback reaches a datasource that joined inside it",
 		valueList( queryExecute( "SELECT id FROM t ORDER BY id", {}, { datasource: dsA } ).id ), "6" );
-	assert( "the outer commit keeps the first datasource's write", rowsIn( dsB ), 1 );
+	assert( "nested rollback also undoes the first datasource's earlier write", rowsIn( dsB ), 0 );
 
 	// After the transaction, both datasources are back to autocommit.
 	queryExecute( "INSERT INTO t VALUES (7)", {}, { datasource: dsA } );

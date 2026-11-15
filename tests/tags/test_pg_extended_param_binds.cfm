@@ -47,7 +47,7 @@ if (NOT pgskip) {
 
         // --- int[] array literal text bound to an int[] column ---
         queryExecute("UPDATE #tbl# SET ai = ? WHERE id = 1", ["{10,20,30}"], { datasource: pgdsn });
-        r1 = queryExecute("SELECT ai::text AS s, ai[2] AS second FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
+        r1 = queryExecute("SELECT ai::::text AS s, ai[2] AS second FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
         assert("int[] param round-trips", r1.s[1] ?: "", "{10,20,30}");
         assert("int[] element addressable server-side", r1.second[1] ?: 0, 20);
 
@@ -58,7 +58,7 @@ if (NOT pgskip) {
 
         // --- interval ---
         queryExecute("UPDATE #tbl# SET iv = ? WHERE id = 1", ["2 days 03:00:00"], { datasource: pgdsn });
-        r3 = queryExecute("SELECT iv::text AS s FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
+        r3 = queryExecute("SELECT iv::::text AS s FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
         assert("interval param round-trips", r3.s[1] ?: "", "2 days 03:00:00");
 
         // --- inet (server canonicalises to /32) ---
@@ -68,12 +68,12 @@ if (NOT pgskip) {
 
         // --- macaddr ---
         queryExecute("UPDATE #tbl# SET mac = ? WHERE id = 1", ["08:00:2b:01:02:03"], { datasource: pgdsn });
-        r5 = queryExecute("SELECT mac::text AS s FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
+        r5 = queryExecute("SELECT mac::::text AS s FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
         assert("macaddr param round-trips", r5.s[1] ?: "", "08:00:2b:01:02:03");
 
         // --- timetz (rendered via ::text; to_char has no timetz overload) ---
         queryExecute("UPDATE #tbl# SET tz = ? WHERE id = 1", ["10:30:45+02"], { datasource: pgdsn });
-        r6 = queryExecute("SELECT tz::text AS s FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
+        r6 = queryExecute("SELECT tz::::text AS s FROM #tbl# WHERE id = 1", [], { datasource: pgdsn });
         assert("timetz param binds", r6.s[1] ?: "", "10:30:45+02");
 
         // --- array param in an expression (= ANY) ---

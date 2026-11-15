@@ -58,7 +58,7 @@ if (NOT pgskip) {
         assert("json param round-trips (->> extraction)", r2.n[1] ?: "", "alpha");
 
         // --- gap: jsonb param in an expression (containment test) ---
-        r3 = queryExecute("SELECT count(*) AS c FROM #tbl# WHERE jb @> ?::jsonb",
+        r3 = queryExecute("SELECT count(*) AS c FROM #tbl# WHERE jb @> ?::::jsonb",
             [serializeJSON({ "name": "alpha" })], { datasource: pgdsn });
         assert("jsonb containment param binds", r3.c[1] ?: 0, 1);
     } catch (any e) {

@@ -1613,72 +1613,31 @@ impl Parser {
                     return Ok(self.lower_script_body_tag("cftransaction", attrs, body, stmt_loc));
                 }
                 // Body-less statement form (no `{`):
-                //   transaction action="commit";   → __cftransaction_commit()
-                //   transaction action="rollback";  → __cftransaction_rollback()
-                //   transaction action="begin";     → __cftransaction_start("begin"[, isolation][, datasource])
-                // Mirrors the angle-bracket <cftransaction action="..."> tag lowering
-                // (tag_parser.rs). Wheels migration templates emit the commit/rollback
-                // forms, so without this they failed with `transaction is undefined`.
+                //   transaction action="commit" | "rollback" | "setsavepoint" [savepoint="x"];
+                //                                   → __cftransaction_action(action, savepoint)
+                //   transaction action="begin";  /  transaction isolation="…";
+                //                                   → __cftransaction_action("begin", "")
+                // A non-literal action is dispatched at run time by the same call.
+                // A bodyless BEGIN is an empty block on Lucee 7.1.2 — it opens no
+                // transaction (probed: isWithinTransaction() stays false and the
+                // statements after it autocommit), as `<cftransaction action="begin" />`
+                // already was here. Until v0.751 it opened a real transaction
+                // that nothing paired with a commit. Wheels migration templates
+                // emit the commit/rollback forms, so without this they failed with
+                // `transaction is undefined`.
                 if !attrs.is_empty() {
                     self.match_token(&Token::Semicolon); // optional trailing ;
-                    let action = attrs
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("action"))
-                        .and_then(|(_, v)| match v {
-                            Expression::Literal(l) => match &l.value {
-                                LiteralValue::String(s) => Some(s.to_lowercase()),
-                                _ => None,
-                            },
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "begin".to_string());
-                    let fn_name = match action.as_str() {
-                        "commit" => "__cftransaction_commit",
-                        "rollback" => "__cftransaction_rollback",
-                        _ => "__cftransaction_start",
-                    };
-                    let mut arguments: Vec<Expression> = Vec::new();
-                    if fn_name == "__cftransaction_start" {
-                        arguments.push(Expression::Literal(Literal {
-                            value: LiteralValue::String("begin".to_string()),
-                            location: stmt_loc,
-                        }));
-                        // Positions are fixed: (action, isolation, datasource).
-                        // An absent attribute emits an empty string rather than
-                        // being skipped — skipping shifted `isolation` into the
-                        // datasource slot (see tag_parser.rs).
-                        let empty = || {
+                    let action_call = Self::transaction_action_call(&attrs, stmt_loc).unwrap_or_else(|| {
+                        let begin_attrs = [(
+                            "action".to_string(),
                             Expression::Literal(Literal {
-                                value: LiteralValue::String(String::new()),
+                                value: LiteralValue::String("begin".to_string()),
                                 location: stmt_loc,
-                            })
-                        };
-                        arguments.push(
-                            attrs
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("isolation"))
-                                .map(|(_, iso)| iso.clone())
-                                .unwrap_or_else(empty),
-                        );
-                        arguments.push(
-                            attrs
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-                                .map(|(_, ds)| ds.clone())
-                                .unwrap_or_else(empty),
-                        );
-                    }
-                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
-                        expr: Expression::FunctionCall(Box::new(FunctionCall {
-                            name: Box::new(Expression::Identifier(Identifier {
-                                name: fn_name.to_string(),
-                                location: stmt_loc,
-                            })),
-                            arguments,
-                            location: stmt_loc,
-                        })),
-                        location: stmt_loc,
-                    })));
+                            }),
+                        )];
+                        Self::transaction_action_call_unchecked(&begin_attrs, stmt_loc)
+                    });
+                    return Ok(CfmlNode::Statement(action_call));
                 }
                 // No attributes and no body — restore and fall through.
                 self.current = saved;
@@ -3904,6 +3863,45 @@ impl Parser {
         }))
     }
 
+    /// The `__cftransaction_action(action, savepoint)` call for a transaction
+    /// whose `action` attribute is anything but a literal `begin` (or absent),
+    /// or `None` when it is a plain begin. A non-literal action is passed
+    /// through for run-time dispatch.
+    fn transaction_action_call(attrs: &[(String, Expression)], loc: SourceLocation) -> Option<Statement> {
+        let action = attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("action")).map(|(_, v)| v)?;
+        if let Expression::Literal(Literal { value: LiteralValue::String(s), .. }) = action {
+            if s.trim().eq_ignore_ascii_case("begin") {
+                return None;
+            }
+        }
+        Some(Self::transaction_action_call_unchecked(attrs, loc))
+    }
+
+    /// `__cftransaction_action(action, savepoint)` for `attrs`, whatever the
+    /// action (an absent one is passed as `begin`).
+    fn transaction_action_call_unchecked(attrs: &[(String, Expression)], loc: SourceLocation) -> Statement {
+        let attr = |name: &str| attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
+        let action = attr("action").unwrap_or(Expression::Literal(Literal {
+            value: LiteralValue::String("begin".to_string()),
+            location: loc,
+        }));
+        let savepoint = attr("savepoint").unwrap_or(Expression::Literal(Literal {
+            value: LiteralValue::String(String::new()),
+            location: loc,
+        }));
+        Statement::Expression(ExpressionStatement {
+            expr: Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "__cftransaction_action".to_string(),
+                    location: loc,
+                })),
+                arguments: vec![action, savepoint],
+                location: loc,
+            })),
+            location: loc,
+        })
+    }
+
     /// Lower a script-call-with-body form (`cfsavecontent(...) { ... }`,
     /// `cflock(...) { ... }`, `cftransaction(...) { ... }`, `cfmail(...) { ... }`)
     /// into the same AST shape the angle-bracket tag forms produce.
@@ -4587,13 +4585,20 @@ impl Parser {
             "cftransaction" => {
                 // __cftransaction_start("begin"); try { body; __cftransaction_commit(); }
                 // catch (any e) { __cftransaction_rollback(); throw e; }
-                let action_expr = attrs.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("action"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Expression::Literal(Literal {
-                        value: LiteralValue::String("begin".to_string()),
-                        location: loc,
-                    }));
+                //
+                // `transaction action="commit|rollback|setsavepoint" { body }` is,
+                // on Lucee 7.1, the action followed by the body inside a block:
+                // nested, the action acts on the enclosing transaction and the
+                // body joins it; at top level the action finds nothing to act on
+                // and the body runs as a transaction of its own.
+                let mut body = body;
+                if let Some(action_call) = Self::transaction_action_call(&attrs, loc) {
+                    body.insert(0, action_call);
+                }
+                let action_expr = Expression::Literal(Literal {
+                    value: LiteralValue::String("begin".to_string()),
+                    location: loc,
+                });
                 // `isolation` and `datasource` used to be dropped here — the
                 // BLOCK form `transaction datasource="other" { … }` silently ran
                 // on the DEFAULT datasource while the tag form honoured the

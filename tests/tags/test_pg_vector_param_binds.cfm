@@ -48,7 +48,7 @@ if (NOT pgskip) {
         queryExecute("INSERT INTO #tbl# (id, v) VALUES (?, ?)",
             [2, "[0,1,0]"], { datasource: pgdsn });
 
-        r1 = queryExecute("SELECT v::text AS vt FROM #tbl# WHERE id = 1",
+        r1 = queryExecute("SELECT v::::text AS vt FROM #tbl# WHERE id = 1",
             [], { datasource: pgdsn });
         assert("vector param round-trips", r1.vt[1] ?: "", "[1,0,0]");
 

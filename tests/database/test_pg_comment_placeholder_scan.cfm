@@ -57,21 +57,21 @@ if ( len(pgDs) == 0 ) {
 	// comment-body content, not comment handling per se.
 	assert(
 		"control: positional binds with a plain line comment",
-		selectAB("SELECT ?::int AS a -- plain comment" & nl & ", ?::int AS b", [1, 2], pgDs),
+		selectAB("SELECT ?::::int AS a -- plain comment" & nl & ", ?::::int AS b", [1, 2], pgDs),
 		"a=1;b=2"
 	);
 
 	// An apostrophe in a `--` comment must not swallow the `?` after it.
 	assert(
 		"positional `?` after an apostrophe in a line comment",
-		selectAB("SELECT ?::int AS a -- it's a comment" & nl & ", ?::int AS b", [1, 2], pgDs),
+		selectAB("SELECT ?::::int AS a -- it's a comment" & nl & ", ?::::int AS b", [1, 2], pgDs),
 		"a=1;b=2"
 	);
 
 	// Same, block comment: /* don't */ sits between the two binds.
 	assert(
 		"positional `?` after an apostrophe in a block comment",
-		selectAB("SELECT ?::int AS a, /* don't panic */ ?::int AS b", [1, 2], pgDs),
+		selectAB("SELECT ?::::int AS a, /* don't panic */ ?::::int AS b", [1, 2], pgDs),
 		"a=1;b=2"
 	);
 

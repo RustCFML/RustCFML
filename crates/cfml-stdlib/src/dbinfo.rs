@@ -396,11 +396,19 @@ const COLUMNS_COLUMNS: &[&str] = &[
     "CHAR_OCTET_LENGTH",
     "ORDINAL_POSITION",
     "IS_NULLABLE",
+    // The rest of JDBC's DatabaseMetaData.getColumns set, in its order. Lucee
+    // passes the driver's result through, so every driver has these, and
+    // `columns_minimal` is exactly these 24 (Lucee 7.1.2, GH #514).
+    "SCOPE_CATALOG",
+    "SCOPE_SCHEMA",
+    "SCOPE_TABLE",
+    "SOURCE_DATA_TYPE",
+    "IS_AUTOINCREMENT",
+    "IS_GENERATEDCOLUMN",
 ];
 
 const COLUMNS_ENRICHMENT: &[&str] = &[
     "IS_PRIMARYKEY",
-    "IS_AUTOINCREMENT",
     "IS_FOREIGNKEY",
     "REFERENCED_PRIMARYKEY",
     "REFERENCED_PRIMARYKEY_TABLE",
@@ -478,6 +486,109 @@ fn jdbc_type_code(type_name: &str) -> i64 {
     }
 }
 
+/// pgjdbc's `TypeInfoCache.getSQLType` for a built-in PostgreSQL type name —
+/// the DATA_TYPE Lucee reports. Measured on Lucee 7.1.2.191 + PostgreSQL 18
+/// (GH #514): text is VARCHAR, bytea BINARY and bool BIT there, unlike the
+/// ANSI names in `jdbc_type_code`.
+fn pg_jdbc_type(pg_type: &str) -> i64 {
+    match pg_type {
+        "int2" => 5,
+        "int4" => 4,
+        "oid" | "int8" => -5,
+        "money" | "float8" => 8,
+        "numeric" => 2,
+        "float4" => 7,
+        "char" | "bpchar" => 1,
+        "varchar" | "text" | "name" => 12,
+        "bytea" => -2,
+        "bool" | "bit" => -7,
+        "date" => 91,
+        "time" | "timetz" => 92,
+        "timestamp" | "timestamptz" => 93,
+        "refcursor" => 2012,
+        "xml" => 2009,
+        _ => 1111, // OTHER: uuid, json, jsonb, inet, …
+    }
+}
+
+/// pgjdbc's "unknown length", reported for unbounded types.
+const PG_UNKNOWN_LENGTH: i64 = i32::MAX as i64;
+
+/// Fractional-seconds digits of a temporal typmod (6 when unconstrained).
+fn pg_seconds_digits(typmod: i64) -> i64 {
+    if typmod == -1 { 6 } else { typmod }
+}
+
+/// pgjdbc's `TypeInfoCache.getDisplaySize`.
+fn pg_display_size(pg_type: &str, typmod: i64) -> i64 {
+    let frac = |typmod: i64| {
+        let d = pg_seconds_digits(typmod);
+        if d == 0 { 0 } else { d + 1 }
+    };
+    match pg_type {
+        "int2" => 6,
+        "int4" => 11,
+        "oid" => 10,
+        "int8" => 20,
+        "float4" => 15,
+        "float8" => 25,
+        "char" | "bool" => 1,
+        "date" => 13,
+        "time" => 8 + frac(typmod),
+        "timetz" => 8 + frac(typmod) + 6,
+        "timestamp" => 22 + frac(typmod),
+        "timestamptz" => 22 + frac(typmod) + 6,
+        "interval" => 49,
+        "varchar" | "bpchar" if typmod != -1 => typmod - 4,
+        "numeric" if typmod != -1 => {
+            let precision = ((typmod - 4) >> 16) & 0xFFFF;
+            let scale = (typmod - 4) & 0xFFFF;
+            1 + precision + if scale != 0 { 1 } else { 0 }
+        }
+        "numeric" => 131089,
+        "bit" => typmod,
+        "varbit" if typmod != -1 => typmod,
+        _ => PG_UNKNOWN_LENGTH,
+    }
+}
+
+/// pgjdbc's `TypeInfoCache.getPrecision` — COLUMN_SIZE.
+fn pg_precision(pg_type: &str, typmod: i64) -> i64 {
+    match pg_type {
+        "int2" => 5,
+        "oid" | "int4" => 10,
+        "int8" => 19,
+        "float4" => 8,
+        "float8" => 17,
+        "numeric" if typmod == -1 => 0,
+        "numeric" => ((typmod - 4) >> 16) & 0xFFFF,
+        "char" | "bool" => 1,
+        "varchar" | "bpchar" if typmod == -1 => PG_UNKNOWN_LENGTH,
+        "varchar" | "bpchar" => typmod - 4,
+        "date" | "time" | "timetz" | "interval" | "timestamp" | "timestamptz" => {
+            pg_display_size(pg_type, typmod)
+        }
+        "bit" => typmod,
+        "varbit" if typmod == -1 => PG_UNKNOWN_LENGTH,
+        "varbit" => typmod,
+        _ => PG_UNKNOWN_LENGTH,
+    }
+}
+
+/// pgjdbc's `TypeInfoCache.getScale` — DECIMAL_DIGITS (0 when not applicable).
+fn pg_scale(pg_type: &str, typmod: i64) -> i64 {
+    match pg_type {
+        "float4" => 8,
+        "float8" => 17,
+        "numeric" if typmod == -1 => 0,
+        "numeric" => (typmod - 4) & 0xFFFF,
+        "time" | "timetz" | "timestamp" | "timestamptz" => pg_seconds_digits(typmod),
+        "interval" if typmod == -1 => 6,
+        "interval" => typmod & 0xFFFF,
+        _ => 0,
+    }
+}
+
 struct ColInfo {
     table_cat: String,
     table_schem: String,
@@ -495,6 +606,41 @@ struct ColInfo {
     ordinal: i64,
     is_pk: bool,
     is_autoincrement: bool,
+    jdbc: JdbcColumnExtras,
+}
+
+/// The `getColumns` fields whose values are driver-specific. `None` is SQL
+/// NULL, an empty cell in the result.
+struct JdbcColumnExtras {
+    /// The `java.sql.Types` code; `None` derives it from TYPE_NAME.
+    data_type: Option<i64>,
+    buffer_length: Option<i64>,
+    num_prec_radix: i64,
+    remarks: String,
+    sql_data_type: Option<i64>,
+    sql_datetime_sub: Option<i64>,
+    char_octet_length: Option<i64>,
+    source_data_type: Option<i64>,
+    is_generated: bool,
+}
+
+impl JdbcColumnExtras {
+    /// What every driver reported before these were driver-specific: zeros,
+    /// and CHAR_OCTET_LENGTH equal to COLUMN_SIZE. Kept for the drivers not
+    /// yet measured against Lucee field by field.
+    fn legacy(column_size: i64) -> Self {
+        JdbcColumnExtras {
+            data_type: None,
+            buffer_length: Some(0),
+            num_prec_radix: 10,
+            remarks: String::new(),
+            sql_data_type: Some(0),
+            sql_datetime_sub: Some(0),
+            char_octet_length: Some(column_size),
+            source_data_type: None,
+            is_generated: false,
+        }
+    }
 }
 
 fn type_columns(
@@ -554,6 +700,7 @@ fn type_columns(
                     ordinal: cell_int(&row, "cid") + 1,
                     is_pk: cell_int(&row, "pk") > 0,
                     is_autoincrement,
+                    jdbc: JdbcColumnExtras::legacy(size),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -577,7 +724,7 @@ fn type_columns(
                 Some(sc) => (
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, \
                      CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA \
+                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA, COLUMN_COMMENT \
                      FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     vec![s(sc), s(&table)],
@@ -585,7 +732,7 @@ fn type_columns(
                 None => (
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, \
                      CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA \
+                     COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA, COLUMN_COMMENT \
                      FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     vec![s(&table)],
@@ -679,6 +826,14 @@ fn type_columns(
                     is_autoincrement: cell_str(&row, "EXTRA")
                         .to_lowercase()
                         .contains("auto_increment"),
+                    jdbc: JdbcColumnExtras {
+                        // Measured on Lucee 7.1.2.191 + MySQL 8.4: the column
+                        // comment is REMARKS, and EXTRA "STORED GENERATED" /
+                        // "VIRTUAL GENERATED" is IS_GENERATEDCOLUMN.
+                        remarks: cell_str(&row, "COLUMN_COMMENT"),
+                        is_generated: cell_str(&row, "EXTRA").to_lowercase().contains("generated"),
+                        ..JdbcColumnExtras::legacy(size)
+                    },
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -704,14 +859,35 @@ fn type_columns(
             (cols, fk_map)
         }
         DbDriver::Postgres(_) => {
+            // pgjdbc's DatabaseMetaData.getColumns, which is what Lucee reports
+            // (GH #514): straight from pg_catalog, so the type's OID-level facts
+            // (typmod, array element, domain base, identity, generated) are
+            // there to derive COLUMN_SIZE / DECIMAL_DIGITS / DATA_TYPE exactly
+            // as the driver does. information_schema had none of that, and
+            // reported serial columns as plain int4.
             let base = run(
                 ds,
-                "SELECT table_catalog, table_schema, table_name, column_name, udt_name, \
-                 character_maximum_length, numeric_precision, numeric_scale, is_nullable, \
-                 column_default, ordinal_position \
-                 FROM information_schema.columns \
-                 WHERE table_schema = COALESCE(NULLIF(?, ''), current_schema()) AND table_name = ? \
-                 ORDER BY ordinal_position",
+                "SELECT current_database() AS table_cat, n.nspname AS table_schem, \
+                 c.relname AS table_name, a.attname AS column_name, t.typname AS type_name, \
+                 t.typtype::text AS typtype, a.atttypmod AS typmod, \
+                 CASE WHEN t.typcategory = 'A' THEN et.typname END AS elem_name, \
+                 bt.typname AS base_name, t.typtypmod AS base_typmod, \
+                 CASE WHEN a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) THEN 1 ELSE 0 END AS notnull, \
+                 row_number() OVER (ORDER BY a.attnum) AS ordinal, \
+                 a.attidentity::text AS attidentity, a.attgenerated::text AS attgenerated, \
+                 pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS adsrc, dsc.description AS remarks \
+                 FROM pg_catalog.pg_namespace n \
+                 JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid \
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+                 JOIN pg_catalog.pg_type t ON a.atttypid = t.oid \
+                 LEFT JOIN pg_catalog.pg_type et ON et.oid = t.typelem \
+                 LEFT JOIN pg_catalog.pg_type bt ON bt.oid = t.typbasetype \
+                 LEFT JOIN pg_catalog.pg_attrdef def ON a.attrelid = def.adrelid AND a.attnum = def.adnum \
+                 LEFT JOIN pg_catalog.pg_description dsc ON c.oid = dsc.objoid AND a.attnum = dsc.objsubid \
+                   AND dsc.classoid = 'pg_catalog.pg_class'::regclass \
+                 WHERE c.relkind IN ('r', 'p', 'v', 'f', 'm') AND a.attnum > 0 AND NOT a.attisdropped \
+                   AND n.nspname = COALESCE(NULLIF(?, ''), current_schema()) AND c.relname = ? \
+                 ORDER BY a.attnum",
                 vec![s(schema.unwrap_or("")), s(&table)],
             )?;
             let pk_rows = run(
@@ -730,33 +906,96 @@ fn type_columns(
                 .collect();
             let mut cols = Vec::new();
             for row in base.rows() {
-                let size = match cell(&row, "character_maximum_length") {
-                    Some(CfmlValue::Null) | None => cell_int(&row, "numeric_precision"),
-                    Some(v) => v.as_string().parse::<i64>().unwrap_or(0),
-                };
-                let dflt = match cell(&row, "column_default") {
+                let pg_name = cell_str(&row, "type_name");
+                let typtype = cell_str(&row, "typtype");
+                let typmod = cell_int(&row, "typmod");
+                let elem = cell_str(&row, "elem_name");
+                let dflt = match cell(&row, "adsrc") {
                     Some(CfmlValue::Null) | None => None,
                     Some(v) => Some(v.as_string()),
                 };
+                // The type whose rules give the size: an array's element (at
+                // the column's typmod), or a domain's base type.
+                let base_name = cell_str(&row, "base_name");
+                let (rule_name, rule_typmod): (&str, i64) = if !elem.is_empty() {
+                    (&elem, typmod)
+                } else if typtype == "d" {
+                    (&base_name, typmod)
+                } else {
+                    (&pg_name, typmod)
+                };
+                let sql_type = if typtype == "c" {
+                    2002 // STRUCT
+                } else if typtype == "d" {
+                    2001 // DISTINCT
+                } else if typtype == "e" {
+                    12 // VARCHAR
+                } else if !elem.is_empty() {
+                    2003 // ARRAY
+                } else {
+                    pg_jdbc_type(&pg_name)
+                };
+                let size_of = |name: &str, typmod: i64| {
+                    let p = pg_precision(name, typmod);
+                    if p == 0 && name != "numeric" { pg_display_size(name, typmod) } else { p }
+                };
+                let base_typmod = cell_int(&row, "base_typmod");
+                // pgjdbc reads a CONSTRAINED domain's size straight off its
+                // typmod — raw, so `varchar(7)` reports 11 and `timestamp(3)`
+                // reports 3 — decoding it only for numeric, and takes the
+                // scale from the unconstrained base type. Measured on Lucee
+                // 7.1.2.191; odd, but it is what portable code sees there.
+                let (column_size, decimal_digits) = if typtype == "d" && base_typmod != -1 {
+                    if rule_name == "numeric" {
+                        (((base_typmod - 4) >> 16) & 0xFFFF, Some((base_typmod - 4) & 0xFFFF))
+                    } else {
+                        (base_typmod, Some(pg_scale(rule_name, -1)))
+                    }
+                } else if typtype == "d" {
+                    (size_of(rule_name, -1), Some(pg_scale(rule_name, -1)))
+                } else {
+                    // An unconstrained numeric has no scale: SQL NULL.
+                    let scale = (rule_name != "numeric" || rule_typmod != -1)
+                        .then(|| pg_scale(rule_name, rule_typmod));
+                    (size_of(rule_name, rule_typmod), scale)
+                };
+                // pgjdbc reports serial / bigserial / smallserial by name when
+                // the default draws from a sequence.
+                let is_serial = dflt.as_deref().is_some_and(|d| d.contains("nextval("));
+                let type_name = match (is_serial, pg_name.as_str()) {
+                    (true, "int4") => "serial".to_string(),
+                    (true, "int8") => "bigserial".to_string(),
+                    (true, "int2") => "smallserial".to_string(),
+                    _ => pg_name.clone(),
+                };
+                let identity = !cell_str(&row, "attidentity").is_empty();
+                let generated = !cell_str(&row, "attgenerated").is_empty();
                 let name = cell_str(&row, "column_name");
                 cols.push(ColInfo {
-                    table_cat: cell_str(&row, "table_catalog"),
-                    table_schem: cell_str(&row, "table_schema"),
+                    table_cat: cell_str(&row, "table_cat"),
+                    table_schem: cell_str(&row, "table_schem"),
                     table_name: cell_str(&row, "table_name"),
                     is_pk: pk_set.contains(&name.to_lowercase()),
                     column_name: name,
-                    type_name: cell_str(&row, "udt_name"),
-                    column_size: size,
-                    decimal_digits: cell_opt_int(&row, "numeric_scale"),
-                    nullable: cell_str(&row, "is_nullable").eq_ignore_ascii_case("YES"),
-                    // Postgres serial/bigserial columns default to nextval(seq);
-                    // that (or an IDENTITY default) is the auto-increment marker.
-                    is_autoincrement: dflt
-                        .as_deref()
-                        .map(|d| d.to_lowercase().contains("nextval"))
-                        .unwrap_or(false),
+                    type_name,
+                    column_size,
+                    decimal_digits,
+                    nullable: cell_int(&row, "notnull") == 0,
+                    is_autoincrement: is_serial || identity,
                     default_value: dflt,
-                    ordinal: cell_int(&row, "ordinal_position"),
+                    ordinal: cell_int(&row, "ordinal"),
+                    jdbc: JdbcColumnExtras {
+                        data_type: Some(sql_type),
+                        buffer_length: None,
+                        num_prec_radix: if matches!(rule_name, "bit" | "varbit") { 2 } else { 10 },
+                        remarks: cell_str(&row, "remarks"),
+                        sql_data_type: None,
+                        sql_datetime_sub: None,
+                        char_octet_length: matches!(sql_type, 1 | 12 | -1 | -2 | -3 | -4)
+                            .then_some(column_size),
+                        source_data_type: (typtype == "d").then(|| pg_jdbc_type(rule_name)),
+                        is_generated: generated,
+                    },
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -844,6 +1083,7 @@ fn type_columns(
                     // (it needs COLUMNPROPERTY(...,'IsIdentity')); left false as a
                     // best-effort default (the reported case is MySQL, GitHub #254).
                     is_autoincrement: false,
+                    jdbc: JdbcColumnExtras::legacy(size),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -893,13 +1133,17 @@ fn type_columns(
         row.insert("TABLE_SCHEM".to_string(), s(&c.table_schem));
         row.insert("TABLE_NAME".to_string(), s(&c.table_name));
         row.insert("COLUMN_NAME".to_string(), s(&c.column_name));
+        let int_or_null = |v: Option<i64>| match v {
+            Some(n) => CfmlValue::Int(n),
+            None => CfmlValue::Null,
+        };
         row.insert(
             "DATA_TYPE".to_string(),
-            CfmlValue::Int(jdbc_type_code(&c.type_name)),
+            CfmlValue::Int(c.jdbc.data_type.unwrap_or_else(|| jdbc_type_code(&c.type_name))),
         );
         row.insert("TYPE_NAME".to_string(), s(&c.type_name));
         row.insert("COLUMN_SIZE".to_string(), CfmlValue::Int(c.column_size));
-        row.insert("BUFFER_LENGTH".to_string(), CfmlValue::Int(0));
+        row.insert("BUFFER_LENGTH".to_string(), int_or_null(c.jdbc.buffer_length));
         row.insert(
             "DECIMAL_DIGITS".to_string(),
             match c.decimal_digits {
@@ -907,12 +1151,12 @@ fn type_columns(
                 None => CfmlValue::Null,
             },
         );
-        row.insert("NUM_PREC_RADIX".to_string(), CfmlValue::Int(10));
+        row.insert("NUM_PREC_RADIX".to_string(), CfmlValue::Int(c.jdbc.num_prec_radix));
         row.insert(
             "NULLABLE".to_string(),
             CfmlValue::Int(if c.nullable { 1 } else { 0 }),
         );
-        row.insert("REMARKS".to_string(), s(""));
+        row.insert("REMARKS".to_string(), s(&c.jdbc.remarks));
         row.insert(
             "COLUMN_DEFAULT_VALUE".to_string(),
             match &c.default_value {
@@ -920,25 +1164,30 @@ fn type_columns(
                 None => CfmlValue::Null,
             },
         );
-        row.insert("SQL_DATA_TYPE".to_string(), CfmlValue::Int(0));
-        row.insert("SQL_DATETIME_SUB".to_string(), CfmlValue::Int(0));
-        row.insert(
-            "CHAR_OCTET_LENGTH".to_string(),
-            CfmlValue::Int(c.column_size),
-        );
+        row.insert("SQL_DATA_TYPE".to_string(), int_or_null(c.jdbc.sql_data_type));
+        row.insert("SQL_DATETIME_SUB".to_string(), int_or_null(c.jdbc.sql_datetime_sub));
+        row.insert("CHAR_OCTET_LENGTH".to_string(), int_or_null(c.jdbc.char_octet_length));
         row.insert("ORDINAL_POSITION".to_string(), CfmlValue::Int(c.ordinal));
         row.insert(
             "IS_NULLABLE".to_string(),
             s(if c.nullable { "YES" } else { "NO" }),
         );
+        row.insert("SCOPE_CATALOG".to_string(), CfmlValue::Null);
+        row.insert("SCOPE_SCHEMA".to_string(), CfmlValue::Null);
+        row.insert("SCOPE_TABLE".to_string(), CfmlValue::Null);
+        row.insert("SOURCE_DATA_TYPE".to_string(), int_or_null(c.jdbc.source_data_type));
+        row.insert(
+            "IS_AUTOINCREMENT".to_string(),
+            s(if c.is_autoincrement { "YES" } else { "NO" }),
+        );
+        row.insert(
+            "IS_GENERATEDCOLUMN".to_string(),
+            s(if c.jdbc.is_generated { "YES" } else { "NO" }),
+        );
         if enrich {
             row.insert(
                 "IS_PRIMARYKEY".to_string(),
                 s(if c.is_pk { "YES" } else { "NO" }),
-            );
-            row.insert(
-                "IS_AUTOINCREMENT".to_string(),
-                s(if c.is_autoincrement { "YES" } else { "NO" }),
             );
             match fk_map.get(&c.column_name.to_lowercase()) {
                 Some((pkcol, pktable)) => {
@@ -1810,5 +2059,55 @@ mod type_mapping_tests {
         assert_eq!(mysql_temporal_display_size("YEAR"), Some(4));
         // A non-temporal type falls through to NUMERIC_PRECISION instead.
         assert_eq!(mysql_temporal_display_size("INT"), None);
+    }
+
+    /// pgjdbc's TypeInfoCache, as Lucee 7.1.2.191 reported it on PostgreSQL 18
+    /// (GH #514). `typmod` is pg_attribute.atttypmod: -1 when unconstrained,
+    /// length + 4 for varchar/bpchar, ((precision << 16) | scale) + 4 for
+    /// numeric, the fractional digits for temporal types.
+    #[test]
+    fn pg_sizes_and_scales_match_pgjdbc() {
+        for (ty, typmod, size, scale) in [
+            ("int4", -1, 10, 0),
+            ("int8", -1, 19, 0),
+            ("int2", -1, 5, 0),
+            ("bool", -1, 1, 0),
+            ("varchar", 24, 20, 0),
+            ("varchar", -1, 2147483647, 0),
+            ("bpchar", 7, 3, 0),
+            ("text", -1, 2147483647, 0),
+            ("timestamp", -1, 29, 6),
+            ("timestamp", 0, 22, 0),
+            ("timestamptz", 3, 32, 3),
+            ("time", -1, 15, 6),
+            ("timetz", 2, 17, 2),
+            ("date", -1, 13, 0),
+            ("numeric", (10 << 16 | 2) + 4, 10, 2),
+            ("numeric", -1, 0, 0),
+            ("float4", -1, 8, 8),
+            ("float8", -1, 17, 17),
+            ("interval", -1, 49, 6),
+            ("bit", 3, 3, 0),
+            ("uuid", -1, 2147483647, 0),
+        ] {
+            let mut got = pg_precision(ty, typmod);
+            if got == 0 && ty != "numeric" {
+                got = pg_display_size(ty, typmod);
+            }
+            assert_eq!(got, size, "COLUMN_SIZE of {ty}({typmod})");
+            assert_eq!(pg_scale(ty, typmod), scale, "DECIMAL_DIGITS of {ty}({typmod})");
+        }
+    }
+
+    #[test]
+    fn pg_type_codes_match_pgjdbc() {
+        for (ty, code) in [
+            ("int4", 4), ("int8", -5), ("int2", 5), ("bool", -7), ("varchar", 12), ("text", 12),
+            ("bpchar", 1), ("bytea", -2), ("numeric", 2), ("float4", 7), ("float8", 8),
+            ("date", 91), ("time", 92), ("timestamp", 93), ("timestamptz", 93),
+            ("uuid", 1111), ("jsonb", 1111), ("interval", 1111),
+        ] {
+            assert_eq!(pg_jdbc_type(ty), code, "DATA_TYPE of {ty}");
+        }
     }
 }

@@ -3074,16 +3074,16 @@ pub struct CfmlVirtualMachine {
     /// own datasource — Lucee/ACF "defer begin until the first query" behaviour.
     pub transaction_pending: bool,
     /// Nesting depth of `transaction { }` blocks. 0 = none, 1 = a single
-    /// outer transaction, >=2 = nested. A nested block becomes a SAVEPOINT on
-    /// the already-open outer transaction (Lucee/ACF/BoxLang semantics) rather
-    /// than a new transaction.
+    /// outer transaction, >=2 = nested. A nested block JOINS the outer
+    /// transaction, as on Lucee 7.1: it takes no savepoint, its exception rolls
+    /// back nothing unless it escapes the outermost block, and an
+    /// `action="commit"`/`"rollback"` inside it acts on the whole transaction.
     pub transaction_depth: usize,
-    /// One entry per nested level (so its length == transaction_depth - 1 while
-    /// inside a transaction). `Some(name)` means a SAVEPOINT statement was
-    /// actually issued on the live connection at that level (so the matching
-    /// commit/rollback releases/rolls-back-to it); `None` means the block was
-    /// still pending (no live connection) so there is no savepoint to manage.
-    pub transaction_savepoints: Vec<Option<String>>,
+    /// Savepoints set with `action="setsavepoint"` / `transactionSetSavepoint`
+    /// in the open transaction, in the spelling first used (names are matched
+    /// case-insensitively, as Lucee does). Kept until the transaction ends;
+    /// a later connection joining the transaction gets them too.
+    pub transaction_user_savepoints: Vec<String>,
     /// One entry per `transaction { }` BLOCK currently being executed, holding
     /// the `transaction_depth` that block established. Pushed by
     /// `__cftransaction_start` when the block form calls it and popped by the
@@ -3102,8 +3102,6 @@ pub struct CfmlVirtualMachine {
     pub txn_rollback: Option<fn(&mut Box<dyn std::any::Any>) -> Result<(), CfmlError>>,
     /// Function pointer: create a savepoint on a transaction conn (conn, name)
     pub txn_savepoint: Option<fn(&mut Box<dyn std::any::Any>, &str) -> Result<(), CfmlError>>,
-    /// Function pointer: release a savepoint on a transaction conn (conn, name)
-    pub txn_release_savepoint: Option<fn(&mut Box<dyn std::any::Any>, &str) -> Result<(), CfmlError>>,
     /// Function pointer: rollback to a savepoint on a transaction conn (conn, name)
     pub txn_rollback_to_savepoint: Option<fn(&mut Box<dyn std::any::Any>, &str) -> Result<(), CfmlError>>,
     /// Function pointer: execute query with transaction conn (conn, sql, params, return_type) -> result
@@ -5800,13 +5798,12 @@ impl CfmlVirtualMachine {
             transaction_extra_conns: Vec::new(),
             transaction_pending: false,
             transaction_depth: 0,
-            transaction_savepoints: Vec::new(),
+            transaction_user_savepoints: Vec::new(),
             transaction_block_marks: Vec::new(),
             txn_begin: None,
             txn_commit: None,
             txn_rollback: None,
             txn_savepoint: None,
-            txn_release_savepoint: None,
             txn_rollback_to_savepoint: None,
             txn_execute: None,
             default_datasource_fn: None,
@@ -23287,6 +23284,26 @@ impl CfmlVirtualMachine {
                             .unwrap_or(false),
                         _ => false,
                     };
+                    // `::` is an escaped `:` whenever params are passed (GH #513,
+                    // Lucee's QueryParamConverter): `queryExecute(sql, params)`
+                    // with any array or struct, or `<cfquery params=…>`. A
+                    // cfquery whose only params are cfqueryparam tags, or a
+                    // call with no (or null) params, keeps its SQL as written.
+                    let params_given = if from_cfquery_tag {
+                        matches!(args.get(2), Some(CfmlValue::Struct(opts)) if opts.get_ci("params").is_some())
+                    } else {
+                        matches!(args.get(1), Some(v) if !matches!(v, CfmlValue::Null))
+                    };
+                    if params_given && !is_qoq {
+                        if let Some(sql) = args.first() {
+                            let text = sql.as_string();
+                            if let std::borrow::Cow::Owned(collapsed) =
+                                cfml_common::sql_colons::collapse_escaped_colons(&text)
+                            {
+                                args[0] = CfmlValue::string(collapsed);
+                            }
+                        }
+                    }
                     // Observability: capture the datasource, query name, and the
                     // bound parameters now, before the QoQ/driver branches below
                     // consume `args`. Only when a QUERY-interested observer is
@@ -23389,11 +23406,9 @@ impl CfmlVirtualMachine {
                                     self.transaction_conn = Some(conn);
                                     self.transaction_datasource = Some(ds);
                                     self.transaction_pending = false;
-                                    // A nested block that opened while this one
-                                    // was still pending could not take its
-                                    // savepoint — there was no connection yet.
-                                    // Take them now, before the statement runs.
-                                    self.take_owed_savepoints()?;
+                                    // Savepoints set while the block was still
+                                    // pending had no connection to go on.
+                                    self.replay_user_savepoints_on_primary()?;
                                 }
                             }
                         }
@@ -23684,6 +23699,20 @@ impl CfmlVirtualMachine {
                         .ok_or_else(|| {
                             CfmlError::runtime("Missing attribute [name] on cfdbinfo".to_string())
                         })?;
+                    // An inline datasource struct (`{ class, connectionString }`),
+                    // which Lucee accepts here as queryExecute does. Stringifying
+                    // it gave the struct's dump, which resolved as a SQLite
+                    // FILE NAME, so cfdbinfo read an empty database.
+                    if let Some(key) = attrs
+                        .keys()
+                        .find(|k| k.eq_ignore_ascii_case("datasource"))
+                        .cloned()
+                    {
+                        if let Some(v @ CfmlValue::Struct(_)) = attrs.get(&key) {
+                            let url = Self::datasource_arg_to_name(v);
+                            attrs.insert(key, CfmlValue::string(url));
+                        }
+                    }
                     // Per-application datasource resolution (this.datasources /
                     // per-app cfconfig) — same routing queryExecute gets.
                     if !self.app_datasources.is_empty() || self.app_default_datasource.is_some() {
@@ -23851,6 +23880,27 @@ impl CfmlVirtualMachine {
                 }
                 "__cftransaction_commit" => return self.cftransaction_commit(),
                 "__cftransaction_rollback" => return self.cftransaction_rollback(),
+                // `transaction action="…" [savepoint="…"];` and the brace form's
+                // leading action — (action, savepoint).
+                "__cftransaction_action" => {
+                    let action = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    let savepoint = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                    return self.cftransaction_action(&action, &savepoint);
+                }
+                "transactioncommit" => {
+                    return self.cftransaction_action("commit", "");
+                }
+                "transactionrollback" => {
+                    let savepoint = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    return self.cftransaction_action("rollback", &savepoint);
+                }
+                "transactionsetsavepoint" => {
+                    let savepoint = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    return self.cftransaction_action("setsavepoint", &savepoint);
+                }
+                "iswithintransaction" => {
+                    return Ok(CfmlValue::Bool(self.transaction_depth > 0));
+                }
                 "__cflog" => {
                     // `<cflog text=".." file=".." log=".." type=".." application="..">`
                     // — the tag preprocessor bundles every attribute into one struct.
@@ -36938,82 +36988,32 @@ impl CfmlVirtualMachine {
         ids.into_iter().filter_map(|gid| self.resolve_fn(gid)).collect()
     }
 
-    /// `__cftransaction_start` — open a transaction, or turn a nested
-    /// `transaction { }` into a SAVEPOINT on the already-open outer one
-    /// (Lucee/ACF/BoxLang semantics).
-    /// Take the savepoints owed by nested `transaction { }` blocks that began
-    /// while the enclosing one was still pending.
-    ///
-    /// Lucee/ACF defer BEGIN to the first statement, so
-    ///
-    /// ```text
-    /// transaction {                 // no statement yet — no connection yet
-    ///     transaction { … }         // nests against nothing
-    /// }
-    /// ```
-    ///
-    /// reached the nested block with `transaction_conn == None`. It recorded
-    /// "no savepoint" and carried on, so on a driver WITHOUT savepoints the
-    /// nesting was silently permitted and the inner rollback became a no-op —
-    /// the inner block kept the work it asked to discard. The same shape with
-    /// one statement ahead of it was correctly refused, which is what made
-    /// this hole so easy to miss. Every `None` still in the list at the moment
-    /// the connection opens is one of these: the live-connection path records
-    /// `Some` or fails.
-    fn take_owed_savepoints(&mut self) -> Result<(), CfmlError> {
-        if self.transaction_savepoints.iter().all(Option::is_some) {
-            return Ok(());
-        }
+    /// Set every savepoint already recorded for this transaction on the
+    /// primary connection. Used when a block that was still pending (no
+    /// datasource yet) gets its connection: savepoints set before that point
+    /// had nothing to go on.
+    fn replay_user_savepoints_on_primary(&mut self) -> Result<(), CfmlError> {
         let Some(savepoint) = self.txn_savepoint else { return Ok(()) };
-        // Depth 1 is the outer block, so slot `i` belongs to depth `i + 2`.
-        let owed: Vec<(usize, String)> = self
-            .transaction_savepoints
-            .iter()
-            .enumerate()
-            .filter(|(_, sp)| sp.is_none())
-            .map(|(i, _)| (i, format!("cftxn_sp{}", i + 2)))
-            .collect();
-        for (i, name) in owed {
-            if let Some(conn) = self.transaction_conn.as_mut() {
-                savepoint(conn, &name)?;
+        if let Some(conn) = self.transaction_conn.as_mut() {
+            for name in &self.transaction_user_savepoints {
+                savepoint(conn, name)?;
             }
-            for (_, extra) in self.transaction_extra_conns.iter_mut() {
-                savepoint(extra, &name)?;
-            }
-            self.transaction_savepoints[i] = Some(name);
         }
         Ok(())
     }
 
+    /// `__cftransaction_start` — open a transaction, or join the one already
+    /// open (a nested `transaction { }` block, Lucee 7.1 semantics).
     fn cftransaction_start(&mut self, args: &[CfmlValue], parent_locals: &ValueMap) -> CfmlResult {
         if self.transaction_depth >= 1 {
-            let depth = self.transaction_depth + 1;
-            // Take the savepoint BEFORE recording the nesting. A driver that
-            // has no savepoints fails here, and leaving `transaction_depth`
-            // already incremented made the ENCLOSING block's rollback look like
-            // a nested one — so the outer transaction kept work it meant to
-            // discard, silently. Nothing is recorded until the savepoint is
-            // actually in place.
-            //
-            // Only issue a real savepoint when the outer transaction
-            // actually has a live connection. A still-pending block
-            // (no resolvable datasource yet) records None so the
-            // matching commit/rollback knows there is nothing to do.
-            let mut taken: Option<String> = None;
-            if self.transaction_conn.is_some() {
-                let name = format!("cftxn_sp{}", depth);
-                if let (Some(savepoint), Some(conn)) =
-                    (self.txn_savepoint, self.transaction_conn.as_mut())
-                {
-                    savepoint(conn, &name)?;
-                    for (_, extra) in self.transaction_extra_conns.iter_mut() {
-                        savepoint(extra, &name)?;
-                    }
-                    taken = Some(name);
-                }
-            }
-            self.transaction_depth = depth;
-            self.transaction_savepoints.push(taken);
+            // A nested block joins the outer transaction. Lucee 7.1.2 takes no
+            // savepoint for it: work done in an inner block whose exception is
+            // caught inside the outer block is kept, and only the outermost
+            // block's commit or rollback ends the transaction. (Until v0.751
+            // RustCFML took a savepoint per nested block, on the mistaken
+            // belief that Lucee did; those savepoints were also what raw
+            // COMMITs broke — GH #224, #308, #536.)
+            self.transaction_depth += 1;
             return Ok(CfmlValue::Null);
         }
         // Args: __cftransaction_start("begin", isolation, datasource).
@@ -37061,99 +37061,162 @@ impl CfmlVirtualMachine {
         ))
     }
 
-    /// `__cftransaction_commit` — close the innermost open level.
+    /// `__cftransaction_commit` — the end of a `transaction { }` block's body.
+    /// A nested block only leaves its level; the outermost block commits.
     fn cftransaction_commit(&mut self) -> CfmlResult {
-        // Committing a nested block releases its savepoint and leaves
-        // the outer transaction open (Lucee/ACF/BoxLang semantics).
         if self.transaction_depth >= 2 {
-            // Pop the savepoint and drop the depth BEFORE issuing the
-            // driver call so that a failing RELEASE SAVEPOINT can't
-            // leave the nesting depth stuck — otherwise the next
-            // sibling block would keep climbing (cftxn_sp6, sp7 …).
-            let popped = self.transaction_savepoints.pop();
             self.transaction_depth -= 1;
-            if let Some(Some(name)) = popped {
-                if let (Some(release), Some(conn)) =
-                    (self.txn_release_savepoint, self.transaction_conn.as_mut())
-                {
-                    release(conn, &name)?;
-                    for (_, extra) in self.transaction_extra_conns.iter_mut() {
-                        release(extra, &name)?;
-                    }
-                }
-            }
             return Ok(CfmlValue::Null);
         }
         // Top-level commit. The block is definitively over once we get
         // here, so ALL transaction state must reset even if the driver
         // commit itself errors — otherwise a stale depth/conn leaks
-        // into the next transaction, which then behaves as nested and
-        // issues a SAVEPOINT on a connection that has none (GH #224:
-        // "SAVEPOINT cftxn_spN does not exist", counter climbing across
-        // specs).
-        let mut commit_result = match (self.transaction_conn.as_mut(), self.txn_commit) {
-            (Some(conn), Some(txn_commit)) => txn_commit(conn),
-            _ => Ok(()),
-        };
-        if let Some(txn_commit) = self.txn_commit {
-            for (_, mut extra) in std::mem::take(&mut self.transaction_extra_conns) {
-                let r = txn_commit(&mut extra);
-                if commit_result.is_ok() {
-                    commit_result = r;
-                }
-            }
-        }
-        self.transaction_extra_conns.clear();
-        self.transaction_conn = None;
-        self.transaction_datasource = None;
-        self.transaction_pending = false;
-        self.transaction_depth = 0;
-        self.transaction_savepoints.clear();
+        // into the next transaction (GH #224).
+        let commit_result = self.for_each_txn_conn(self.txn_commit);
+        self.reset_transaction_state();
         commit_result?;
         Ok(CfmlValue::Null)
     }
 
-    /// `__cftransaction_rollback` — undo the innermost open level.
+    /// `__cftransaction_rollback` — an exception is leaving a
+    /// `transaction { }` block. A nested block only leaves its level: the
+    /// exception rolls the work back if it escapes the outermost block, and
+    /// keeps it if something inside that block catches it (Lucee 7.1).
     fn cftransaction_rollback(&mut self) -> CfmlResult {
-        // Rolling back a nested block rolls back to its savepoint and
-        // leaves the outer transaction open.
         if self.transaction_depth >= 2 {
-            let popped = self.transaction_savepoints.pop();
             self.transaction_depth -= 1;
-            if let Some(Some(name)) = popped {
-                if let (Some(rollback_to), Some(conn)) =
-                    (self.txn_rollback_to_savepoint, self.transaction_conn.as_mut())
-                {
-                    rollback_to(conn, &name)?;
-                    for (_, extra) in self.transaction_extra_conns.iter_mut() {
-                        rollback_to(extra, &name)?;
-                    }
-                }
-            }
             return Ok(CfmlValue::Null);
         }
         // Top-level rollback — reset all state unconditionally (see the
         // commit handler above for why). GH #224.
-        let mut rollback_result = match (self.transaction_conn.as_mut(), self.txn_rollback) {
-            (Some(conn), Some(txn_rollback)) => txn_rollback(conn),
-            _ => Ok(()),
+        let rollback_result = self.for_each_txn_conn(self.txn_rollback);
+        self.reset_transaction_state();
+        rollback_result?;
+        Ok(CfmlValue::Null)
+    }
+
+    /// Run `op` on the transaction's primary connection and every extra one,
+    /// returning the first error after trying them all.
+    fn for_each_txn_conn(
+        &mut self,
+        op: Option<fn(&mut Box<dyn std::any::Any>) -> Result<(), CfmlError>>,
+    ) -> Result<(), CfmlError> {
+        let Some(op) = op else { return Ok(()) };
+        let mut result = match self.transaction_conn.as_mut() {
+            Some(conn) => op(conn),
+            None => Ok(()),
         };
-        if let Some(txn_rollback) = self.txn_rollback {
-            for (_, mut extra) in std::mem::take(&mut self.transaction_extra_conns) {
-                let r = txn_rollback(&mut extra);
-                if rollback_result.is_ok() {
-                    rollback_result = r;
-                }
+        for (_, extra) in self.transaction_extra_conns.iter_mut() {
+            let r = op(extra);
+            if result.is_ok() {
+                result = r;
             }
         }
+        result
+    }
+
+    /// Like `for_each_txn_conn`, for an operation that takes a savepoint name.
+    /// Stops at the first error: a savepoint missing on one connection must
+    /// not be rolled back to on the others.
+    fn for_each_txn_conn_named(
+        &mut self,
+        op: Option<fn(&mut Box<dyn std::any::Any>, &str) -> Result<(), CfmlError>>,
+        name: &str,
+    ) -> Result<(), CfmlError> {
+        let Some(op) = op else { return Ok(()) };
+        if let Some(conn) = self.transaction_conn.as_mut() {
+            op(conn, name)?;
+        }
+        for (_, extra) in self.transaction_extra_conns.iter_mut() {
+            op(extra, name)?;
+        }
+        Ok(())
+    }
+
+    /// Forget the transaction: drop its connections (returning them to their
+    /// pools) and every piece of state that belongs to it.
+    fn reset_transaction_state(&mut self) {
         self.transaction_extra_conns.clear();
         self.transaction_conn = None;
         self.transaction_datasource = None;
         self.transaction_pending = false;
         self.transaction_depth = 0;
-        self.transaction_savepoints.clear();
-        rollback_result?;
-        Ok(CfmlValue::Null)
+        self.transaction_user_savepoints.clear();
+    }
+
+    /// An action run inside a transaction: `transaction action="…";`, the
+    /// leading action of `transaction action="…" { … }`, `<cftransaction
+    /// action="…">` inside another cftransaction, and the transactionCommit /
+    /// transactionRollback / transactionSetSavepoint BIFs. Probed on Lucee
+    /// 7.1.2.191 against PostgreSQL and MySQL:
+    ///
+    /// - `commit` and `rollback` act on the WHOLE transaction, at any nesting
+    ///   level, and the transaction stays open: later statements in the block
+    ///   run in a new database transaction that the block's end commits or
+    ///   rolls back (GH #537).
+    /// - `rollback` with a `savepoint` rolls back to it; an unknown name is an
+    ///   error. Names match case-insensitively.
+    /// - `setsavepoint` sets a named savepoint. An unnamed one can never be
+    ///   rolled back to (`savepoint=""` means the whole transaction), so it
+    ///   sets nothing.
+    /// - Outside a transaction, every action does nothing.
+    fn cftransaction_action(&mut self, action: &str, savepoint: &str) -> CfmlResult {
+        let action = action.trim().to_ascii_lowercase();
+        let savepoint = savepoint.trim();
+        match action.as_str() {
+            // A run-time `action="#a#"` that turns out to be begin. Inside a
+            // transaction it joins the open one; as a bodyless statement it is
+            // an empty block, as Lucee reads `<cftransaction action="begin" />`.
+            // (The literal `transaction action="begin";` statement still opens
+            // a transaction through `__cftransaction_start`.)
+            "begin" | "" => Ok(CfmlValue::Null),
+            "commit" | "rollback" | "setsavepoint" if self.transaction_depth == 0 => Ok(CfmlValue::Null),
+            "commit" => {
+                self.for_each_txn_conn(self.txn_commit)?;
+                Ok(CfmlValue::Null)
+            }
+            "rollback" if savepoint.is_empty() => {
+                self.for_each_txn_conn(self.txn_rollback)?;
+                Ok(CfmlValue::Null)
+            }
+            "rollback" => {
+                let name = self
+                    .transaction_user_savepoints
+                    .iter()
+                    .find(|n| n.eq_ignore_ascii_case(savepoint))
+                    .cloned()
+                    .ok_or_else(|| {
+                        CfmlError::database(format!(
+                            "There are no savepoint with name [{}] set",
+                            savepoint
+                        ))
+                    })?;
+                self.for_each_txn_conn_named(self.txn_rollback_to_savepoint, &name)?;
+                Ok(CfmlValue::Null)
+            }
+            "setsavepoint" => {
+                if savepoint.is_empty() {
+                    return Ok(CfmlValue::Null);
+                }
+                let name = match self
+                    .transaction_user_savepoints
+                    .iter()
+                    .find(|n| n.eq_ignore_ascii_case(savepoint))
+                {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        self.transaction_user_savepoints.push(savepoint.to_string());
+                        savepoint.to_string()
+                    }
+                };
+                self.for_each_txn_conn_named(self.txn_savepoint, &name)?;
+                Ok(CfmlValue::Null)
+            }
+            other => Err(CfmlError::runtime(format!(
+                "Invalid cftransaction action [{}]: valid actions are begin, commit, rollback, setsavepoint.",
+                other
+            ))),
+        }
     }
 
     /// Roll back and discard any transaction still open when a request ends.
@@ -37169,28 +37232,15 @@ impl CfmlVirtualMachine {
         if self.transaction_depth == 0 && self.transaction_conn.is_none() {
             return;
         }
-        if let (Some(conn), Some(txn_rollback)) = (self.transaction_conn.as_mut(), self.txn_rollback)
-        {
-            let _ = txn_rollback(conn);
-        }
-        if let Some(txn_rollback) = self.txn_rollback {
-            for (_, mut extra) in std::mem::take(&mut self.transaction_extra_conns) {
-                let _ = txn_rollback(&mut extra);
-            }
-        }
-        self.transaction_extra_conns.clear();
-        self.transaction_conn = None;
-        self.transaction_datasource = None;
-        self.transaction_pending = false;
-        self.transaction_depth = 0;
-        self.transaction_savepoints.clear();
+        let _ = self.for_each_txn_conn(self.txn_rollback);
+        self.reset_transaction_state();
     }
 
     /// The open transaction's connection for datasource `ds`: the transaction's
     /// own when `ds` is the datasource it began on, otherwise a connection
     /// opened into the same transaction on first use. A connection that joins
-    /// after nested blocks set savepoints gets those savepoints too, so a
-    /// nested rollback reaches every datasource the block touched.
+    /// after savepoints were set gets those savepoints too, so rolling back to
+    /// one reaches every datasource the transaction touched.
     fn transaction_conn_for(&mut self, ds: &str) -> Result<&mut Box<dyn std::any::Any>, CfmlError> {
         let resolve = |s: &str| match self.datasource_resolve_fn {
             Some(f) => f(s),
@@ -37213,7 +37263,7 @@ impl CfmlVirtualMachine {
                 })?;
                 let mut conn = txn_begin(ds)?;
                 if let Some(savepoint) = self.txn_savepoint {
-                    for name in self.transaction_savepoints.iter().flatten() {
+                    for name in &self.transaction_user_savepoints {
                         savepoint(&mut conn, name)?;
                     }
                 }
