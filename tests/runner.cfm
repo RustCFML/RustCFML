@@ -795,6 +795,7 @@ include "harness.cfm";
 
 <!--- Application.cfc this.timezone / this.locale (docs/known-issues.md §1). --->
 <cf_runtest file="lifecycle/test_application_timezone_locale.cfm" />
+<cf_runtest file="lifecycle/test_application_settings_in_thread.cfm" />
 <cf_runtest file="lifecycle/test_application_pseudo_include.cfm" />
 <cf_runtest file="lifecycle/test_application_shared_variables.cfm" />
 
