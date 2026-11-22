@@ -36,10 +36,28 @@ cargo about generate --config about.toml about.hbs -o THIRD-PARTY.txt.raw
 # between macOS and Linux, which is legally meaningless but broke the
 # byte-exact staleness gate in .github/workflows/licenses.yml.
 #
-# Squeezing blank lines makes the artifact platform-independent. It only ever
-# removes empty lines — no licence wording, copyright line or attribution is
+# Squeezing removes the EXTRA blank lines. The opposite also happens: a
+# licence text harvested without its trailing blank line runs straight into
+# the next entry's opening rule (v0.751.1: bit_field 0.10.3 on Linux only, a
+# file macOS generates WITH the line), and which way it falls flips with the
+# dependency set — so hand-editing the file to match CI only moved the
+# failure (18737bce broke main that way). The awk pass therefore also puts
+# the blank line back before every entry's OPENING rule: a line of 80 `=`
+# whose next line is not blank (the closing rule after "Applies to" is
+# followed by a blank line and is left alone).
+#
+# Together these make the artifact platform-independent. They only ever add or
+# remove empty lines — no licence wording, copyright line or attribution is
 # altered.
-cat -s THIRD-PARTY.txt.raw > THIRD-PARTY.txt
+cat -s THIRD-PARTY.txt.raw | awk '
+    function is_rule(s) { return s ~ /^={80}$/ }
+    NR > 1 {
+        if (is_rule(prev) && $0 != "" && prev_prev != "" && NR > 2) print ""
+        print prev
+    }
+    { prev_prev = (NR > 1 ? prev : ""); prev = $0 }
+    END { if (NR > 0) print prev }
+' > THIRD-PARTY.txt
 rm -f THIRD-PARTY.txt.raw
 
 echo "Wrote THIRD-PARTY.txt ($(wc -l < THIRD-PARTY.txt | tr -d ' ') lines)"
