@@ -69,6 +69,13 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time macro only" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; no vulnerability" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; no vulnerability" },
+    # chronotope/chrono#1768 (2026-11): chrono and its satellites declared
+    # unmaintained, "no safe upgrade". No vulnerability. chrono underpins the
+    # date value type (stdlib/dates.rs, vendor/chrono-tz), so replacing it is a
+    # project of its own, not a dependency bump.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (chrono#1768); no vulnerability; replacement is a project" },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build unmaintained (chrono#1768); build-time only; no vulnerability" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained (chrono#1768); no vulnerability" },
 ]
 
 [sources]

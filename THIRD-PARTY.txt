@@ -18,7 +18,7 @@ making the corresponding source available to recipients at those locations.
 
 Summary
 -------
-  MIT License (MIT) — 593 crate(s)
+  MIT License (MIT) — 594 crate(s)
   Apache License 2.0 (Apache-2.0) — 47 crate(s)
   Unicode License v3 (Unicode-3.0) — 20 crate(s)
   BSD 3-Clause "New" or "Revised" License (BSD-3-Clause) — 13 crate(s)
@@ -167,12 +167,12 @@ Dependencies
 [MIT]
   hex 0.4.3 — https://github.com/KokaKiwi/rust-hex
 [MIT]
-  form_urlencoded 1.2.2 — https://github.com/servo/rust-url
+  form_urlencoded 1.2.3 — https://github.com/servo/rust-url
 [MIT]
   data-url 0.3.2 — https://github.com/servo/rust-url
   idna 1.1.0 — https://github.com/servo/rust-url/
   percent-encoding 2.3.2 — https://github.com/servo/rust-url/
-  url 2.5.8 — https://github.com/servo/rust-url
+  url 2.5.9 — https://github.com/servo/rust-url
 [MIT]
   cfg-if 1.0.5 — https://github.com/rust-lang/cfg-if
   openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
@@ -227,7 +227,7 @@ Dependencies
 [MIT]
   float-cmp 0.9.0 — https://github.com/mikedilger/float-cmp
 [MIT]
-  lettre 0.11.23 — https://github.com/lettre/lettre
+  lettre 0.11.24 — https://github.com/lettre/lettre
 [MIT]
   flate2 1.1.10 — https://github.com/rust-lang/flate2-rs
 [MIT]
@@ -722,7 +722,7 @@ Dependencies
 [MIT]
   pulp 0.22.3 — https://github.com/sarah-quinones/pulp/
 [MIT]
-  email-encoding 0.4.2 — https://github.com/lettre/email-encoding
+  email-encoding 0.4.3 — https://github.com/lettre/email-encoding
 [MIT]
   atomic_refcell 0.1.14 — https://github.com/mozilla/atomic_refcell
 [MIT]
@@ -789,6 +789,7 @@ Dependencies
   windows-result 0.4.1 — https://github.com/microsoft/windows-rs
   windows-strings 0.5.1 — https://github.com/microsoft/windows-rs
   windows-sys 0.52.0 — https://github.com/microsoft/windows-rs
+  windows-sys 0.59.0 — https://github.com/microsoft/windows-rs
   windows-sys 0.61.2 — https://github.com/microsoft/windows-rs
   windows-targets 0.52.6 — https://github.com/microsoft/windows-rs
   windows_x86_64_gnu 0.52.6 — https://github.com/microsoft/windows-rs
@@ -4443,7 +4444,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - form_urlencoded 1.2.2
+  - form_urlencoded 1.2.3
 ================================================================================
 
 Copyright (c) 2013-2016 The rust-url developers
@@ -4479,7 +4480,7 @@ Applies to:
   - data-url 0.3.2
   - idna 1.1.0
   - percent-encoding 2.3.2
-  - url 2.5.8
+  - url 2.5.9
 ================================================================================
 
 Copyright (c) 2013-2025 The rust-url developers
@@ -4943,7 +4944,7 @@ IN THE SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - lettre 0.11.23
+  - lettre 0.11.24
 ================================================================================
 
 Copyright (c) 2014-2024 Alexis Mousset <contact@amousset.me>
@@ -10809,12 +10810,12 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - email-encoding 0.4.2
+  - email-encoding 0.4.3
 ================================================================================
 
 MIT License
 
-Copyright (c) 2021-2024 Paolo Barbolini <paolo@paolo565.org>
+Copyright (c) 2021-2026 Paolo Barbolini <paolo@paolobarbolini.it>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11215,6 +11216,7 @@ Applies to:
   - windows-result 0.4.1
   - windows-strings 0.5.1
   - windows-sys 0.52.0
+  - windows-sys 0.59.0
   - windows-sys 0.61.2
   - windows-targets 0.52.6
   - windows_x86_64_gnu 0.52.6
