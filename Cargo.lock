@@ -1535,7 +1535,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1560,14 +1560,14 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "cfml-common",
 ]
 
 [[package]]
 name = "cfml-config"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "indexmap",
  "log",
@@ -1582,7 +1582,7 @@ version = "0.1.0"
 
 [[package]]
 name = "cfml-qoq"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "cfml-common",
  "indexmap",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-sanitize"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "ego-tree",
  "quick-xml 0.41.0",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "ab_glyph",
  "aes 0.8.4",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "bincode",
  "cfml-codegen",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -6782,7 +6782,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.751.0"
+version = "0.751.1"
 dependencies = [
  "automerge",
  "axum",
