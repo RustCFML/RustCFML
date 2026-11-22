@@ -4386,6 +4386,13 @@ pub struct ThreadSeed {
     pub app_datasources: IndexMap<String, String>,
     /// Per-application default datasource URL (`this.datasource`). See above.
     pub app_default_datasource: Option<String>,
+    /// The Application.cfc `this` template. Everything that reads the
+    /// application's own settings consults it — `getApplicationSettings()` /
+    /// `getApplicationMetadata()` (custom `this.*` keys), `this.s3` for
+    /// `s3://` paths, the upload allow/block lists — so a thread without it
+    /// saw only the defaulted standard keys and no S3 config (GH #543). Lucee
+    /// gives a thread the same application context as its request.
+    pub app_cfc_template: Option<CfmlValue>,
     /// Snapshot of the parent's page-level `thread` soft-scope at spawn. Holds
     /// any `thread.x = ...` values seeded BEFORE the cfthread (the standard CFML
     /// idiom for passing data into a thread). Restored into the child's
@@ -7099,6 +7106,7 @@ impl CfmlVirtualMachine {
             disallowed_imports: self.disallowed_imports.clone(),
             app_datasources: self.app_datasources.clone(),
             app_default_datasource: self.app_default_datasource.clone(),
+            app_cfc_template: self.app_cfc_template.clone(),
             closure: body,
             attributes,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -7170,6 +7178,7 @@ impl CfmlVirtualMachine {
         self.disallowed_imports = seed.disallowed_imports;
         self.app_datasources = seed.app_datasources;
         self.app_default_datasource = seed.app_default_datasource;
+        self.app_cfc_template = seed.app_cfc_template;
         self.cancel_flag = Some(seed.cancel_flag);
         for (k, v) in seed.variables_snapshot {
             self.globals.insert(k, v);
