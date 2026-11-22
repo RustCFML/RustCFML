@@ -10606,8 +10606,24 @@ const CFHTTP_MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 /// `fileContent = ""` with a `200` status, so a large or Latin-1 response just
 /// looked empty. Text is now decoded lossily, and an over-size body is an
 /// error rather than a silent empty success.
+///
+/// A response that has no body by definition — the answer to a HEAD, or a
+/// 1xx/204/304 status (RFC 9110 §6.4.1) — is not read at all. Its
+/// `Content-Encoding` names how the body a GET *would* get is encoded, but
+/// `ureq` still wraps the empty stream in a gzip decoder, which fails with
+/// "unexpected end of file" (GH #540: a HEAD for a missing S3 object, answered
+/// 404 + gzip, threw instead of reporting 404). Lucee returns the status and
+/// headers with an empty `fileContent`.
 #[cfg(feature = "http")]
-fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> Result<CfmlValue, CfmlError> {
+fn cfhttp_file_content(
+    resp: ureq::Response,
+    method: &str,
+    get_as_binary: bool,
+) -> Result<CfmlValue, CfmlError> {
+    let status = resp.status();
+    if method == "HEAD" || (100..200).contains(&status) || status == 204 || status == 304 {
+        return Ok(if get_as_binary { CfmlValue::binary(Vec::new()) } else { CfmlValue::string(String::new()) });
+    }
     let mut reader = std::io::Read::take(resp.into_reader(), CFHTTP_MAX_RESPONSE_BYTES + 1);
     let mut body = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut body).map_err(|e| {
@@ -10997,7 +11013,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             resp_headers.insert("status_code".to_string(), CfmlValue::Int(status as i64));
             resp_headers.insert("explanation".to_string(), CfmlValue::string(status_text.clone()));
 
-            let file_content = cfhttp_file_content(resp, get_as_binary)?;
+            let file_content = cfhttp_file_content(resp, &method, get_as_binary)?;
 
             let (mime, charset) = parse_content_type(&content_type);
 
@@ -11050,7 +11066,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             resp_headers.insert("status_code".to_string(), CfmlValue::Int(code as i64));
             resp_headers.insert("explanation".to_string(), CfmlValue::string(status_text.clone()));
 
-            let file_content = cfhttp_file_content(resp, get_as_binary)?;
+            let file_content = cfhttp_file_content(resp, &method, get_as_binary)?;
             let (mime, charset) = parse_content_type(&content_type);
 
             result_struct.insert("statusCode".to_string(), CfmlValue::string(format!("{} {}", code, status_text)));
