@@ -53,6 +53,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_null_return_no_key.cfm" />
 <cf_runtest file="core/test_undefined_member_throws.cfm" />
 <cf_runtest file="core/test_cfcatch_standard_members.cfm" />
+<cf_runtest file="tags/test_cfcatch_type_literal.cfm" />
 <cf_runtest file="core/test_bare_call_shadowing_semantics.cfm" />
 <cf_runtest file="core/test_closure_env_leak.cfm" rustcfmlOnly="true" why="chained call mk(5)(3) in an expression; Lucee's parser rejects it" />
 <cf_runtest file="functions/test_closure_env_writeback_leak.cfm" />

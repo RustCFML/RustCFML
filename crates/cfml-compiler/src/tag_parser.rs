@@ -1559,6 +1559,22 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 tag.eq_ignore_ascii_case("</cfcatch>")
             };
             let prefix = if preceded_by_catch { "" } else { "}\n" };
+            // The type is a literal NAME (Lucee): `my-type`, `my type` and
+            // `app.one,app.two` are each one exception type — a comma makes no
+            // list. Emitted bare, anything but a dotted identifier is a parse
+            // error for the whole template (`x-y` lexes as a subtraction), so
+            // quote it; the script `catch ("…" e)` form takes a string literal.
+            // Dotted identifiers stay bare to keep the generated source as it was.
+            let is_dotted_ident = !catch_type.is_empty()
+                && catch_type.split('.').all(|seg| {
+                    seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                });
+            let catch_type = if is_dotted_ident {
+                catch_type
+            } else {
+                format!("\"{}\"", escape_for_string_literal(&catch_type))
+            };
             (format!("{}catch ({} cfcatch) {{\n", prefix, catch_type), tag_end - start)
         }
         "cfabort" => {
