@@ -4181,6 +4181,34 @@ impl CfmlQuery {
         self.0.read().columns.iter().any(|c| c.eq_ignore_ascii_case(name))
     }
 
+    /// What a bare `name` reads inside a query loop over this recordset: the
+    /// pseudo-columns `currentRow`, `recordCount` and `columnList`, or a
+    /// column's value at the cursor row. `None` when the query has neither, so
+    /// the lookup moves on (to an outer loop's query, then `variables`).
+    ///
+    /// As on Lucee 7.1: a real column wins over a pseudo-column of the same
+    /// name, and a NULL cell reads as `""`.
+    pub fn loop_scope_get(&self, name: &str) -> Option<CfmlValue> {
+        let data = self.0.read();
+        if let Some(col) = data.column_index_ci(name) {
+            return Some(match data.cell(data.current_row() - 1, col) {
+                Some(CfmlValue::Null) | None => CfmlValue::string(String::new()),
+                Some(v) => v.clone(),
+            });
+        }
+        if name.eq_ignore_ascii_case("currentrow") {
+            return Some(CfmlValue::Int(data.current_row() as i64));
+        }
+        if name.eq_ignore_ascii_case("recordcount") {
+            return Some(CfmlValue::Int(data.row_count() as i64));
+        }
+        if name.eq_ignore_ascii_case("columnlist") {
+            drop(data);
+            return Some(CfmlValue::string(self.column_list()));
+        }
+        None
+    }
+
     /// Uppercased, comma-joined column list (Lucee/ACF `columnList` convention).
     pub fn column_list(&self) -> String {
         self.0

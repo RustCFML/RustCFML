@@ -1093,44 +1093,49 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 Some(query_raw) => {
                     let query = strip_hashes(query_raw);
                     if attrs.contains_key("group") {
-                        // Grouped (control-break) output. The query rows are
-                        // materialised into an array once, then iterated in
-                        // group breaks: per-group body runs once, and a nested
-                        // <cfoutput> (the detail block) iterates that group's
-                        // rows. Nesting recurses for multi-level grouping.
+                        // Grouped (control-break) output. The row numbers are
+                        // collected once, then iterated in group breaks: the
+                        // per-group body runs once, and a nested <cfoutput>
+                        // (the detail block) iterates that group's rows.
+                        // Nesting recurses for multi-level grouping. Rows are
+                        // visited by cursor with the query on the query scope
+                        // stack, as in the ungrouped form (GH #544).
                         let group_col = strip_hashes(attrs.get("group").unwrap());
                         let case_sensitive = group_case_sensitive(&attrs);
                         let q = format!("__cfg_q_{}", start);
                         let rows = format!("__cfg_rows_{}", start);
                         let rc = format!("__cfg_rc_{}", start);
-                        let cl = format!("__cfg_cl_{}", start);
                         let ci = format!("__cfg_ci_{}", start);
-                        let r = format!("__cfg_r_{}", start);
+                        let cur = format!("__cfg_cur_{}", start);
+                        let depth = format!("__cfg_d_{}", start);
                         let group_loop = emit_grouped_query_body(
-                            &rows, &query, &body, &group_col, case_sensitive, "cfoutput", true,
+                            &rows, &q, &body, &group_col, case_sensitive, "cfoutput", true,
                             imports, start, 0,
                         );
                         (
                             format!(
-                                "var {q} = {query};\nvar {rows} = [];\nvar {rc} = {q}.recordcount;\nvar {cl} = {q}.columnlist;\nvar {ci} = 0;\nfor (var {r} in {q}) {{\n{ci} = {ci} + 1;\n{r}.currentRow = {ci};\n{r}.recordCount = {rc};\n{r}.columnList = {cl};\narrayAppend({rows}, {r});\n}}\n{loop}{query} = {q};\n",
+                                "var {q} = {query};\nvar {rows} = [];\nvar {rc} = {q}.recordcount;\nfor (var {ci} = 1; {ci} <= {rc}; {ci} = {ci} + 1) {{ arrayAppend({rows}, {ci}); }}\nvar {cur} = {q}.currentrow;\nvar {depth} = __queryScopePush({q});\ntry {{\n{loop}}} finally {{\n__queryScopePop({depth});\n__querySetRow({q}, {cur});\n}}\n",
                                 q = q,
                                 query = query,
                                 rows = rows,
                                 rc = rc,
-                                cl = cl,
                                 ci = ci,
-                                r = r,
+                                cur = cur,
+                                depth = depth,
                                 loop = group_loop,
                             ),
                             consumed,
                         )
                     } else {
-                        // <cfoutput query="q"> iterates the query's rows. Within
-                        // the body, bare column refs (#name#) resolve to the
-                        // current row (we merge the row struct into `variables`)
-                        // and `#q.col#` resolves to the row scalar (we reassign
-                        // the query var to the row, restoring it after the loop).
-                        // `maxrows`/`startrow` bound the iteration.
+                        // <cfoutput query="q"> iterates the query's rows with the
+                        // same cursor model as `<cfloop query>`: `q` stays the
+                        // query and its cursor moves, so `#q.col#` and
+                        // `#q.currentRow#` read the current row. The query is on
+                        // the VM's query scope stack for the loop, so bare
+                        // `#col#` / `#currentRow#` resolve after locals and
+                        // arguments and before `variables` (GH #544) — no row is
+                        // copied into `variables`. `startrow`/`maxrows` bound
+                        // the iteration.
                         let body_script = tags_to_script_inner(&body, imports, true);
                         let startrow = attrs
                             .get("startrow")
@@ -1145,21 +1150,23 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                         // so we declare the temps inline rather than wrapping.
                         let q = format!("__cfoq_q_{}", start);
                         let rc = format!("__cfoq_rc_{}", start);
-                        let cl = format!("__cfoq_cl_{}", start);
                         let sr = format!("__cfoq_sr_{}", start);
+                        let er = format!("__cfoq_er_{}", start);
                         let mr = format!("__cfoq_mr_{}", start);
                         let i = format!("__cfoq_i_{}", start);
-                        let row = format!("__cfoq_row_{}", start);
+                        let depth = format!("__cfoq_d_{}", start);
+                        let cur = format!("__cfoq_cur_{}", start);
                         (
                             format!(
-                                "var {q} = {query};\nvar {rc} = {q}.recordcount;\nvar {cl} = {q}.columnlist;\nvar {sr} = {startrow};\nvar {mr} = {maxrows};\nvar {i} = 0;\nfor (var {row} in {q}) {{\n{i} = {i} + 1;\nif ({i} < {sr}) {{ continue; }}\nif ({mr} >= 0 && {i} >= {sr} + {mr}) {{ break; }}\n{row}.currentRow = {i};\n{row}.recordCount = {rc};\n{row}.columnList = {cl};\nstructAppend(variables, {row}, true);\n{query} = {row};\n{body}\n}}\n{query} = {q};\n",
+                                "var {q} = {query};\nvar {rc} = {q}.recordcount;\nvar {sr} = {startrow};\nif ({sr} < 1) {{ {sr} = 1; }}\nvar {er} = {rc};\nvar {mr} = {maxrows};\nif ({mr} >= 0 && {sr} + {mr} - 1 < {er}) {{ {er} = {sr} + {mr} - 1; }}\nvar {cur} = {q}.currentrow;\nvar {depth} = __queryScopePush({q});\ntry {{\nfor (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\n{body}\n}}\n}} finally {{\n__queryScopePop({depth});\n__querySetRow({q}, {cur});\n}}\n",
                                 q = q,
                                 rc = rc,
-                                cl = cl,
                                 sr = sr,
+                                er = er,
                                 mr = mr,
                                 i = i,
-                                row = row,
+                                depth = depth,
+                                cur = cur,
                                 query = query,
                                 startrow = startrow,
                                 maxrows = maxrows,
@@ -1239,32 +1246,32 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 );
                 if let Some(group_raw) = attrs.get("group") {
                     // Grouped (control-break) iteration, the same model the
-                    // grouped `<cfoutput query>` uses: materialise the windowed
-                    // rows, then break on the group column. A BARE nested
+                    // grouped `<cfoutput query>` uses: collect the windowed row
+                    // numbers, then break on the group column. A BARE nested
                     // `<cfloop>` is the detail block over the current group.
+                    // Rows are visited by cursor with the query on the query
+                    // scope stack, as in the ungrouped form (GH #544).
                     let group_col = strip_hashes(group_raw);
                     let case_sensitive = group_case_sensitive(&attrs);
                     let rows = format!("__cfloopq_rows_{}", start);
-                    let cl = format!("__cfloopq_cl_{}", start);
-                    let r = format!("__cfloopq_r_{}", start);
+                    let cur = format!("__cfloopq_cur_{}", start);
+                    let depth = format!("__cfloopq_d_{}", start);
                     let group_loop = emit_grouped_query_body(
-                        &rows, &query, &body, &group_col, case_sensitive, "cfloop", in_cfoutput,
+                        &rows, &q, &body, &group_col, case_sensitive, "cfloop", in_cfoutput,
                         imports, start, 0,
                     );
                     return (
                         format!(
-                            "{window}var {cl} = {q}.columnlist;\nvar {rows} = [];\nvar {i} = 0;\nfor (var {r} in {q}) {{\n{i} = {i} + 1;\nif ({i} < {sr}) {{ continue; }}\nif ({i} > {er}) {{ break; }}\n{r}.currentRow = {i};\n{r}.recordCount = {rc};\n{r}.columnList = {cl};\narrayAppend({rows}, {r});\n}}\n{loop}{query} = {q};\n",
+                            "{window}var {rows} = [];\nfor (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{ arrayAppend({rows}, {i}); }}\nvar {cur} = {q}.currentrow;\nvar {depth} = __queryScopePush({q});\ntry {{\n{loop}}} finally {{\n__queryScopePop({depth});\n__querySetRow({q}, {cur});\n}}\n",
                             window = window,
-                            cl = cl,
                             q = q,
                             rows = rows,
                             i = i,
-                            r = r,
                             sr = sr,
                             er = er,
-                            rc = rc,
+                            cur = cur,
+                            depth = depth,
                             loop = group_loop,
-                            query = query,
                         ),
                         consumed,
                     );
@@ -1274,37 +1281,36 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // each iteration moves the query's current-row cursor via the
                 // internal __querySetRow helper, so `q.col` reads the current
                 // row, `q.currentRow` reports the position, and `q` can still be
-                // passed to functions that expect the whole query. The cursor is
-                // reset to row 1 after the loop. BARE column refs in the body
-                // must also resolve to the current row (Lucee puts the query at
-                // the head of the loop body's scope cascade) — the same
-                // row-into-variables merge `<cfoutput query>` and the grouped
-                // form already do (docs known-issues §13, GitHub PR #318).
+                // passed to functions that expect the whole query. Queries are
+                // shared by reference, so an inner loop over the same query (in
+                // the body or a function it calls) moves the same cursor: each
+                // loop saves it on entry and restores it on exit, handing an
+                // outer loop its own row back (as Lucee 7.1.2.191 does). The
+                // query variable is never written, so a body that reassigns it
+                // keeps the new value while the loop runs on over the old one.
                 //
-                // The pseudo-columns resolve too: a bare `currentRow` /
-                // `recordCount` / `columnList` in the body is the looped
-                // query's, as on Lucee (`queryGetRow( q, currentRow )`). They
-                // are set in `variables` for the body and put back as they were
-                // when the loop ends however it ends (a `finally`, so `return`
-                // and `break` restore too): on Lucee they come from the scope
-                // cascade, so a variable of the same name is untouched after
-                // the loop, and none is left defined.
-                let saved = format!("__cfloopq_sv_{}", start);
-                let key = format!("__cfloopq_k_{}", start);
-                const PSEUDO: &str = "[\"currentRow\", \"recordCount\", \"columnList\"]";
+                // Bare names (GH #544): the query is pushed on the VM's query
+                // scope stack for the loop, so a bare column, `currentRow`,
+                // `recordCount` or `columnList` in the body (or in a function it
+                // calls) reads the current row, after locals and arguments and
+                // before `variables`, as on Lucee. This used to copy each row
+                // into `variables`, which overwrote a same-named variable, left
+                // the columns defined after the loop, and wrote into a
+                // component's shared `variables` scope when the loop ran in a
+                // method. The pop is in a `finally`, so `return`, `break` and
+                // an error leave the stack as they found it.
+                let depth = format!("__cfloopq_d_{}", start);
+                let cur = format!("__cfloopq_cur_{}", start);
                 (
                     format!(
-                        "{window}var {saved} = {{}};\nfor (var {key} in {pseudo}) {{ if (structKeyExists(variables, {key})) {{ {saved}[{key}] = variables[{key}]; }} }}\ntry {{\nfor (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\nstructAppend(variables, queryGetRow({q}, {i}), true);\nvariables.currentRow = {i};\nvariables.recordCount = {rc};\nvariables.columnList = {q}.columnlist;\n{query} = {q};\n{body}\n}}\n}} finally {{\nfor (var {key} in {pseudo}) {{ if (structKeyExists({saved}, {key})) {{ variables[{key}] = {saved}[{key}]; }} else {{ structDelete(variables, {key}); }} }}\n}}\n__querySetRow({q}, 1);\n{query} = {q};\n",
+                        "{window}var {cur} = {q}.currentrow;\nvar {depth} = __queryScopePush({q});\ntry {{\nfor (var {i} = {sr}; {i} <= {er}; {i} = {i} + 1) {{\n__querySetRow({q}, {i});\n{body}\n}}\n}} finally {{\n__queryScopePop({depth});\n__querySetRow({q}, {cur});\n}}\n",
                         window = window,
-                        saved = saved,
-                        key = key,
-                        pseudo = PSEUDO,
+                        depth = depth,
+                        cur = cur,
                         q = q,
                         sr = sr,
                         er = er,
                         i = i,
-                        rc = rc,
-                        query = query,
                         body = body_script,
                     ),
                     consumed,
@@ -4252,7 +4258,11 @@ fn find_nested_tag(chars: &[char], from: usize, len: usize, tag: &str) -> Option
 }
 
 /// Emit the control-break loop for a grouped `<cfoutput query group=>` /
-/// `<cfloop query group=>` over `rows_var` (a CFML array of row structs). The
+/// `<cfloop query group=>` over `rows_var`, a CFML array of the 1-based row
+/// numbers to visit in the query held in `query_tmp`. Each row is visited by
+/// moving the query's cursor to it, and the caller has the query on the VM's
+/// query scope stack, so bare columns and `currentRow` read that row (GH #544:
+/// no row is copied into `variables`). The
 /// per-group body (everything outside the nested detail block) runs once per
 /// distinct consecutive value of `group_col`; the nested block iterates that
 /// group's rows, recursing for further `group=` levels. `uid`/`depth` keep
@@ -4265,7 +4275,7 @@ fn find_nested_tag(chars: &[char], from: usize, len: usize, tag: &str) -> Option
 #[allow(clippy::too_many_arguments)]
 fn emit_grouped_query_body(
     rows_var: &str,
-    query_var: &str,
+    query_tmp: &str,
     body: &str,
     group_col: &str,
     case_sensitive: bool,
@@ -4336,7 +4346,7 @@ fn emit_grouped_query_body(
                 let g2 = strip_hashes(g2);
                 let cs2 = group_case_sensitive(&attrs);
                 emit_grouped_query_body(
-                    &sub, query_var, &nested_inner, &g2, cs2, inner_tag, in_cfoutput, imports,
+                    &sub, query_tmp, &nested_inner, &g2, cs2, inner_tag, in_cfoutput, imports,
                     uid, depth + 1,
                 )
             } else {
@@ -4344,10 +4354,10 @@ fn emit_grouped_query_body(
                 let nested_body = tags_to_script_inner(&nested_inner, imports, in_cfoutput);
                 let ri = format!("__cfg_ri_{}", sfx);
                 format!(
-                    "var {ri} = 1;\nwhile ({ri} <= arrayLen({sub})) {{\nstructAppend(variables, {sub}[{ri}], true);\n{q} = {sub}[{ri}];\n{body}\n{ri} = {ri} + 1;\n}}\n",
+                    "var {ri} = 1;\nwhile ({ri} <= arrayLen({sub})) {{\n__querySetRow({q}, {sub}[{ri}]);\n{body}\n{ri} = {ri} + 1;\n}}\n",
                     ri = ri,
                     sub = sub,
-                    q = query_var,
+                    q = query_tmp,
                     body = nested_body,
                 )
             }
@@ -4355,7 +4365,7 @@ fn emit_grouped_query_body(
     };
 
     format!(
-        "var {i} = 1;\nwhile ({i} <= arrayLen({rows})) {{\nvar {gval} = {rows}[{i}][\"{col}\"];\nvar {gstart} = {i};\nwhile ({i} <= arrayLen({rows}) && {cmp}({rows}[{i}][\"{col}\"], {gval}) == 0) {{ {i} = {i} + 1; }}\nvar {sub} = arraySlice({rows}, {gstart}, {i} - {gstart});\nstructAppend(variables, {sub}[1], true);\n{q} = {sub}[1];\n{pre}\n{nested}{post}\n}}\n",
+        "var {i} = 1;\nwhile ({i} <= arrayLen({rows})) {{\nvar {gval} = queryGetCell({q}, \"{col}\", {rows}[{i}]);\nvar {gstart} = {i};\nwhile ({i} <= arrayLen({rows}) && {cmp}(queryGetCell({q}, \"{col}\", {rows}[{i}]), {gval}) == 0) {{ {i} = {i} + 1; }}\nvar {sub} = arraySlice({rows}, {gstart}, {i} - {gstart});\n__querySetRow({q}, {sub}[1]);\n{pre}\n{nested}{post}\n}}\n",
         i = i,
         rows = rows_var,
         gval = gval,
@@ -4363,7 +4373,7 @@ fn emit_grouped_query_body(
         col = group_col,
         cmp = cmp,
         sub = sub,
-        q = query_var,
+        q = query_tmp,
         pre = pre_script,
         nested = nested_script,
         post = post_script,

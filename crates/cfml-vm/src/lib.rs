@@ -37,6 +37,7 @@ mod intercepts_querydir;
 mod intercepts_objectio;
 mod intercepts_upload;
 mod intercepts_varpath;
+mod intercepts_queryscope;
 mod intercepts_output;
 mod intercepts_realtime;
 mod intercepts_mcp;
@@ -2667,6 +2668,15 @@ pub struct CfmlVirtualMachine {
     /// `frame_ctx.last()` is not guaranteed to describe the frame that is actually
     /// running — and a wrong answer here silently changes what `local` means.
     frame_has_local_scope: bool,
+    /// The queries of the query loops now running (`loop query`, `<cfloop
+    /// query>`, `<cfoutput query>`), innermost last. A bare name that is not a
+    /// local or an argument resolves against these before `variables`, as
+    /// Lucee's query stack does (GH #544): a column at the cursor row, or
+    /// `currentRow` / `recordCount` / `columnList`. Pushed and popped by the
+    /// loop's own lowering (`__queryScopePush` / `__queryScopePop`, the pop in
+    /// a `finally`). Nothing is written to `variables`, so a component's shared
+    /// scope is never touched.
+    query_scope: Vec<cfml_common::dynamic::CfmlQuery>,
     /// Is the frame currently executing a custom-tag / `cfmodule` template (or
     /// a template included from one)? Its `arguments` scope is the CALLING
     /// function's, bridged in by [`Self::custom_tag_frame`] so an explicit
@@ -5724,6 +5734,7 @@ impl CfmlVirtualMachine {
             call_stack: Vec::new(),
             frame_ctx: Vec::new(),
             frame_has_local_scope: false,
+            query_scope: Vec::new(),
             frame_args_explicit_only: false,
             pending_custom_tag_frame: false,
             escaped_local: None,
@@ -9871,6 +9882,11 @@ impl CfmlVirtualMachine {
             && (custom_tag_frame || frame_args_explicit_only_before);
         let try_depth_before = self.try_stack.len();
         let saved_buffers_before = self.saved_output_buffers.len();
+        // GH #544: a query loop pops its query in a `finally`, but an exit
+        // that skips the `finally` (`cfexit` from a custom tag or an include,
+        // `abort`) would leave it pinned and its columns visible for the rest
+        // of the request. Every frame puts the stack back as it found it.
+        let query_scope_before = self.query_scope.len();
 
         // `output="false"` on a cffunction/component method suppresses ALL output
         // the body produces — inter-tag whitespace, plain text, AND cfoutput/
@@ -9932,6 +9948,7 @@ impl CfmlVirtualMachine {
         self.escaped_local = escaped_local_before;
         self.local_watch = local_watch_before;
         self.try_stack.truncate(try_depth_before);
+        self.query_scope.truncate(query_scope_before);
         // Reclaim output-capture buffers orphaned by an early `return` out of a
         // `cfsilent`/`cfsavecontent` block inside this function (e.g. Preside's
         // `<cfsilent><cfreturn …></cfsilent>` helpers — booleanUtils `isTrue`,
@@ -10385,6 +10402,21 @@ impl CfmlVirtualMachine {
     /// The getter shape of a function body, decided from its instructions
     /// alone (no lookups), so a body that is not a getter costs a few
     /// compares. See the callers of [`Self::trivial_getter_value`].
+    /// [`Self::getter_shape`], except that while a query loop runs a getter
+    /// that reads a BARE name is not answered frameless: that name may be a
+    /// column of the looping query, which outranks the component's
+    /// `variables` (GH #544, Lucee 7.1.2.191), and only the full lookup
+    /// consults the query scope. Scoped shapes (`variables.k`, accessors)
+    /// never read the query scope and keep the shortcut.
+    #[inline]
+    fn getter_shape_now<'f>(&self, func: &'f BytecodeFunction) -> Option<GetterShape<'f>> {
+        let shape = Self::getter_shape(func)?;
+        if !self.query_scope.is_empty() && matches!(shape, GetterShape::Bare(_) | GetterShape::Prop(..)) {
+            return None;
+        }
+        Some(shape)
+    }
+
     #[inline]
     fn getter_shape(func: &BytecodeFunction) -> Option<GetterShape<'_>> {
         use BytecodeOp as Op;
@@ -10436,7 +10468,7 @@ impl CfmlVirtualMachine {
         let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body else { return None };
         let CfmlValue::Int(idx) = body.as_ref() else { return None };
         let user_func = self.resolve_fn(*idx)?;
-        let shape = Self::getter_shape(&user_func)?;
+        let shape = self.getter_shape_now(&user_func)?;
         let v = Self::trivial_getter_value(
             &user_func,
             shape,
@@ -11066,7 +11098,7 @@ impl CfmlVirtualMachine {
         // The wrapper still enforces the declared return type and fires the
         // function enter/exit hooks.
         if args.is_empty() && direct_frame && self.pending_extra_named_args.is_none() && !moved_template {
-            if let Some(v) = Self::getter_shape(func)
+            if let Some(v) = self.getter_shape_now(func)
                 .and_then(|shape| {
                     Self::trivial_getter_value(func, shape, &locals, &mut scope_cache, &self.request_scope)
                 })
@@ -11695,6 +11727,7 @@ impl CfmlVirtualMachine {
                     // stack) is simple — Concat cannot throw then, so the
                     // variable is never left holding the placeholder.
                     if matches!(op, BytecodeOp::TakeLocal(_) | BytecodeOp::TakeSlot(..))
+                        && self.query_scope.is_empty()
                         && matches!(
                             stack.last(),
                             Some(CfmlValue::String(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::Bool(_))
@@ -11754,6 +11787,15 @@ impl CfmlVirtualMachine {
                     // a `contains_key` and a parameter scan. A miss then takes the
                     // direct `variables` path with no second probe of `locals`.
                     if !name.is_reserved_word() {
+                        // GH #544: inside a query loop a bare column or
+                        // pseudo-column outranks `variables` (which, on a page,
+                        // is `locals` itself). One empty-Vec test otherwise.
+                        if let Some(v) = self.query_scope_get(name, || {
+                            Self::is_own_frame_name(&locals, &inherited_or_param_keys, &func.params, name)
+                        }) {
+                            stack.push(v);
+                            continue;
+                        }
                         if let Some(v) = locals.get(name) {
                             stack.push(v.clone());
                             continue;
@@ -13645,7 +13687,13 @@ impl CfmlVirtualMachine {
                     if (*target as usize) < ip {
                         self.poll_cancel()?;
                     }
-                    ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize);
+                    let query_val = match op {
+                        BytecodeOp::JumpIfSlotCmpConstFalse(i, ..) if slots[*i as usize].is_some() => None,
+                        _ => self.query_scope_get(name, || {
+                            Self::is_own_frame_name(&locals, &inherited_or_param_keys, &func.params, name)
+                        }),
+                    };
+                    ops::locals::op_jump_if_local_cmp_const_false(&mut ip, &locals, &slots, op, name, *c as i64, *cmp, *target as usize, query_val);
                 }
                 BytecodeOp::ForLoopStep(name, limit, cmp, step, target)
                 | BytecodeOp::ForSlotStep(_, name, limit, cmp, step, target) => {
@@ -18795,7 +18843,7 @@ impl CfmlVirtualMachine {
             && self.pending_extra_named_args.is_none()
             && !self.function_hooks_active()
         {
-            if let Some(v) = Self::getter_shape(&user_func)
+            if let Some(v) = self.getter_shape_now(&user_func)
                 .and_then(|shape| self.getter_value_before_seed(func, shape, parent_locals))
             {
                 if let Ok(v) = self.check_declared_return_type(&user_func, v) {
@@ -19095,6 +19143,10 @@ impl CfmlVirtualMachine {
                     Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
                     other => return other,
                 }
+            }
+
+            if intercepts_queryscope::handles(&name_lower) {
+                return self.dispatch_query_scope(&name_lower, args);
             }
 
             if intercepts_varpath::handles(&name_lower) {
@@ -26585,6 +26637,81 @@ impl CfmlVirtualMachine {
         self.frame_has_local_scope
     }
 
+    /// A bare `name` read against the running query loops (GH #544).
+    ///
+    /// Lucee's order is local -> arguments -> query -> variables, and its
+    /// query stack belongs to the request, not the frame: a function called
+    /// from inside the loop sees the columns too, even over its component's
+    /// own `variables` (probed on 7.1.2.191). So the only names not looked up
+    /// here are the running frame's own locals and arguments, which
+    /// `is_own_local` answers (it runs only while a loop is active). On a page
+    /// there is no local scope: `locals` IS `variables`, which the query
+    /// outranks. The innermost loop is searched first.
+    #[inline]
+    pub(crate) fn query_scope_get(
+        &self,
+        name: &cfml_common::name::Name,
+        is_own_local: impl FnOnce() -> bool,
+    ) -> Option<CfmlValue> {
+        if self.query_scope.is_empty() {
+            return None;
+        }
+        let s = name.as_str();
+        if s.starts_with("__") || name.is_reserved_word() {
+            return None;
+        }
+        if self.frame_has_local_scope && is_own_local() {
+            return None;
+        }
+
+        self.query_scope.iter().rev().find_map(|q| q.loop_scope_get(s))
+    }
+
+    /// Does a bare `name` string resolve against the running query loops?
+    /// For the reflective probes (`isDefined`, `getVariable`, `evaluate`),
+    /// which have no inherited-key set: any key in `locals` or the arguments
+    /// scope counts as the frame's own.
+    pub(crate) fn query_scope_name_defined(&self, name: &str, locals: &ValueMap) -> bool {
+        if self.query_scope.is_empty() || name.contains('.') || name.contains('[') {
+            return false;
+        }
+        self.query_scope_get(&cfml_common::name::Name::intern(name), || {
+            Self::is_locals_or_args_name(locals, name)
+        })
+        .is_some()
+    }
+
+    pub(crate) fn is_locals_or_args_name(locals: &ValueMap, name: &str) -> bool {
+        locals.get(name).is_some()
+            || matches!(
+                locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE),
+                Some(CfmlValue::Struct(args)) if args.get_ci(name).is_some_and(|v| !matches!(v, CfmlValue::Null))
+            )
+    }
+
+    /// Is `name` one of this function frame's own locals or arguments, as
+    /// opposed to a key it inherited (a component's or page's variables carried
+    /// into `locals`)? A declared parameter is tracked as inherited, so it is
+    /// checked by name; an extra argument lives only in the arguments scope.
+    pub(crate) fn is_own_frame_name(
+        locals: &ValueMap,
+        inherited: &InheritedKeys,
+        params: &[String],
+        name: &cfml_common::name::Name,
+    ) -> bool {
+        let key = name.key();
+        if locals.contains_key(key) && !inherited.contains_key(key) {
+            return true;
+        }
+        if params.iter().any(|p| p.eq_ignore_ascii_case(name.as_str())) {
+            return true;
+        }
+        matches!(
+            locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE),
+            Some(CfmlValue::Struct(args)) if args.get(name).is_some_and(|v| !matches!(v, CfmlValue::Null))
+        )
+    }
+
     /// Diagnostics: `RUSTCFML_CLOSURE_CALLER_SCAN=1` restores the per-call scan
     /// of the caller's locals into a lexical closure frame (A/B and bisection).
     fn closure_caller_scan_forced() -> bool {
@@ -26884,6 +27011,13 @@ impl CfmlVirtualMachine {
             cfml_common::perf_counters::bump(
                 &cfml_common::perf_counters::SCOPE_LOOKUP_TOTAL,
             );
+        }
+        // GH #544: the running query loops come after local and arguments and
+        // before `variables` (see `query_scope_get`).
+        // Callers without the frame's inherited-key set treat any key in
+        // `locals` (or the arguments scope) as the frame's own.
+        if let Some(v) = self.query_scope_get(name, || Self::is_locals_or_args_name(locals, name.as_str())) {
+            return Some(v);
         }
         if name_lower == "arguments" {
             if let Some(v) = locals.get(&*cfml_common::key::well_known::ARGUMENTS_SCOPE) {
@@ -34840,6 +34974,11 @@ impl CfmlVirtualMachine {
         let root = root_raw.to_lowercase();
         let root_raw: &str = root_raw;
         let rest = &segs[1..];
+        // GH #544: inside a query loop a bare column or pseudo-column is
+        // defined (Lucee 7.1.2.191), so the probe agrees with the read.
+        if rest.is_empty() && self.query_scope_name_defined(root_raw, locals) {
+            return true;
+        }
 
         // `local` and bare-`variables` roots resolve against the raw locals
         // map. Probe it directly instead of materializing an O(frame) struct
@@ -35214,6 +35353,13 @@ impl CfmlVirtualMachine {
             "server" => Some(CfmlValue::Struct(self.live_server_scope())),
             "cookie" => self.globals.get("cookie").cloned(),
             "static" => self.find_static_scope(locals).map(CfmlValue::Struct),
+            _ if self.query_scope_name_defined(root, locals) => {
+                // GH #544: a bare column or pseudo-column of a running query
+                // loop, after locals and arguments, before `variables`.
+                self.query_scope_get(&cfml_common::name::Name::intern(root), || {
+                    Self::is_locals_or_args_name(locals, root)
+                })
+            }
             _ => {
                 // Unscoped: locals, the component `variables` scope, request,
                 // then globals — the variable READ order. Every probe is

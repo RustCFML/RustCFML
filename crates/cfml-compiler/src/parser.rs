@@ -2914,19 +2914,27 @@ impl Parser {
             }
             // No binding — cursor model (Lucee/ACF): the query variable STAYS the
             // query; each iteration moves the query's current-row cursor via the
-            // internal __querySetRow helper, so `q.col` reads the current row,
-            // `q.currentRow` reports the position, and `q` can still be passed to
-            // functions expecting the whole query. Cursor reset to 1 after the loop.
+            // internal __querySetRow helper, so `q.col` reads the current row and
+            // `q.currentRow` reports the position.
+            //
+            // Queries are shared by reference, so the cursor is too: an inner
+            // loop over the same query (here, or in a function the body calls)
+            // moves it. Each loop therefore saves the cursor on entry and puts
+            // it back on exit, which hands an outer loop its own row again
+            // (Lucee 7.1.2.191 behaves the same). The query variable itself is
+            // never written: a body that reassigns it keeps its new value, and
+            // the loop runs on over the query it started with, as on Lucee.
+            //
+            // GH #544: while the loop runs the query is on the VM's query scope
+            // stack, so a bare column, `currentRow`, `recordCount` or
+            // `columnList` reads the current row, after locals and arguments
+            // and before `variables`. Pop and cursor restore sit in a
+            // `finally`, so `return`, `break` and an error leave both as found.
             let q_tmp = format!("__cfloop_q_{}", uniq);
             let rc_tmp = format!("__cfloop_qrc_{}", uniq);
             let i_tmp = format!("__cfloop_qi_{}", uniq);
-            // Rebind the query var to the (cursor-positioned) query only when it
-            // is a plain variable (an lvalue).
-            let query_name = if let Expression::Identifier(id) = &query {
-                Some(id.name.clone())
-            } else {
-                None
-            };
+            let cur_tmp = format!("__cfloop_qcur_{}", uniq);
+            let depth_tmp = format!("__cfloop_qd_{}", uniq);
             let set_row = |row: Expression| {
                 Statement::Expression(ExpressionStatement {
                     expr: call("__querySetRow", vec![ident(&q_tmp), row]),
@@ -2934,9 +2942,6 @@ impl Parser {
                 })
             };
             let mut for_body = vec![set_row(ident(&i_tmp))];
-            if let Some(ref qname) = query_name {
-                for_body.push(assign(qname.clone(), ident(&q_tmp)));
-            }
             for_body.extend(body);
             let for_loop = Statement::For(Box::new(For {
                 init: Some(Box::new(Statement::Var(Var {
@@ -2953,16 +2958,26 @@ impl Parser {
                 body: for_body,
                 location: loc,
             }));
-            // Run [hoist…, loop, reset] exactly once via a one-shot `for`.
-            let mut once_body = vec![
+            let scoped_loop = Statement::Try(Try {
+                body: vec![for_loop],
+                catches: Vec::new(),
+                finally_body: Some(vec![
+                    Statement::Expression(ExpressionStatement {
+                        expr: call("__queryScopePop", vec![ident(&depth_tmp)]),
+                        location: loc,
+                    }),
+                    set_row(ident(&cur_tmp)),
+                ]),
+                location: loc,
+            });
+            // Run [hoist…, loop] exactly once via a one-shot `for`.
+            let once_body = vec![
                 var_tmp(q_tmp.clone(), query),
                 var_tmp(rc_tmp.clone(), ident(&format!("{}.recordcount", q_tmp))),
-                for_loop,
-                set_row(int(1)),
+                var_tmp(cur_tmp.clone(), ident(&format!("{}.currentrow", q_tmp))),
+                var_tmp(depth_tmp.clone(), call("__queryScopePush", vec![ident(&q_tmp)])),
+                scoped_loop,
             ];
-            if let Some(ref qname) = query_name {
-                once_body.push(assign(qname.clone(), ident(&q_tmp)));
-            }
             let once = format!("__cfloop_qonce_{}", uniq);
             let init = Statement::Var(Var { name: once.clone(), value: Some(int(0)), location: loc });
             let cond = bin(ident(&once), BinaryOpType::Less, int(1));

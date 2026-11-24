@@ -932,6 +932,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("queryRenameColumn".to_string(), fn_query_rename_column as BuiltinFunction);
     f.insert("queryToStruct".to_string(), fn_query_to_struct as BuiltinFunction);
     f.insert("__querySetRow".to_string(), fn_query_move_cursor as BuiltinFunction);
+    f.insert("__queryScopePush".to_string(), fn_query_scope_stub as BuiltinFunction);
+    f.insert("__queryScopePop".to_string(), fn_query_scope_stub as BuiltinFunction);
     // QoQ custom-function registration (VM-intercepted).
     f.insert("queryRegisterFunction".to_string(), fn_query_register_function_stub as BuiltinFunction);
 
@@ -20681,6 +20683,12 @@ fn fn_query_current_row(args: Vec<CfmlValue>) -> CfmlResult {
 /// advance the query's 1-based cursor so `q.col` and `q.currentRow` read the
 /// current row (the query itself stays a query — Lucee/ACF semantics). Not a
 /// user-facing BIF. Returns Null; a non-query first arg is a no-op.
+/// `__queryScopePush` / `__queryScopePop` (GH #544): the query-loop scope
+/// stack lives in the VM, so outside it there is nothing to push onto.
+fn fn_query_scope_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__queryScopePush/__queryScopePop require the VM".into()))
+}
+
 fn fn_query_move_cursor(args: Vec<CfmlValue>) -> CfmlResult {
     if let (Some(CfmlValue::Query(q)), Some(row)) = (args.get(0), args.get(1)) {
         let n = row.as_string().trim().parse::<i64>().unwrap_or(1).max(1) as usize;

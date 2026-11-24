@@ -479,6 +479,7 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
     c: i64,
     cmp: CmpOp,
     target: usize,
+    query_val: Option<CfmlValue>,
 ) {
     // Fused loop-condition super-instruction. Equivalent to
     // LoadLocal(name) + Integer(c) + <cmp> + JumpIfFalse(target)
@@ -493,6 +494,10 @@ pub(crate) fn op_jump_if_local_cmp_const_false(
         }
         _ => None,
     };
+    // GH #544: the caller resolved the name against the running query loops
+    // (only when one runs and the name is not this frame's own local); that
+    // value outranks `variables`, as a plain read's would.
+    let slot_val = slot_val.or(query_val.as_ref());
     // A counter that lives outside this frame's map (a page variable behind
     // the page scope handle, a captured closure variable, a component
     // variable) is fetched ONCE here and then takes the same numeric arms as a
@@ -620,6 +625,12 @@ pub(crate) fn op_try_load_local(
         }
     } else if name_lower == "server" {
         CfmlValue::Struct(vm.live_server_scope())
+    } else if let Some(v) = vm.query_scope_get(name, || {
+        // GH #544: the running query loops, with this frame's inherited keys
+        // told apart from its own locals (see `query_scope_get`).
+        CfmlVirtualMachine::is_own_frame_name(&locals, inherited_or_param_keys, &func.params, name)
+    }) {
+        v
     } else {
         vm.lookup_name_in_scopes(name, &name_lower, &locals)
             .unwrap_or(CfmlValue::Null)
@@ -755,6 +766,11 @@ pub(crate) fn op_load_local_property(
         _ => None,
     };
     let name_lower: &str = local_name.lower();
+    // GH #544: a running query loop's column outranks `variables` (which, on a
+    // page, is `locals` itself) — the same order a plain read uses.
+    let slot_receiver = slot_receiver.or_else(|| {
+        vm.query_scope_get(local_name, || CfmlVirtualMachine::is_locals_or_args_name(locals, local_name.as_str()))
+    });
     let receiver = slot_receiver.or_else(|| {
         locals.get(local_name).cloned().or_else(|| {
             vm.lookup_name_in_scopes(
