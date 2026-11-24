@@ -513,8 +513,11 @@ answers `version`, `tables` and `columns` is a reasonable place to stop — thos
 are what ORMs actually call.
 
 If your transactions have no savepoints, leave `supports_savepoints` at its
-default. A **nested** `transaction { }` then errors instead of flattening into
-the one around it and committing work the inner block meant to roll back.
+default. A nested `transaction { }` needs none: it joins the transaction around
+it, as on Lucee. Only an explicit `action="setsavepoint"` (or
+`transactionSetSavepoint()`) then errors. After an in-block `action="commit"`
+or `"rollback"`, the engine calls `begin` on your driver again before the next
+statement in the block.
 
 Two drivers claiming the same kind is reported before either library is opened,
 because the kind is declared in `module.json` — the same pre-load conflict check

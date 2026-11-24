@@ -363,9 +363,17 @@ whole class of bug started.
 > back to the caller's frame — `evaluate("x = 5")` will not set `x`. Read-only
 > expression evaluation (the common use) works.
 
-> **Nested `<cftransaction>` is supported** via savepoints. An inner transaction
-> block opens a SAVEPOINT on the outer transaction; a nested commit releases it
-> and a nested rollback rolls back to it (Lucee/ACF/BoxLang semantics).
+> **Nested `<cftransaction>` is supported** and JOINS the outer transaction, as
+> on Lucee 7.1 (probed on PostgreSQL, MySQL and SQL Server). It takes no
+> savepoint, so an exception caught inside the outer block rolls nothing back,
+> and `action="commit"`/`"rollback"` at any depth acts on the whole transaction,
+> which stays open for the statements after it. Until v0.751 each nested block
+> was a SAVEPOINT, which Lucee never did. Explicit savepoints
+> (`action="setsavepoint"`, `rollback savepoint=`, `transactionSetSavepoint()`)
+> are supported. A raw `COMMIT`/`ROLLBACK` sent through `queryExecute` (or
+> MySQL DDL's implicit commit) ends the database transaction and the next
+> statement begins a new one, as Lucee's autocommit-off connection does. Only
+> the first statement of a multi-statement SQL string is checked for that.
 
 ---
 
@@ -624,8 +632,9 @@ bundled drivers (SQLite, MySQL, PostgreSQL, SQL Server). Known divergences:
 | result struct extras | only `executionTime` (ms) | also carries `executionTimeNano`, `sqlparameters`, and a per-generated-key-column entry (e.g. `ID` on H2) |
 | `executionTime` in result structs | measured (wall-clock ms of the driver round-trip; `0` on the wasm target, which has no monotonic clock) | measured |
 | `generatedKey` on non-SQLite/MySQL INSERTs | absent on PostgreSQL/MSSQL (use `RETURNING` / `OUTPUT`) | driver-dependent |
-| dbinfo `DATA_TYPE`/`SQL_DATA_TYPE` columns | always `0` (no JDBC type codes) | JDBC `java.sql.Types` ints |
+| dbinfo `columns` values | match the driver's `getColumns` field for field on all three servers: PostgreSQL as pgjdbc (type names incl. `serial`, COLUMN_SIZE / DECIMAL_DIGITS from the typmod, identity and generated columns), MySQL as Connector/J (BUFFER_LENGTH 65535, CHAR_OCTET_LENGTH in bytes, fractional-second widths, JSON/spatial sizes), SQL Server as mssql-jdbc (`sp_columns_100` with the driver's type and `(max)` fix-ups, `int identity`, the `SS_*` columns) — GH #514, #539 | the driver's own `getColumns` values |
 | dbinfo statement syntax `dbinfo type="x" name="y";` | not parsed (use `cfdbinfo(...)` or the tag) | supported |
+| a `list=true` param that is empty (`""`, `[]`, or only separators) | binds one empty/NULL value, so `IN (…)` matches nothing (an int column on PostgreSQL rejects the empty string) | 7.1.2: named `queryExecute` param throws "param [x] may not be empty"; an empty array or positional value expands to `IN ()`, a SQL syntax error; a `<cfqueryparam>` tag binds one `""` (an error on a numeric type). Kept lenient on purpose: code written for Lucee never relies on the error |
 | dbinfo `UPDATE_RULE`/`DELETE_RULE` (foreignkeys) | rule **names** (`CASCADE`, `NO ACTION`, …) | JDBC smallint codes |
 
 BoxLang notes (we follow Lucee, which Wheels tries first): Lucee renames `COLUMN_DEF` →

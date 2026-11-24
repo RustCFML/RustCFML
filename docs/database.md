@@ -81,6 +81,31 @@ cftransaction {
 }
 ```
 
+Transactions follow Lucee 7.1, on every driver:
+
+- **A nested `transaction { }` joins the one around it.** It takes no
+  savepoint. Its work is rolled back only if an exception escapes the outermost
+  block; an exception caught inside that block rolls nothing back.
+- **`transaction action="commit";` / `action="rollback";`** (and
+  `transactionCommit()` / `transactionRollback()`) act on the whole
+  transaction, at any nesting depth. The block stays a transaction: the
+  statements after the action run in a new database transaction, which the
+  block's end commits (or an escaping exception rolls back). Outside a
+  transaction these do nothing.
+- **Savepoints:** `transaction action="setsavepoint" savepoint="a";` (or
+  `transactionSetSavepoint("a")`), then `transaction action="rollback"
+  savepoint="a";` (or `transactionRollback("a")`). Names match
+  case-insensitively, and rolling back to a name never set is an error.
+- **`transaction action="X" { body }`** runs the action, then the body, inside
+  a transaction block. A bodyless `transaction action="begin";` is an empty
+  block and opens nothing.
+- **Raw `COMMIT` / `ROLLBACK` SQL** sent through `queryExecute` inside a block
+  (PostgreSQL also accepts `END` / `ABORT`) ends the database transaction, and
+  the next statement begins a new one. MySQL DDL, which commits implicitly, is
+  treated the same way. Only the first statement of a multi-statement SQL
+  string is checked for this.
+- `isWithinTransaction()` is true anywhere inside a block.
+
 ---
 
 ## Working with PostgreSQL
@@ -119,6 +144,18 @@ correctly.
 ### Placeholders are translated automatically
 
 You write CFML-style `?` (or `:name`) placeholders; RustCFML rewrites them to PostgreSQL's `$1`, `$2`, … form. Quoted string literals and `::type` casts are left untouched.
+
+**Spell a cast `::::` when you pass `params`.** As on Lucee, whenever
+`queryExecute` gets a `params` argument (an array or struct, even an empty one)
+or `<cfquery>` has a `params` attribute, `::` outside quotes, double-quoted
+identifiers and comments is an escaped colon and becomes a single `:`. So
+`queryExecute("select x::::int from t", [])` sends `x::int`, and a bare `::` there
+becomes `:`, which is a syntax error. With no params, and in `<cfquery>` whose
+only parameters are `<cfqueryparam>` tags, the SQL is sent as written, so `::`
+works there. This applies to every driver (SQL Server's `geography::Point` is
+`geography::::Point` with params). RustCFML before v0.751 never collapsed `::`;
+SQL written that way with params must change to `::::`, which is also what it
+needs to run on Lucee.
 
 ### Untyped CFML strings are coerced to the column type
 
