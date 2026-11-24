@@ -80,6 +80,37 @@ if (mydsn == "") {
 		assert("decimal size",             byName.c_dec.size,    10);
 		assert("datetime size is its display width", byName.c_dt.size, 19);
 
+		// GH #539: the rest of Connector/J's getColumns values, measured on
+		// Lucee 7.1.2.191 + MySQL 8.4 (utf8mb4, so 4 bytes a character).
+		queryExecute(
+			"ALTER TABLE #tbl# ADD COLUMN c_dt3 datetime(3), ADD COLUMN c_json json,
+			   ADD COLUMN c_year year, ADD COLUMN c_ttext tinytext, ADD COLUMN c_tblob tinyblob,
+			   ADD COLUMN c_geo geometry, ADD COLUMN c_pt point, ADD COLUMN c_flt73 float(7,3),
+			   ADD COLUMN c_enum enum('a','b'), ADD COLUMN c_char char(5) CHARACTER SET utf8mb4,
+			   ADD COLUMN c_vc4 varchar(20) CHARACTER SET utf8mb4",
+			[], { datasource: mydsn } );
+		dbinfo type="columns" datasource="#mydsn#" table="#tbl#" name="cols";
+		full = {};
+		for (r in cols) {
+			full[ lCase(r.column_name) ] = r;
+		}
+		assert("BUFFER_LENGTH is Connector/J's constant 65535", full.c_int.buffer_length, 65535);
+		assert("CHAR_OCTET_LENGTH is the byte length of a varchar", full.c_vc4.char_octet_length, 80);
+		assert("CHAR_OCTET_LENGTH is the byte length of a char", full.c_char.char_octet_length, 20);
+		assert("CHAR_OCTET_LENGTH of an enum is its longest member in bytes", full.c_enum.char_octet_length, 4);
+		assert("CHAR_OCTET_LENGTH is NULL for a numeric column", full.c_int.char_octet_length, "");
+		assert("CHAR_OCTET_LENGTH is NULL for a temporal column", full.c_dt.char_octet_length, "");
+		assert("datetime(3) size counts the fraction", full.c_dt3.column_size, 23);
+		assert("json size", full.c_json.column_size, 1073741824);
+		assert("year is Types.DATE", full.c_year.data_type, 91);
+		assert("tinytext is Types.VARCHAR", full.c_ttext.data_type, 12);
+		assert("tinyblob is Types.VARBINARY", full.c_tblob.data_type, -3);
+		assert("geometry is Types.BINARY", full.c_geo.data_type, -2);
+		assert("geometry size", full.c_geo.column_size, 65535);
+		assert("a point is presented as GEOMETRY", uCase(full.c_pt.type_name), "GEOMETRY");
+		assert("float(7,3) keeps its scale", full.c_flt73.decimal_digits, 3);
+		assert("a plain double has scale 0", full.c_double.decimal_digits, 0);
+
 		queryExecute("DROP TABLE #tbl#", [], { datasource: mydsn });
 	} catch (any e) {
 		try { queryExecute("DROP TABLE IF EXISTS #tbl#", [], { datasource: mydsn }); } catch (any e2) {}

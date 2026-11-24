@@ -690,6 +690,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_mssql_dml_output.cfm" />
 <cf_runtest file="tags/test_mysql_dml_returning.cfm" />
 <cf_runtest file="tags/test_dbinfo_mysql_column_types.cfm" />
+<cf_runtest file="tags/test_dbinfo_mssql_columns.cfm" />
 <cf_runtest file="tags/test_dbinfo_pg_columns_pgjdbc.cfm" rustcfmlOnly="true" why="SQLite plus a URL-string PostgreSQL datasource; expected values were probed on Lucee 7.1.2.191 with pgjdbc" />
 <cf_runtest file="tags/test_db_null_column_empty_string.cfm" />
 <cf_runtest file="tags/test_pg_extended_param_binds.cfm" />

@@ -441,6 +441,18 @@ fn mysql_temporal_display_size(type_name: &str) -> Option<i64> {
     })
 }
 
+/// A MySQL spatial type, which Connector/J presents as GEOMETRY (BINARY).
+fn mysql_is_spatial(type_name: &str) -> bool {
+    matches!(
+        type_name.to_ascii_uppercase().as_str(),
+        "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
+            | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "GEOMCOLLECTION"
+    )
+}
+
+/// Connector/J's COLUMN_SIZE for a JSON column (its `MysqlType.JSON` precision).
+const MYSQL_JSON_COLUMN_SIZE: i64 = 1_073_741_824;
+
 /// The `java.sql.Types` constant for a SQL type name — `cfdbinfo`'s DATA_TYPE.
 ///
 /// We reported 0 for every column on every driver. Lucee reports the JDBC code,
@@ -469,14 +481,20 @@ fn jdbc_type_code(type_name: &str) -> i64 {
         "DOUBLE" => 8,
         // ENUM and SET are presented as CHAR by Connector/J.
         "CHAR" | "ENUM" | "SET" | "NCHAR" | "BPCHAR" => 1,
-        "VARCHAR" | "NVARCHAR" | "VARCHAR2" | "CHARACTER" => 12,
-        "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "LONGVARCHAR" | "NTEXT" => -1,
-        "DATE" => 91,
+        // Connector/J presents TINYTEXT (255 bytes) as VARCHAR, the larger
+        // TEXT types as LONGVARCHAR.
+        "VARCHAR" | "NVARCHAR" | "VARCHAR2" | "CHARACTER" | "TINYTEXT" => 12,
+        "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "LONGVARCHAR" | "NTEXT" => -1,
+        // `yearIsDateType` defaults to true, so YEAR is DATE.
+        "DATE" | "YEAR" => 91,
         "TIME" => 92,
         "DATETIME" | "TIMESTAMP" | "DATETIME2" | "SMALLDATETIME" => 93,
-        "BINARY" => -2,
-        "VARBINARY" => -3,
-        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "LONGVARBINARY" | "IMAGE" | "BYTEA" => -4,
+        // Connector/J presents MySQL's spatial types as BINARY.
+        "BINARY" | "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT"
+        | "MULTILINESTRING" | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "GEOMCOLLECTION" => -2,
+        // ... and TINYBLOB (255 bytes) as VARBINARY.
+        "VARBINARY" | "TINYBLOB" => -3,
+        "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "LONGVARBINARY" | "IMAGE" | "BYTEA" => -4,
         "CLOB" => 2005,
         "UUID" | "UNIQUEIDENTIFIER" => 1111,
         "JSON" | "JSONB" | "XML" => -1,
@@ -589,6 +607,49 @@ fn pg_scale(pg_type: &str, typmod: i64) -> i64 {
     }
 }
 
+/// The columns mssql-jdbc's `getColumns` passes through from `sp_columns_100`
+/// after the 24 JDBC ones, in its order. Lucee reports them before its own
+/// IS_PRIMARYKEY enrichment (measured on 7.1.2.191, GH #539).
+const MSSQL_EXTRA_COLUMNS: &[&str] = &[
+    "SS_IS_SPARSE",
+    "SS_IS_COLUMN_SET",
+    "SS_UDT_CATALOG_NAME",
+    "SS_UDT_SCHEMA_NAME",
+    "SS_UDT_ASSEMBLY_TYPE_NAME",
+    "SS_XML_SCHEMACOLLECTION_CATALOG_NAME",
+    "SS_XML_SCHEMACOLLECTION_SCHEMA_NAME",
+    "SS_XML_SCHEMACOLLECTION_NAME",
+];
+
+/// The driver's own `getColumns` columns that follow IS_GENERATEDCOLUMN.
+fn driver_extra_columns(driver: &DbDriver) -> &'static [&'static str] {
+    match driver {
+        DbDriver::Mssql(_) => MSSQL_EXTRA_COLUMNS,
+        _ => &[],
+    }
+}
+
+/// mssql-jdbc's `DataTypeFilter`: `sp_columns_100` answers with ODBC type
+/// codes, and the driver rewrites the ones that differ in `java.sql.Types`.
+fn mssql_jdbc_type(odbc: i64) -> i64 {
+    match odbc {
+        6 => 8,         // SQL_FLOAT → DOUBLE
+        -8 => -15,      // SQL_WCHAR → NCHAR
+        -10 => -16,     // SQL_WLONGVARCHAR → LONGNVARCHAR
+        -11 => 1,       // SQL_GUID → CHAR
+        -152 => -16,    // SQL_SS_XML → LONGNVARCHAR
+        -154 => 92,     // SQL_SS_TIME2 → TIME
+        -151 => -3,     // SQL_SS_UDT (geography, hierarchyid) → VARBINARY
+        other => other, // datetimeoffset stays -155 (microsoft.sql.Types)
+    }
+}
+
+/// mssql-jdbc's `ZeroFixupFilter`: a `(max)` column has length 0 in the
+/// catalogue, and the driver reports Integer.MAX_VALUE instead.
+fn mssql_zero_fixup(v: Option<i64>) -> Option<i64> {
+    v.map(|n| if n == 0 { i32::MAX as i64 } else { n })
+}
+
 struct ColInfo {
     table_cat: String,
     table_schem: String,
@@ -607,6 +668,9 @@ struct ColInfo {
     is_pk: bool,
     is_autoincrement: bool,
     jdbc: JdbcColumnExtras,
+    /// The driver's own columns after IS_GENERATEDCOLUMN, in
+    /// [`driver_extra_columns`] order (mssql-jdbc's `SS_*`).
+    driver_extra: Vec<CfmlValue>,
 }
 
 /// The `getColumns` fields whose values are driver-specific. `None` is SQL
@@ -615,7 +679,7 @@ struct JdbcColumnExtras {
     /// The `java.sql.Types` code; `None` derives it from TYPE_NAME.
     data_type: Option<i64>,
     buffer_length: Option<i64>,
-    num_prec_radix: i64,
+    num_prec_radix: Option<i64>,
     remarks: String,
     sql_data_type: Option<i64>,
     sql_datetime_sub: Option<i64>,
@@ -632,7 +696,7 @@ impl JdbcColumnExtras {
         JdbcColumnExtras {
             data_type: None,
             buffer_length: Some(0),
-            num_prec_radix: 10,
+            num_prec_radix: Some(10),
             remarks: String::new(),
             sql_data_type: Some(0),
             sql_datetime_sub: Some(0),
@@ -701,6 +765,7 @@ fn type_columns(
                     is_pk: cell_int(&row, "pk") > 0,
                     is_autoincrement,
                     jdbc: JdbcColumnExtras::legacy(size),
+                    driver_extra: Vec::new(),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -723,7 +788,8 @@ fn type_columns(
             let (sql, params) = match schema {
                 Some(sc) => (
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, \
-                     CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
+                     CHARACTER_MAXIMUM_LENGTH, CHARACTER_OCTET_LENGTH, NUMERIC_PRECISION, \
+                     NUMERIC_SCALE, DATETIME_PRECISION, IS_NULLABLE, \
                      COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA, COLUMN_COMMENT \
                      FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
@@ -731,7 +797,8 @@ fn type_columns(
                 ),
                 None => (
                     "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, \
-                     CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
+                     CHARACTER_MAXIMUM_LENGTH, CHARACTER_OCTET_LENGTH, NUMERIC_PRECISION, \
+                     NUMERIC_SCALE, DATETIME_PRECISION, IS_NULLABLE, \
                      COLUMN_DEFAULT, ORDINAL_POSITION, COLUMN_KEY, EXTRA, COLUMN_COMMENT \
                      FROM information_schema.COLUMNS \
                      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
@@ -769,6 +836,9 @@ fn type_columns(
                 let is_bool_tinyint = mysql_tinyint1_is_bit(&column_type);
                 let type_name = if is_bool_tinyint {
                     "BIT".to_string()
+                } else if mysql_is_spatial(&type_name) {
+                    // Every spatial type is GEOMETRY to Connector/J (GH #539).
+                    "GEOMETRY".to_string()
                 } else {
                     type_name.to_uppercase()
                 };
@@ -781,13 +851,26 @@ fn type_columns(
                 };
                 let size = if is_bool_tinyint {
                     1
+                } else if type_name == "JSON" {
+                    // Connector/J's fixed precision for JSON (MysqlType.JSON);
+                    // information_schema has no length for it.
+                    MYSQL_JSON_COLUMN_SIZE
+                } else if mysql_is_spatial(&type_name) {
+                    // MysqlType.GEOMETRY's precision.
+                    65535
                 } else {
                     match char_len {
                         // Connector/J clamps a length to Integer.MAX_VALUE, so
                         // LONGTEXT reports 2147483647, not MySQL's 4294967295.
                         Some(n) => n.min(i32::MAX as i64),
                         None => match mysql_temporal_display_size(&type_name) {
-                            Some(n) => n,
+                            // `datetime(3)` is 23 wide: the point and the digits.
+                            Some(n) => match cell_opt_int(&row, "DATETIME_PRECISION") {
+                                Some(fsp) if fsp > 0 && type_name != "DATE" && type_name != "YEAR" => {
+                                    n + fsp + 1
+                                }
+                                _ => n,
+                            },
                             None => cell_int(&row, "NUMERIC_PRECISION"),
                         },
                     }
@@ -804,7 +887,9 @@ fn type_columns(
                 // straight through.
                 let decimal_digits = match type_name.as_str() {
                     "DECIMAL" | "NUMERIC" | "DEC" | "FIXED" => cell_opt_int(&row, "NUMERIC_SCALE"),
-                    "FLOAT" | "DOUBLE" | "REAL" => Some(0),
+                    // An approximate type is 0 unless declared with a scale:
+                    // `float(7,3)` reports 3 (Lucee 7.1.2.191, GH #539).
+                    "FLOAT" | "DOUBLE" | "REAL" => Some(cell_opt_int(&row, "NUMERIC_SCALE").unwrap_or(0)),
                     _ => None,
                 };
                 cols.push(ColInfo {
@@ -832,8 +917,16 @@ fn type_columns(
                         // "VIRTUAL GENERATED" is IS_GENERATEDCOLUMN.
                         remarks: cell_str(&row, "COLUMN_COMMENT"),
                         is_generated: cell_str(&row, "EXTRA").to_lowercase().contains("generated"),
+                        // Connector/J reports a constant 65535 BUFFER_LENGTH,
+                        // and CHAR_OCTET_LENGTH is the catalogue's byte length
+                        // (4 × the length for utf8mb4), NULL for a non-character
+                        // column, clamped like COLUMN_SIZE (GH #539).
+                        buffer_length: Some(65535),
+                        char_octet_length: cell_opt_int(&row, "CHARACTER_OCTET_LENGTH")
+                            .map(|n| n.min(i32::MAX as i64)),
                         ..JdbcColumnExtras::legacy(size)
                     },
+                    driver_extra: Vec::new(),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -987,7 +1080,7 @@ fn type_columns(
                     jdbc: JdbcColumnExtras {
                         data_type: Some(sql_type),
                         buffer_length: None,
-                        num_prec_radix: if matches!(rule_name, "bit" | "varbit") { 2 } else { 10 },
+                        num_prec_radix: Some(if matches!(rule_name, "bit" | "varbit") { 2 } else { 10 }),
                         remarks: cell_str(&row, "remarks"),
                         sql_data_type: None,
                         sql_datetime_sub: None,
@@ -996,6 +1089,7 @@ fn type_columns(
                         source_data_type: (typtype == "d").then(|| pg_jdbc_type(rule_name)),
                         is_generated: generated,
                     },
+                    driver_extra: Vec::new(),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -1024,25 +1118,19 @@ fn type_columns(
             (cols, fk_map)
         }
         DbDriver::Mssql(_) => {
-            let (sql, params) = match schema {
-                Some(sc) => (
-                    "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, \
-                     CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-                     COLUMN_DEFAULT, ORDINAL_POSITION \
-                     FROM INFORMATION_SCHEMA.COLUMNS \
-                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-                    vec![s(sc), s(&table)],
-                ),
-                None => (
-                    "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, \
-                     CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, \
-                     COLUMN_DEFAULT, ORDINAL_POSITION \
-                     FROM INFORMATION_SCHEMA.COLUMNS \
-                     WHERE TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-                    vec![s(&table)],
-                ),
-            };
-            let base = run(ds, sql, params)?;
+            // mssql-jdbc's DatabaseMetaData.getColumns, which is what Lucee
+            // reports (GH #539): the `sp_columns_100` catalogue procedure, then
+            // the driver's fix-ups (see `mssql_jdbc_type` and
+            // `mssql_zero_fixup`). INFORMATION_SCHEMA had no identity or
+            // computed flag and no length for a `(max)` column, and its NULL
+            // NUMERIC_PRECISION gave every date and bit column COLUMN_SIZE 0.
+            // `@fUsePattern = 0`: the table name is matched exactly, as before,
+            // so an underscore in it is not a wildcard.
+            let base = run(
+                ds,
+                "EXEC sp_columns_100 @table_name = ?, @table_owner = ?, @ODBCVer = 3, @fUsePattern = 0",
+                vec![s(&table), schema.map_or(CfmlValue::Null, s)],
+            )?;
             let pk_rows = run(
                 ds,
                 "SELECT kcu.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
@@ -1058,32 +1146,41 @@ fn type_columns(
                 .collect();
             let mut cols = Vec::new();
             for row in base.rows() {
-                let size = match cell(&row, "CHARACTER_MAXIMUM_LENGTH") {
-                    Some(CfmlValue::Null) | None => cell_int(&row, "NUMERIC_PRECISION"),
-                    Some(v) => v.as_string().parse::<i64>().unwrap_or(0),
-                };
-                let dflt = match cell(&row, "COLUMN_DEFAULT") {
+                let dflt = match cell(&row, "COLUMN_DEF") {
                     Some(CfmlValue::Null) | None => None,
                     Some(v) => Some(v.as_string()),
                 };
                 let name = cell_str(&row, "COLUMN_NAME");
+                let column_size = mssql_zero_fixup(cell_opt_int(&row, "PRECISION")).unwrap_or(0);
                 cols.push(ColInfo {
-                    table_cat: cell_str(&row, "TABLE_CATALOG"),
-                    table_schem: cell_str(&row, "TABLE_SCHEMA"),
+                    table_cat: cell_str(&row, "TABLE_QUALIFIER"),
+                    table_schem: cell_str(&row, "TABLE_OWNER"),
                     table_name: cell_str(&row, "TABLE_NAME"),
                     is_pk: pk_set.contains(&name.to_lowercase()),
                     column_name: name,
-                    type_name: cell_str(&row, "DATA_TYPE"),
-                    column_size: size,
-                    decimal_digits: cell_opt_int(&row, "NUMERIC_SCALE"),
-                    nullable: cell_str(&row, "IS_NULLABLE").eq_ignore_ascii_case("YES"),
+                    // "int identity" for an identity column, as mssql-jdbc reports.
+                    type_name: cell_str(&row, "TYPE_NAME"),
+                    column_size,
+                    decimal_digits: cell_opt_int(&row, "SCALE"),
+                    nullable: cell_int(&row, "NULLABLE") != 0,
                     default_value: dflt,
                     ordinal: cell_int(&row, "ORDINAL_POSITION"),
-                    // SQL Server IDENTITY is not exposed via INFORMATION_SCHEMA
-                    // (it needs COLUMNPROPERTY(...,'IsIdentity')); left false as a
-                    // best-effort default (the reported case is MySQL, GitHub #254).
-                    is_autoincrement: false,
-                    jdbc: JdbcColumnExtras::legacy(size),
+                    is_autoincrement: cell_int(&row, "SS_IS_IDENTITY") != 0,
+                    jdbc: JdbcColumnExtras {
+                        data_type: Some(mssql_jdbc_type(cell_int(&row, "DATA_TYPE"))),
+                        buffer_length: mssql_zero_fixup(cell_opt_int(&row, "LENGTH")),
+                        num_prec_radix: cell_opt_int(&row, "RADIX"),
+                        remarks: cell_str(&row, "REMARKS"),
+                        sql_data_type: cell_opt_int(&row, "SQL_DATA_TYPE"),
+                        sql_datetime_sub: cell_opt_int(&row, "SQL_DATETIME_SUB"),
+                        char_octet_length: mssql_zero_fixup(cell_opt_int(&row, "CHAR_OCTET_LENGTH")),
+                        source_data_type: cell_opt_int(&row, "SS_DATA_TYPE"),
+                        is_generated: cell_int(&row, "SS_IS_COMPUTED") != 0,
+                    },
+                    driver_extra: MSSQL_EXTRA_COLUMNS
+                        .iter()
+                        .map(|c| cell(&row, c).cloned().unwrap_or(CfmlValue::Null))
+                        .collect(),
                 });
             }
             let mut fk_map: IndexMap<String, (String, String)> = IndexMap::new();
@@ -1116,7 +1213,9 @@ fn type_columns(
         return Err(missing_table_error(&table));
     }
 
+    let extra_columns = driver_extra_columns(driver);
     let mut out_columns: Vec<String> = COLUMNS_COLUMNS.iter().map(|c| c.to_string()).collect();
+    out_columns.extend(extra_columns.iter().map(|c| c.to_string()));
     if enrich {
         out_columns.extend(COLUMNS_ENRICHMENT.iter().map(|c| c.to_string()));
     }
@@ -1151,7 +1250,7 @@ fn type_columns(
                 None => CfmlValue::Null,
             },
         );
-        row.insert("NUM_PREC_RADIX".to_string(), CfmlValue::Int(c.jdbc.num_prec_radix));
+        row.insert("NUM_PREC_RADIX".to_string(), int_or_null(c.jdbc.num_prec_radix));
         row.insert(
             "NULLABLE".to_string(),
             CfmlValue::Int(if c.nullable { 1 } else { 0 }),
@@ -1184,6 +1283,9 @@ fn type_columns(
             "IS_GENERATEDCOLUMN".to_string(),
             s(if c.jdbc.is_generated { "YES" } else { "NO" }),
         );
+        for (name, value) in extra_columns.iter().zip(c.driver_extra) {
+            row.insert(name.to_string(), value);
+        }
         if enrich {
             row.insert(
                 "IS_PRIMARYKEY".to_string(),
@@ -2032,6 +2134,13 @@ mod type_mapping_tests {
             ("BINARY", -2),
             ("VARBINARY", -3),
             ("BLOB", -4),
+            // Lucee 7.1.2.191 + Connector/J on MySQL 8.4 (GH #539).
+            ("YEAR", 91),
+            ("TINYTEXT", 12),
+            ("MEDIUMTEXT", -1),
+            ("TINYBLOB", -3),
+            ("GEOMETRY", -2),
+            ("POINT", -2),
         ] {
             assert_eq!(jdbc_type_code(name), code, "{name}");
         }

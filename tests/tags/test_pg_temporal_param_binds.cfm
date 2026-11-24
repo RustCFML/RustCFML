@@ -118,6 +118,22 @@ if (NOT pgskip) {
         r6 = queryExecute("SELECT to_char(ts, 'YYYY-MM-DD HH24:MI:SS') AS s FROM #tbl# WHERE id = 1",
             [], { datasource: pgdsn });
         assert("cf_sql_timestamp param struct binds", r6.s[1] ?: "", "2024-06-01 12:00:00");
+
+        // GH #538: pgjdbc sends the engine's zone as the session TimeZone, so
+        // the server's own `timezone` setting does not shift what a query
+        // sees. RustCFML used the server's: with the server in UTC and the
+        // host in London, a summer date bound here read back an hour early.
+        // (Only a server zone that differs from the host's, and a date in
+        // the host's summer time, tells the two apart.)
+        r7 = queryExecute("SELECT to_char(CAST(CAST(? AS timestamptz) AS timestamp), 'YYYY-MM-DD HH24:MI:SS') AS s",
+            [{ value: createDateTime(2024, 7, 15, 9, 30, 0), cfsqltype: "cf_sql_timestamp" }], { datasource: pgdsn });
+        assert("a timestamptz renders in the engine's zone", r7.s[1] ?: "", "2024-07-15 09:30:00");
+
+        // A zone-less string is a wall clock in that same zone, as the server
+        // reads the text pgjdbc sends: the same instant as the date.
+        r8 = queryExecute("SELECT CASE WHEN CAST(? AS timestamptz) = CAST(? AS timestamptz) THEN 1 ELSE 0 END AS same",
+            ["2024-07-15 09:30:00", { value: createDateTime(2024, 7, 15, 9, 30, 0), cfsqltype: "cf_sql_timestamp" }], { datasource: pgdsn });
+        assert("a zone-less string binds as the same instant as the date", r8.same[1] ?: "", 1);
     } catch (any e) {
         assertTrue("temporal binds failed: " & e.message, false);
     }

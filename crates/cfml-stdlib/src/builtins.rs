@@ -12608,16 +12608,78 @@ fn build_pg_tls_config(verify: bool) -> Result<rustls::ClientConfig, PgConnError
     Ok(config)
 }
 
+/// The zone a PostgreSQL session should run in: the engine's (host) zone.
+///
+/// pgjdbc sends `TimeZone=<JVM default zone>` as a startup parameter, so on
+/// Lucee the server renders `timestamptz` values — `to_char`, `::text`, casts
+/// to `timestamp`, `now()::date` — in the engine's zone whatever the server's
+/// own `timezone` setting is. Without it a UTC server read a June date bound
+/// from London back an hour early (GH #538).
+#[cfg(feature = "postgres_db")]
+fn pg_session_timezone() -> String {
+    cfml_common::datetime::zone::canonical_name(&cfml_common::datetime::system_zone())
+}
+
+/// `options` with `-c TimeZone=<zone>` appended, unless the connection string
+/// already sets TimeZone itself (an explicit setting wins).
+#[cfg(feature = "postgres_db")]
+fn pg_options_with_timezone(existing: Option<&str>, zone: &str) -> Option<String> {
+    let existing = existing.unwrap_or("").trim();
+    if existing.to_ascii_lowercase().contains("timezone") {
+        return None;
+    }
+    // The options string is split on unescaped spaces; escape any in the value.
+    let value = zone.replace('\\', "\\\\").replace(' ', "\\ ");
+    let opt = format!("-c TimeZone={value}");
+    Some(if existing.is_empty() { opt } else { format!("{existing} {opt}") })
+}
+
+/// Whether the server refused the session TimeZone we sent (a zone name its
+/// tzdata does not know): `invalid value for parameter "TimeZone"`.
+#[cfg(feature = "postgres_db")]
+fn pg_rejected_timezone(e: &postgres::Error) -> bool {
+    e.as_db_error().is_some_and(|db| {
+        *db.code() == postgres::error::SqlState::INVALID_PARAMETER_VALUE
+            && db.message().contains("\"TimeZone\"")
+    })
+}
+
 /// Open a single PostgreSQL connection, honouring the `sslmode` URL option and
 /// negotiating TLS via rustls where required. Used by the r2d2 manager.
+///
+/// The session runs in the engine's zone (see [`pg_session_timezone`]). If the
+/// server does not know that zone's name, connect again without it rather
+/// than fail: the server's own zone is what every connection had before.
 #[cfg(feature = "postgres_db")]
 fn connect_postgres(url: &str) -> Result<postgres::Client, PgConnError> {
+    let zone = pg_session_timezone();
+    let mut zone_rejected = false;
+    match connect_postgres_in_zone(url, Some(&zone), &mut zone_rejected) {
+        Err(_) if zone_rejected => connect_postgres_in_zone(url, None, &mut false),
+        result => result,
+    }
+}
+
+#[cfg(feature = "postgres_db")]
+fn connect_postgres_in_zone(
+    url: &str,
+    zone: Option<&str>,
+    zone_rejected: &mut bool,
+) -> Result<postgres::Client, PgConnError> {
     use std::str::FromStr;
 
     let mode = pg_sslmode_from_url(url);
     let sanitized = pg_sanitize_url_sslmode(url);
     let mut config = postgres::Config::from_str(&sanitized)
         .map_err(|e| PgConnError(format!("invalid PostgreSQL connection string: {e}")))?;
+
+    if let Some(options) = zone.and_then(|z| pg_options_with_timezone(config.get_options(), z)) {
+        config.options(&options);
+    }
+    let on_connect_err = |e: postgres::Error| {
+        *zone_rejected = zone.is_some() && pg_rejected_timezone(&e);
+        PgConnError::from(e)
+    };
 
     // Socket-level bounds (GitHub #302) — see `db_net_secs`. Only applied when
     // the connection string didn't already specify them, so an explicit
@@ -12634,7 +12696,7 @@ fn connect_postgres(url: &str) -> Result<postgres::Client, PgConnError> {
 
     if mode == "disable" {
         config.ssl_mode(tokio_postgres::config::SslMode::Disable);
-        return config.connect(postgres::NoTls).map_err(PgConnError::from);
+        return config.connect(postgres::NoTls).map_err(on_connect_err);
     }
 
     config.ssl_mode(match mode.as_str() {
@@ -12645,7 +12707,7 @@ fn connect_postgres(url: &str) -> Result<postgres::Client, PgConnError> {
     let verify = mode == "verify-ca" || mode == "verify-full";
     let tls_config = build_pg_tls_config(verify)?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-    config.connect(tls).map_err(PgConnError::from)
+    config.connect(tls).map_err(on_connect_err)
 }
 
 /// Maximum pooled PostgreSQL connections. Also bounds `execute_postgres`'s
@@ -12956,73 +13018,83 @@ pub(crate) fn cfqueryparam_unwrap(v: &CfmlValue) -> CfmlValue {
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String>) {
-    // If params is an array of structs with "value" key, extract typed values
+    // Each element is either a plain value or a cfqueryparam-style struct, and
+    // an array may mix the two (Lucee reads each element on its own). Deciding
+    // from the FIRST element alone bound a later struct as its own text —
+    // `[1, {value: "b"}]` wrote "{value: b, …}" to the database.
     // Returns (effective_values, type_hints)
     match params_arg {
         CfmlValue::Array(arr) if !arr.is_empty() => {
-            // Check if first element is a struct with "value" key (cfqueryparam style)
-            if let Some(CfmlValue::Struct(first)) = arr.first() {
-                let has_value_key = first.data_contains_key("value");
-                if has_value_key {
-                    let mut values = Vec::with_capacity(arr.len());
-                    let mut type_hints = Vec::with_capacity(arr.len());
-                    for item in arr.iter() {
-                        if let CfmlValue::Struct(s) = item {
-                            let value = s.data_get("value")
-                                .unwrap_or(CfmlValue::Null);
+            let mut values = Vec::with_capacity(arr.len());
+            let mut type_hints = Vec::with_capacity(arr.len());
+            for item in arr.iter() {
+                if let Some(s) = as_param_struct(&item) {
+                    let value = s.data_get("value")
+                        .unwrap_or(CfmlValue::Null);
 
-                            let is_null = s.data_get("null").is_some_and(|v| param_null_flag(&v));
+                    let is_null = s.data_get("null").is_some_and(|v| param_null_flag(&v));
 
-                            let cfsqltype = s.data_get("cfsqltype").map(|v| v.as_string().to_lowercase())
-                                .unwrap_or_else(|| "cf_sql_varchar".to_string());
+                    let cfsqltype = s.data_get("cfsqltype").map(|v| v.as_string().to_lowercase())
+                        .unwrap_or_else(|| "cf_sql_varchar".to_string());
 
-                            let is_list = s.data_get("list").map(|v| {
-                                    match v {
-                                        CfmlValue::Bool(b) => b,
-                                        CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
-                                        _ => false,
-                                    }
-                                })
-                                .unwrap_or(false);
-
-                            let separator = s.data_get("separator").map(|v| v.as_string())
-                                .unwrap_or_else(|| ",".to_string());
-
-                            if is_null {
-                                values.push(CfmlValue::Null);
-                                type_hints.push(cfsqltype);
-                            } else if is_list {
-                                // An ARRAY value is already one bind per
-                                // element; only a string gets split.
-                                let parts =
-                                    cfml_common::dynamic::expand_list_param(&value, &separator);
-                                if parts.is_empty() {
-                                    // get_list_placeholder_counts reserves one
-                                    // `?` for an empty list; bind NULL into it.
-                                    values.push(CfmlValue::Null);
-                                    type_hints.push(cfsqltype.clone());
-                                }
-                                for part in parts {
-                                    values.push(coerce_by_sqltype_value(&part, &cfsqltype));
-                                    type_hints.push(cfsqltype.clone());
-                                }
-                            } else {
-                                let coerced = coerce_by_sqltype_value(&value, &cfsqltype);
-                                values.push(coerced);
-                                type_hints.push(cfsqltype);
+                    let is_list = s.data_get("list").map(|v| {
+                            match v {
+                                CfmlValue::Bool(b) => b,
+                                CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
+                                _ => false,
                             }
-                        } else {
-                            values.push(item.clone());
-                            type_hints.push("cf_sql_varchar".to_string());
+                        })
+                        .unwrap_or(false);
+
+                    let separator = s.data_get("separator").map(|v| v.as_string())
+                        .unwrap_or_else(|| ",".to_string());
+
+                    if is_null {
+                        values.push(CfmlValue::Null);
+                        type_hints.push(cfsqltype);
+                    } else if is_list {
+                        // An ARRAY value is already one bind per
+                        // element; only a string gets split.
+                        let parts =
+                            cfml_common::dynamic::expand_list_param(&value, &separator);
+                        if parts.is_empty() {
+                            // get_list_placeholder_counts reserves one
+                            // `?` for an empty list; bind NULL into it.
+                            values.push(CfmlValue::Null);
+                            type_hints.push(cfsqltype.clone());
                         }
+                        for part in parts {
+                            values.push(coerce_by_sqltype_value(&part, &cfsqltype));
+                            type_hints.push(cfsqltype.clone());
+                        }
+                    } else {
+                        let coerced = coerce_by_sqltype_value(&value, &cfsqltype);
+                        values.push(coerced);
+                        type_hints.push(cfsqltype);
                     }
-                    return (values, type_hints);
+                } else {
+                    values.push(item.clone());
+                    type_hints.push("cf_sql_varchar".to_string());
                 }
             }
-            // Plain array — pass through
-            (arr.to_vec(), vec!["cf_sql_varchar".to_string(); arr.len()])
+            (values, type_hints)
         }
         _ => (vec![], vec![]),
+    }
+}
+
+/// The struct behind a cfqueryparam-style array element — one that carries a
+/// `value`, a `null` flag or a `cfsqltype` (`{null: true, cfsqltype: …}` has
+/// no value) — or `None` for a plain value.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn as_param_struct(item: &CfmlValue) -> Option<&cfml_common::dynamic::CfmlStruct> {
+    match item {
+        CfmlValue::Struct(s)
+            if s.data_contains_key("value") || s.data_contains_key("null") || s.data_contains_key("cfsqltype") =>
+        {
+            Some(s)
+        }
+        _ => None,
     }
 }
 
@@ -13032,7 +13104,7 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
     match params_arg {
         CfmlValue::Array(arr) => {
             arr.iter().map(|item| {
-                if let CfmlValue::Struct(s) = item {
+                if let Some(s) = as_param_struct(&item) {
                     let is_list = s.data_get("list").map(|v| {
                             match v {
                                 CfmlValue::Bool(b) => b,
@@ -13913,23 +13985,23 @@ pub fn fn_query_execute_dynamic(args: Vec<CfmlValue>) -> CfmlResult {
 /// Both the normal `queryExecute` path and the transaction path must run
 /// this before handing params to a driver — otherwise the raw cfqueryparam
 /// struct reaches the driver and gets stringified into the SQL (issue #147).
-/// Idempotent: an already-normalized plain array has no `value`-keyed structs,
-/// so it returns unchanged.
+/// Idempotent: an already-normalized plain array has no param structs (see
+/// [`as_param_struct`]), so it returns unchanged.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn normalize_positional_params(sql: String, raw_params: &CfmlValue) -> (String, CfmlValue) {
     if let CfmlValue::Array(arr) = raw_params {
-        if let Some(CfmlValue::Struct(first)) = arr.first() {
-            if first.data_contains_key("value") {
-                let (values, _hints) = normalize_query_params(raw_params);
-                // Check if any list params require SQL expansion
-                let placeholder_counts = get_list_placeholder_counts(raw_params);
-                let expanded_sql = if placeholder_counts.iter().any(|&c| c > 1) {
-                    expand_sql_placeholders(&sql, &placeholder_counts)
-                } else {
-                    sql
-                };
-                return (expanded_sql, CfmlValue::array(values));
-            }
+        // ANY param struct, not just a leading one: `[1, {value: "b"}]` mixes
+        // the two forms, and Lucee reads each element on its own.
+        if arr.iter().any(|item| as_param_struct(&item).is_some()) {
+            let (values, _hints) = normalize_query_params(raw_params);
+            // Check if any list params require SQL expansion
+            let placeholder_counts = get_list_placeholder_counts(raw_params);
+            let expanded_sql = if placeholder_counts.iter().any(|&c| c > 1) {
+                expand_sql_placeholders(&sql, &placeholder_counts)
+            } else {
+                sql
+            };
+            return (expanded_sql, CfmlValue::array(values));
         }
     }
     (sql, raw_params.clone())
@@ -15735,15 +15807,18 @@ fn parse_cfml_time(s: &str) -> Option<NaiveTime> {
 /// PostgreSQL `timestamptz` column. RFC 3339 / ISO 8601 strings carrying a
 /// numeric offset or 'Z' suffix ("2026-06-10T07:20:42.177+00:00", "...Z") are
 /// honoured — the offset is applied to recover the true instant. A zone-less
-/// value (a plain CFML datetime) carries no offset, so its wall-clock is
-/// interpreted as UTC (matching the existing behaviour for a UTC server).
+/// value (a plain CFML datetime) carries no offset, so its wall clock is read
+/// in the session zone — the engine's, see [`pg_session_timezone`] — which is
+/// what the server does with the text pgjdbc sends on Lucee (GH #538).
 #[cfg(feature = "postgres_db")]
 fn parse_cfml_datetime_utc(s: &str) -> Option<chrono::DateTime<Utc>> {
     let t = s.trim();
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
         return Some(dt.with_timezone(&Utc));
     }
-    parse_cfml_date(t).map(|ndt| Utc.from_utc_datetime(&ndt))
+    let wall = parse_cfml_date(t)?;
+    let zone = cfml_common::datetime::system_zone();
+    cfml_common::datetime::zone::local_to_utc(&zone, wall).map(|utc| Utc.from_utc_datetime(&utc))
 }
 
 /// Encode a CFML vector-literal string ("[1,0,0]") into pgvector's binary wire
@@ -15870,10 +15945,9 @@ impl postgres::types::ToSql for PgParam {
                     .to_sql(ty, out),
                 Type::TIMESTAMPTZ => {
                     // An ISO 8601 string carrying a zone offset or 'Z' is bound
-                    // at the true instant it denotes; a zone-less CFML datetime
-                    // is interpreted as UTC wall-clock (Lucee binds the
-                    // server-tz instant — for a UTC server, identical). The
-                    // server then renders it back in its session TimeZone.
+                    // at the true instant it denotes; a zone-less one is a
+                    // wall clock in the session zone, as the server would
+                    // read the text pgjdbc sends on Lucee.
                     parse_cfml_datetime_utc(s)
                         .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date/time"))?
                         .to_sql(ty, out)
@@ -23080,7 +23154,7 @@ mod db_tls_tests {
 
     #[cfg(feature = "postgres_db")]
     mod postgres {
-    use crate::builtins::{pg_sanitize_url_sslmode, pg_sslmode_from_url};
+    use crate::builtins::{pg_options_with_timezone, pg_sanitize_url_sslmode, pg_sslmode_from_url};
 
     #[test]
     fn sslmode_defaults_to_prefer_when_absent() {
@@ -23104,6 +23178,27 @@ mod db_tls_tests {
         assert_eq!(
             pg_sslmode_from_url("postgresql://u:p@host/db?x=1&sslmode=disable&y=2"),
             "disable"
+        );
+    }
+
+    #[test]
+    fn session_timezone_option_is_appended_unless_already_set() {
+        // GH #538: the session runs in the engine's zone, as pgjdbc's does.
+        assert_eq!(
+            pg_options_with_timezone(None, "Europe/London").as_deref(),
+            Some("-c TimeZone=Europe/London")
+        );
+        assert_eq!(
+            pg_options_with_timezone(Some("-c search_path=app"), "UTC").as_deref(),
+            Some("-c search_path=app -c TimeZone=UTC")
+        );
+        // A TimeZone the connection string sets itself wins.
+        assert_eq!(pg_options_with_timezone(Some("-c timezone=Asia/Tokyo"), "UTC"), None);
+        assert_eq!(pg_options_with_timezone(Some("--TimeZone=UTC"), "Europe/London"), None);
+        // The options string splits on spaces, so a value's spaces are escaped.
+        assert_eq!(
+            pg_options_with_timezone(None, "Odd Zone").as_deref(),
+            Some("-c TimeZone=Odd\\ Zone")
         );
     }
 

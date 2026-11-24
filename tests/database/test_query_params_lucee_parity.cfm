@@ -62,6 +62,15 @@ for ( target in qpTargets ) {
 		assert( "#target.name#: a named scalar", qpRun( "#sel# where v = :x", { x: { value: 3, cfsqltype: "integer" } } ), "3" );
 		assert( "#target.name#: a plain named value", qpRun( "#sel# where v = :x", { x: 2 } ), "2" );
 		assert( "#target.name#: a camelCase name", qpRun( "#sel# where v = :someValue", { someValue: 4 } ), "4" );
+		// A positional array may mix plain values and param structs; each
+		// element is read on its own. Only a LEADING struct used to switch
+		// struct handling on, so a later one was bound as its own text
+		// ("{value: k3, …}") and its list=true was never expanded. Lucee
+		// 7.1.2.191 on MySQL 8.4 gives these results (on PostgreSQL it binds
+		// an untyped number as text, so `v = ?` with a plain 1 errors there).
+		assert( "#target.name#: a plain value, then a param struct", qpRun( "#sel# where v = ? or s = ? order by v", [ 1, { value: "k3", cfsqltype: "varchar" } ] ), "1,3" );
+		assert( "#target.name#: a plain value, then a list param", qpRun( "#sel# where v = ? or v in (?) order by v", [ 1, { value: "2,4", cfsqltype: "integer", list: true } ] ), "1,2,4" );
+		assert( "#target.name#: a param struct, then a plain value", qpRun( "#sel# where v = ? or s = ? order by v", [ { value: 1, cfsqltype: "integer" }, "k3" ] ), "1,3" );
 		// `::` inside a quoted string is never touched.
 		assert( "#target.name#: :: inside quotes with params", qpRun( "select 'a::::b' as v", [] ), "a::::b" );
 
