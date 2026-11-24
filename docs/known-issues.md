@@ -845,14 +845,41 @@ Lucee's spec default is `secure:false` everywhere, so the Worker-on default is a
 
 <a id="13"></a>
 
-## 13. `<cfoutput query>` / grouped output — implemented, with edges 🏗
+## 13. Query loops (`<cfoutput query>`, `<cfloop query>`, script `loop query`) — implemented, with edges 🏗
 
-`<cfoutput query="q">` drives row iteration. Supported: per-row looping, `startrow`/`maxrows`, bare column refs (`#name#`,
-resolved by merging each row into the `variables` scope), `#q.col#` row scalars,
-and `#q.currentRow#`/`#q.recordCount#`/`#q.columnList#`. The query variable is
-restored to the full query after the loop. `group` (control-break) output with a
-nested detail `<cfoutput>` is supported, including multi-level grouping;
-`groupCaseSensitive` defaults to `Yes` (case-sensitive), matching the CFML spec.
+`<cfoutput query="q">`, `<cfloop query="q">` and script `loop query="q" { }`
+drive row iteration. Supported: per-row looping, `startrow`/`maxrows` (and
+`endrow` on `<cfloop>`), `#q.col#` row scalars, and
+`#q.currentRow#`/`#q.recordCount#`/`#q.columnList#`. `group` (control-break)
+output with a nested detail `<cfoutput>` or bare `<cfloop>` is supported,
+including multi-level grouping; `groupCaseSensitive` defaults to `Yes`
+(case-sensitive), matching the CFML spec.
+
+**Bare names (GH #544).** Inside any query loop a bare column, `currentRow`,
+`recordCount` or `columnList` reads the looping query's current row, as on
+Lucee 7.1. The engine keeps Lucee's query stack for the request: a bare name is
+looked up in `local`, then `arguments`, then the running loops' queries
+(innermost first), then `variables`. So:
+
+- the query outranks a `variables` key of the same name, and a local or an
+  argument outranks the query;
+- functions called from inside the loop see its columns too, even over their
+  component's own `variables` (Lucee does the same);
+- a real column outranks a pseudo-column of the same name, and a NULL cell
+  reads as `""`;
+- assigning to a bare column name writes `variables`, not the query;
+- nothing is written to `variables`, and nothing is left defined after the
+  loop, however it ends (`break`, `return`, an error, `cfexit`).
+
+Queries are references, so loops over the same query share its cursor. Each
+loop saves the cursor on entry and restores it on exit, which hands an outer
+loop its own row again. The loop never writes the query variable: a body that
+reassigns it keeps the new value while the loop runs on over the original.
+
+Before v0.752.0 the tag forms copied each row into `variables`. That
+overwrote a same-named page variable, left the columns defined after the loop,
+and in a component method wrote into the component's shared `variables`. The
+script form did not resolve bare names at all.
 
 Known edges:
 
@@ -861,7 +888,7 @@ Known edges:
 | Nested detail block placement | The detail `<cfoutput>` must sit **directly** in the group body. Wrapping it in `<cfif>`/`<cfloop>` is not supported (the pre/detail/post split would straddle the control-flow block). |
 | Multiple sibling detail blocks | Only the **first** nested `<cfoutput>` at a given group level is treated as the detail loop; later siblings render once. |
 | `group` + `startrow`/`maxrows` | `startrow`/`maxrows` apply to the **non-grouped** form only; the grouped form ignores them. |
-| Bare column scope | Columns are merged into `variables`, so a page variable sharing a column's name is shadowed for the duration of the loop. `<cfloop query>` bodies perform the same merge (GitHub PR #318), so bare column refs resolve there too. |
+| Query of queries table names | Lucee resolves an UNSCOPED table name in a query of queries through the same lookup, so inside a loop whose query has a column of that name it finds the column's string and the query of queries throws. RustCFML resolves the table name as before and finds the query. Left as is: matching it would only turn working code into an error. A scoped name (`variables.t`) behaves the same on both engines. |
 
 <a id="14"></a>
 
