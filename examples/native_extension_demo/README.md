@@ -68,6 +68,19 @@ The last block in `tier3.cfm` is the one that matters: CFML → extension → CF
 extension. Under the old exclusive dispatch guard the nested extension call
 deadlocked.
 
+## Tier 4 — catching what CFML throws, named arguments
+
+`tier4.cfm`, serve mode. Reload it: the kept closure is called again in a new
+request.
+
+| | |
+|---|---|
+| `demoTryApply( callback, value )` | `demoApply`, but a CFML error in the callback comes back as `{ ok: false, type, message, detail }` and the request carries on |
+| `demoApplyNamed( callback, args )` | call with named arguments — `argumentCollection`, from Rust |
+| `demoKeep( name, callback )` | keep a closure beyond this request (a tier-2 root) |
+| `demoCallKept( name, args… )` | call it in a LATER request: its captures are its own, `request` and `session` are this request's |
+| `demoForget( name )` | release it, and everything it captured |
+
 ## The two things worth copying
 
 **Bulk reads.** `query_column(i)` materialises a whole column in one crossing;

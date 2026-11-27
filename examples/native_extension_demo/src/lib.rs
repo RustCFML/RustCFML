@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
-use rustcfml_module::{abi, module, Ctx, Error, NativeClass, Result, Value};
+use rustcfml_module::{abi, module, Ctx, Error, NativeClass, Result, Rooted, Value};
 
 /// `demoGreet( [name] )` — the smallest useful thing.
 fn greet<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
@@ -351,6 +351,97 @@ fn sort_with_cfml<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 4 — CFML errors as data, named arguments
+// ---------------------------------------------------------------------------
+
+/// `demoTryApply( callback, value )` — `demoApply`, but a CFML error in the
+/// callback comes back as data instead of ending the request:
+/// `{ ok: true, value }` or `{ ok: false, type, message, detail }`. The shape
+/// an agent's tool loop needs: a tool that throws is a result the model reads.
+fn try_apply<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let f = args
+        .first()
+        .copied()
+        .ok_or_else(|| Error::expression("demoTryApply() needs a function"))?;
+    let arg = args.get(1).copied().unwrap_or_else(|| ctx.int(0));
+    let out = ctx.strukt();
+    match f.try_call_as_fn(&[arg]) {
+        Ok(v) => {
+            out.put("ok", ctx.bool(true))?;
+            out.put("value", v)?;
+        }
+        // An abort or a request timeout is not an exception; it cannot be
+        // handled, so hand it straight back.
+        Err(e) if e.ends_request() => return Err(e.rethrow()),
+        Err(e) => {
+            out.put("ok", ctx.bool(false))?;
+            out.put("type", ctx.string(&e.error_type))?;
+            out.put("message", ctx.string(&e.message))?;
+            out.put("detail", ctx.string(&e.detail))?;
+        }
+    }
+    Ok(out)
+}
+
+/// `demoApplyNamed( callback, args )` — call with NAMED arguments, the ABI
+/// form of `callback( argumentCollection = args )`.
+fn apply_named<'a>(_ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let f = args
+        .first()
+        .copied()
+        .ok_or_else(|| Error::expression("demoApplyNamed() needs a function"))?;
+    let named = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| Error::expression("demoApplyNamed() needs a struct of arguments"))?;
+    f.call_as_fn_named(named)
+}
+
+// ---------------------------------------------------------------------------
+// Keeping a closure for a later request (tier 2 roots, called with tier 3/4)
+// ---------------------------------------------------------------------------
+
+/// Closures kept between requests, by name — a handler registry.
+static KEPT: Mutex<Option<std::collections::HashMap<String, Rooted>>> = Mutex::new(None);
+
+/// `demoKeep( name, callback )` — keep a closure beyond this request.
+fn keep<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let name = args.first().map(|v| v.to_string()).unwrap_or_default().to_lowercase();
+    let f = args.get(1).copied().ok_or_else(|| Error::expression("demoKeep( name, callback )"))?;
+    let rooted = ctx.root(f)?;
+    // A replaced handler is released after the lock is let go.
+    let previous = KEPT.lock().unwrap().get_or_insert_with(Default::default).insert(name, rooted);
+    drop(previous);
+    Ok(ctx.bool(true))
+}
+
+/// `demoCallKept( name, args… )` — call a kept closure, in THIS request: its
+/// `request`, `session` and `url` are this request's.
+fn call_kept<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let name = args.first().map(|v| v.to_string()).unwrap_or_default().to_lowercase();
+    // Resolve under the lock, call without it: the closure is arbitrary CFML
+    // and may call back into this extension.
+    let f = {
+        let kept = KEPT.lock().unwrap();
+        let rooted = kept
+            .as_ref()
+            .and_then(|m| m.get(&name))
+            .ok_or_else(|| Error::expression(format!("nothing kept as [{name}]")))?;
+        rooted.get(ctx)
+    };
+    f.call_as_fn(args.get(1..).unwrap_or(&[]))
+}
+
+/// `demoForget( name )` — release a kept closure, and everything it captured.
+fn forget<'a>(ctx: &'a Ctx, args: &[Value<'a>]) -> Result<Value<'a>> {
+    let name = args.first().map(|v| v.to_string()).unwrap_or_default().to_lowercase();
+    let removed = KEPT.lock().unwrap().as_mut().and_then(|m| m.remove(&name));
+    let existed = removed.is_some();
+    drop(removed);
+    Ok(ctx.bool(existed))
+}
+
+// ---------------------------------------------------------------------------
 // Query-of-Queries functions
 // ---------------------------------------------------------------------------
 
@@ -412,9 +503,10 @@ static GREETING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 module! {
     name: "demo",
     version: "0.1.0",
-    // This extension reads scopes, takes locks AND runs CFML, so it needs the
-    // top tier. An engine providing less refuses the load up front.
-    tier: abi::tier::EXECUTION,
+    // This extension reads scopes, takes locks, runs CFML AND catches the
+    // errors that CFML raises, so it needs tier 4. An engine providing less
+    // refuses the load up front.
+    tier: abi::tier::EXCEPTIONS,
     bifs: {
         "demoGreet"          => greet,
         "demoStats"          => stats,
@@ -432,6 +524,11 @@ module! {
         "demoComponentAnnotations" => component_annotations,
         "demoEmit"                => emit,
         "demoSort"                => sort_with_cfml,
+        "demoTryApply"            => try_apply,
+        "demoApplyNamed"          => apply_named,
+        "demoKeep"                => keep,
+        "demoCallKept"            => call_kept,
+        "demoForget"              => forget,
     },
     classes: { Tally },
     qoq_scalars: { "slugify" => sql_slugify },
