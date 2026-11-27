@@ -2970,6 +2970,10 @@ pub struct CfmlVirtualMachine {
     pub redirect_url: Option<String>,
     /// HTTP request data for getHTTPRequestData()
     pub http_request_data: Option<CfmlValue>,
+    /// Per-request uploaded file parts keyed by lower-cased form field name
+    /// (GH #546, #547). `form.<field>` holds only the temp path string(s);
+    /// `FileUpload` / `FileUploadAll` read the full metadata from here.
+    pub upload_registry: crate::web::UploadRegistry,
     /// Stack of saved output buffers for cfsavecontent
     pub saved_output_buffers: Vec<String>,
     /// Sink that carries `<cfflush>` output to the client while the request is
@@ -4403,6 +4407,9 @@ pub struct ThreadSeed {
     /// saw only the defaulted standard keys and no S3 config (GH #543). Lucee
     /// gives a thread the same application context as its request.
     pub app_cfc_template: Option<CfmlValue>,
+    /// Parent request's uploaded-file registry so a `cfthread` body can still
+    /// call `FileUpload` / `FileUploadAll` (GH #546, #547).
+    pub upload_registry: crate::web::UploadRegistry,
     /// Snapshot of the parent's page-level `thread` soft-scope at spawn. Holds
     /// any `thread.x = ...` values seeded BEFORE the cfthread (the standard CFML
     /// idiom for passing data into a thread). Restored into the child's
@@ -5791,6 +5798,7 @@ impl CfmlVirtualMachine {
             response_body: None,
             redirect_url: None,
             http_request_data: None,
+            upload_registry: crate::web::UploadRegistry::new(),
             saved_output_buffers: Vec::new(),
             flush_sink: None,
             response_flushed: false,
@@ -7118,6 +7126,7 @@ impl CfmlVirtualMachine {
             app_datasources: self.app_datasources.clone(),
             app_default_datasource: self.app_default_datasource.clone(),
             app_cfc_template: self.app_cfc_template.clone(),
+            upload_registry: self.upload_registry.clone(),
             closure: body,
             attributes,
             cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -7190,6 +7199,7 @@ impl CfmlVirtualMachine {
         self.app_datasources = seed.app_datasources;
         self.app_default_datasource = seed.app_default_datasource;
         self.app_cfc_template = seed.app_cfc_template;
+        self.upload_registry = seed.upload_registry;
         self.cancel_flag = Some(seed.cancel_flag);
         for (k, v) in seed.variables_snapshot {
             self.globals.insert(k, v);

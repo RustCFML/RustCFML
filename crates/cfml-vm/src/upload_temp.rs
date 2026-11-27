@@ -2,8 +2,10 @@
 //! parts (GH #386).
 //!
 //! Each part is written to `cfupload_<pid>_<counter>.upload` in the system temp
-//! directory and exposed to CFML as `form.<field>.tempFilePath`. Nothing used
-//! to delete them, so a server taking uploads filled its temp volume.
+//! directory. CFML sees the path as the simple `form.<field>` string (and the
+//! full metadata lives in the per-request upload registry for `FileUpload`).
+//! Nothing used to delete them, so a server taking uploads filled its temp
+//! volume.
 //!
 //! Three layers, each covering what the one before it cannot:
 //!

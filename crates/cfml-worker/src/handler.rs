@@ -78,7 +78,7 @@ pub async fn handle_fetch(
     let file_path = resolved.file_path.to_string_lossy().to_string();
 
     // Build CGI/URL/Form/Cookie scopes
-    let (globals, http_request_data) =
+    let (globals, http_request_data, upload_registry) =
         match scopes::build_from_request(&mut req, &script_name, &path_info).await {
             Ok(p) => p,
             Err(e) => return error_500(config, "Request could not be read", &format!("{e:?}")),
@@ -165,6 +165,7 @@ pub async fn handle_fetch(
         vfs,
         extra_globals: globals,
         http_request_data,
+        upload_registry,
         server_state: server_state.clone(),
         session_id: cookie_session_id.clone(),
     });
@@ -289,6 +290,7 @@ pub(crate) fn run_cfml(
     vfs: Arc<dyn Vfs>,
     extra_globals: ValueMap,
     http_request_data: CfmlValue,
+    upload_registry: cfml_vm::web::UploadRegistry,
     server_state: &ServerState,
     session_id: Option<String>,
 ) -> std::result::Result<ResponseData, String> {
@@ -354,6 +356,7 @@ pub(crate) fn run_cfml(
     vm.apply_cfconfig(&server_state.cfconfig);
     vm.server_state = Some(server_state.clone());
     vm.http_request_data = Some(http_request_data);
+    vm.upload_registry = upload_registry;
     vm.session_id = session_id;
 
     let result = vm.execute_with_lifecycle();

@@ -145,6 +145,8 @@ fn streamed_upload_arrives_intact_and_exposes_no_raw_body() {
     let resp = post_upload(server.port, "photo.png", &payload);
 
     assert!(resp.contains("200 OK"), "upload should succeed; got:\n{resp}");
+    assert_eq!(field(&resp, "isSimpleValue"), "true", "form.upload must be a simple path (GH #546)");
+    assert_eq!(field(&resp, "fileExists"), "true");
     assert_eq!(field(&resp, "clientFile"), "photo.png");
     assert_eq!(
         field(&resp, "fileSize"),
@@ -168,7 +170,8 @@ fn streamed_upload_arrives_intact_and_exposes_no_raw_body() {
         "the streamed bytes must reach disk unchanged"
     );
 
-    // ...and the request's end removed it (GH #386).
+    // ...and the request's end removed it (GH #386). FileUpload also removes
+    // the temp once it has copied it into place.
     let temp_path = field(&resp, "tempFilePath").to_string();
     assert!(
         !std::path::Path::new(&temp_path).exists(),
@@ -281,6 +284,101 @@ fn client_filename_cannot_steer_the_temp_path() {
         !temp_path.contains("evil") && !temp_path.contains(".."),
         "the temp path must carry nothing from the client filename: {temp_path}"
     );
+}
+
+/// POST several file parts under the same field name (and optional plain fields).
+fn post_named_files(port: u16, page: &str, field: &str, files: &[(&str, &[u8])]) -> String {
+    let boundary = "----------------------------rustcfmluploadboundary";
+    let mut body: Vec<u8> = Vec::new();
+    for (filename, payload) in files {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; \
+                 filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    let head = format!(
+        "POST {page} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: multipart/form-data; boundary={boundary}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    stream.flush().unwrap();
+    let mut out = Vec::new();
+    stream.read_to_end(&mut out).expect("read response");
+    String::from_utf8_lossy(&out).to_string()
+}
+
+#[test]
+fn form_file_field_is_a_simple_temp_path_and_fileupload_returns_metadata() {
+    // GH #546: form.doc is a string path; FileUpload still returns clientFile.
+    let server = start_server();
+    let resp = post_named_files(
+        server.port,
+        "/form_and_all.cfm",
+        "doc",
+        &[("report.txt", b"hello upload")],
+    );
+    assert!(resp.contains("200 OK"), "upload should succeed; got:\n{resp}");
+    assert_eq!(field(&resp, "isSimpleValue"), "true");
+    assert_eq!(field(&resp, "fileExists"), "true");
+    assert_eq!(field(&resp, "uploadClientFile"), "report.txt");
+    assert_eq!(field(&resp, "uploadSaved"), "true");
+    let temp_path = field(&resp, "formDoc").to_string();
+    assert!(
+        !temp_path.contains(','),
+        "a single upload must not be a comma list: {temp_path}"
+    );
+}
+
+#[test]
+fn several_files_under_one_field_name_reach_fileuploadall() {
+    // GH #547: docs=@a.txt docs=@b.txt → FileUploadAll returns both; form.docs
+    // is the comma-joined temp paths; FileUpload takes the first.
+    let server = start_server();
+    let resp = post_named_files(
+        server.port,
+        "/uploadall.cfm",
+        "docs",
+        &[("a.txt", b"aaa"), ("b.txt", b"bbb")],
+    );
+    assert!(resp.contains("200 OK"), "upload should succeed; got:\n{resp}");
+    assert_eq!(field(&resp, "isSimpleValue"), "true");
+    assert_eq!(field(&resp, "pathCount"), "2");
+    assert_eq!(field(&resp, "path1Exists"), "true");
+    assert_eq!(field(&resp, "path2Exists"), "true");
+    assert_eq!(field(&resp, "uploadAllCount"), "2");
+    assert_eq!(field(&resp, "clientFile1"), "a.txt");
+    assert_eq!(field(&resp, "clientFile2"), "b.txt");
+    let form_docs = field(&resp, "formDocs").to_string();
+    assert_eq!(
+        form_docs.split(',').count(),
+        2,
+        "form.docs must list both temp paths: {form_docs}"
+    );
+
+    let first = post_named_files(
+        server.port,
+        "/upload_first.cfm",
+        "docs",
+        &[("a.txt", b"aaa"), ("b.txt", b"bbb")],
+    );
+    assert!(first.contains("200 OK"), "upload should succeed; got:\n{first}");
+    assert_eq!(field(&first, "pathCount"), "2");
+    assert_eq!(field(&first, "firstClientFile"), "a.txt");
+    assert_eq!(field(&first, "saved"), "true");
 }
 
 #[test]

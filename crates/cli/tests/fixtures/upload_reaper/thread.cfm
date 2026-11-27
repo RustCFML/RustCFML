@@ -1,9 +1,10 @@
 <cfscript>
-// Hands the upload to a cfthread, so the request keeps its temp file and the
-// age reaper has to remove it (GH #386).
-f = form.upload;
-thread name="uploadReader" action="run" path=f.tempFilePath {
+// Same as upload_streaming/thread.cfm: keep the temp path past request end
+// so the age reaper has something to sweep (GH #386). form.upload is the
+// temp path string (GH #546).
+thread name="uploadReader" action="run" path=form.upload {
+	sleep( 500 );
 	fileReadBinary( attributes.path );
 }
-writeOutput( "tempFilePath=" & f.tempFilePath & ";" );
+writeOutput( "tempFilePath=" & form.upload & ";" );
 </cfscript>
