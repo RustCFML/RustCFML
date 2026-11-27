@@ -2703,14 +2703,25 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                                 let (cattrs, cquoted, _order, cend) =
                                     parse_tag_attributes_ordered(chars, ne, len);
                                 if let Some(argname) = cattrs.get("name") {
-                                    // The arg key is the (possibly `$`) name; always
-                                    // quote it so keys like `$` are legal struct keys.
-                                    let key = strip_hashes(argname);
+                                    // `name` is an ordinary interpolated attribute
+                                    // (GH #545), same as `value`: `#listFirst(key,"=")#`,
+                                    // `#n#`, and `x#n#` must evaluate at runtime.
+                                    // format_attr_value yields the right expression, but a
+                                    // bare identifier as a struct-literal key is a
+                                    // *literal* key name (`{ n: 1 }` → key "n"), so
+                                    // concatenate onto "" to force a computed key —
+                                    // `("" & n)`, `("" & listFirst(...))`,
+                                    // `("" & "x" & (n))`. (`omit` is webservice-only;
+                                    // RustCFML rejects webservice= and never reads it.)
+                                    let key = format!(
+                                        "(\"\" & {})",
+                                        format_attr_value(argname, cquoted.contains("name"))
+                                    );
                                     let val = cattrs
                                         .get("value")
                                         .map(|v| format_attr_value(v, cquoted.contains("value")))
                                         .unwrap_or_else(|| "\"\"".to_string());
-                                    child_parts.push(format!("\"{}\": {}", key, val));
+                                    child_parts.push(format!("{}: {}", key, val));
                                 }
                                 i = cend;
                                 continue;

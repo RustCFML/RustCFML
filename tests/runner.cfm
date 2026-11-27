@@ -1006,6 +1006,10 @@ include "harness.cfm";
 <!--- rejects it, so the cross-engine test uses the cf-less `invoke`.) --->
 <cf_runtest file="tags/test_cfinvoke_statement.cfm" />
 <cf_runtest file="tags/test_cfinvoke_argument_children.cfm" />
+<!--- - cfinvokeargument_name_expr: name="#expr#" must evaluate (GH #545), --->
+<!--- including nested double quotes inside #...#, single quotes, #n#, and --->
+<!--- prefix+interpolation x#n#. Static name and value="#...#" stay green. --->
+<cf_runtest file="tags/test_cfinvokeargument_name_expr.cfm" />
 <!--- - cfinvoke_call_form_marshaling: the cf-PREFIXED parenthesized CALL form --->
 <!--- cfinvoke(...) — the spelling Lucee accepts and Wheels' Global.cfc --->
 <!--- $invoke() uses — must marshal attributeCollection, deliver --->
