@@ -11,6 +11,8 @@ pub mod qr_zxing;
 pub mod spreadsheet;
 #[cfg(feature = "xml")]
 pub mod xmp;
+#[cfg(feature = "xml")]
+pub mod xpath;
 #[cfg(feature = "html")]
 pub mod html_dom;
 #[cfg(feature = "html")]
