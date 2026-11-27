@@ -85,7 +85,7 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [51](#51) | Tag-mode parsing — two constructs compile here that Lucee rejects | 🏗 edges |
 | [53](#53) | `private`/`package` methods are gated on CALLS, not on member reads | 🏗 edges |
 | [122](#122) | A page-level closure called on a later request has lost the page's `variables` | 🏗 open |
-| [123](#123) | A closure kept in a function local loses its captures when an inner closure calls it | 🏗 open |
+| [123](#123) | A closure kept in a function local loses its captures when an inner closure calls it | ✅ resolved (v0.752.1) |
 | [118](#118) | Markdown: safe by default (unlike BoxLang), reference links resolved | 🏗 by design |
 
 **Part E — Environment-specific 🌍**
@@ -1930,7 +1930,7 @@ outlive their request in a function — `onApplicationStart` is the usual place.
 
 <a id="123"></a>
 
-## 123. A closure kept in a function local loses its captures when an inner closure calls it 🏗
+## 123. A closure kept in a function local loses its captures when an inner closure calls it — RESOLVED in v0.752.1 *(GH [#549](https://github.com/RustCFML/RustCFML/issues/549))*
 
 ```cfml
 function makeCounter() { var n = 0; return function() { n++; return n; }; }
@@ -1939,14 +1939,14 @@ function makeShared() {
     return function() { return counter(); };
 }
 s = makeShared();
-s();   // Lucee 7.1.2: 1, then 2      RustCFML: variable [N] doesn't exist
+s();   // 1, then 2, as on Lucee 7.1.2 (v0.752.0: variable [N] doesn't exist)
 ```
 
-Calling `counter()` directly, or from a closure defined at page level, works;
-it is calling it from a closure defined in the same function that holds it that
-loses `counter`'s own captured `n`. Reproduced on v0.752.0 with plain CFML, so it
-is not specific to extensions; the extension tests in
-`crates/cfml-vm/tests/foreign_cfml_calls.rs` avoid the shape.
+Calling `counter()` directly or from a closure defined at page level always
+worked; calling it from a closure defined in the same function that holds it
+lost `counter`'s own captured `n` until v0.752.1. The fix keeps a closure's
+captured scope when another closure captures it
+(`tests/core/test_nested_closure_preserves_capture.cfm`).
 
 ---
 

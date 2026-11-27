@@ -408,13 +408,11 @@ exactly as they would through `application` scope: unsynchronised updates to its
 captured variables race in the same way, and `<cflock>` inside the closure (or
 around the call) is the remedy, as it is in CFML.
 
-Two places where RustCFML's closures differ from Lucee's apply here as they do
-in CFML (they are not specific to extensions): a closure defined at **page
+One place where RustCFML's closures differ from Lucee's applies here as it does
+in CFML (it is not specific to extensions): a closure defined at **page
 level** loses the page's `variables` when that page's request ends
-([known-issues §122](known-issues.md#122)), and a closure called from inside
-another closure defined in the same function can lose its own captures
-([§123](known-issues.md#123)). Build kept closures in a function — as above, or
-in `onApplicationStart` — rather than at page level.
+([known-issues §122](known-issues.md#122)). Build kept closures in a function —
+as above, or in `onApplicationStart` — rather than at page level.
 
 ### Checking the host is new enough
 
