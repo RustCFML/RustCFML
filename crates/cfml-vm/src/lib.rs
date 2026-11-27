@@ -12990,6 +12990,7 @@ impl CfmlVirtualMachine {
                                         &val,
                                         &declared_locals,
                                         &func.params,
+                                        Some(env),
                                     ) {
                                         m.insert(name, cv);
                                     }
@@ -16061,9 +16062,13 @@ impl CfmlVirtualMachine {
                         Some(ref env) => {
                             let mut m = env.write().unwrap();
                             for (k, v) in &locals {
-                                if let Some(cv) =
-                                    Self::closure_env_capture_value(k, v, &declared_locals, &func.params)
-                                {
+                                if let Some(cv) = Self::closure_env_capture_value(
+                                    k,
+                                    v,
+                                    &declared_locals,
+                                    &func.params,
+                                    Some(env),
+                                ) {
                                     m.insert(k.clone(), cv);
                                 }
                             }
@@ -16072,9 +16077,13 @@ impl CfmlVirtualMachine {
                         None => {
                             let mut seed = ValueMap::default();
                             for (k, v) in locals.iter() {
-                                if let Some(cv) =
-                                    Self::closure_env_capture_value(k, v, &declared_locals, &func.params)
-                                {
+                                if let Some(cv) = Self::closure_env_capture_value(
+                                    k,
+                                    v,
+                                    &declared_locals,
+                                    &func.params,
+                                    None,
+                                ) {
                                     seed.insert(k.clone(), cv);
                                 }
                             }
@@ -17618,6 +17627,7 @@ impl CfmlVirtualMachine {
                             &value,
                             &declared_locals,
                             &func.params,
+                            Some(env),
                         ) {
                             let mut m = env.write().unwrap();
                             Self::env_own_write(&mut m, &mut env_reconciled_version, |m| {
@@ -35933,21 +35943,25 @@ impl CfmlVirtualMachine {
     /// var-scoped function EXPRESSION like `var fn = function(){…}` — so that a
     /// nested closure can resolve it by bare name (PR #198: Wheels/TestBox
     /// define a helper at the top of `run()` and call it from inside
-    /// `it()`/`describe()` closures). Crucially it is captured with
-    /// `captured_scope` STRIPPED: an env-resident Function whose captured_scope
-    /// is an Arc clone of this same env forms a self-referential cycle (env ->
-    /// Function -> captured_scope -> env) that leaks the env on frame exit (the
-    /// reason Functions were historically excluded wholesale). Stripping the
-    /// scope breaks the cycle; the helper still resolves its enclosing values
-    /// because the calling closure passes its own effective scope (which carries
-    /// the same env data) as the parent. Anonymous / non-`var` sibling closures
-    /// stay out of the env (resolved via user_functions / call-site overlay),
-    /// preserving prior behaviour and the leak guard.
+    /// `it()`/`describe()` closures). When the Function's `captured_scope` is
+    /// THIS same env (`current_env`), it is stored with the scope STRIPPED: an
+    /// env-resident Function whose captured_scope is an Arc clone of this same
+    /// env forms a self-referential cycle (env -> Function -> captured_scope ->
+    /// env) that leaks the env on frame exit. Stripping breaks the cycle; the
+    /// helper still resolves its enclosing values because a stripped lexical
+    /// callee adopts the caller's `CLOSURE_FRAME_ENV` (see `fused_parent_merge`).
+    /// A FOREIGN closure — one returned from another function or passed in as an
+    /// argument, whose captured_scope points at a *different* env — must KEEP
+    /// that scope: stripping it is how `return function(){ return counter(); }`
+    /// lost the counter's own captured `n` (GH #549). Anonymous / non-`var`
+    /// sibling closures stay out of the env (resolved via user_functions /
+    /// call-site overlay), preserving prior behaviour and the leak guard.
     fn closure_env_capture_value(
         name: &str,
         value: &CfmlValue,
         declared_locals: &DeclaredLocals,
         params: &[String],
+        current_env: Option<&Arc<RwLock<ValueMap>>>,
     ) -> Option<CfmlValue> {
         match value {
             CfmlValue::Function(f) => {
@@ -35974,16 +35988,24 @@ impl CfmlVirtualMachine {
                 }
                 // A Function that still owns a captured_scope is a named nested
                 // function / real closure: reachable via user_functions, and
-                // re-capturing it would reintroduce the leak cycle. Capture only
-                // when var-scoped (PR #198), stripping the scope to break it.
+                // re-capturing a SAME-env self-reference would reintroduce the
+                // leak cycle. Capture only when var-scoped / a parameter
+                // (PR #198), and strip ONLY when the scope IS this env.
                 let is_var_scoped = declared_locals.contains(name)
                     || params.iter().any(|p| p.eq_ignore_ascii_case(name));
                 if !is_var_scoped {
                     return None;
                 }
-                let mut nf = (**f).clone();
-                nf.captured_scope = None;
-                Some(CfmlValue::Function(Arc::new(nf)))
+                if let (Some(cur), Some(cap)) = (current_env, f.captured_scope.as_ref()) {
+                    if Arc::ptr_eq(cur, cap) {
+                        let mut nf = (**f).clone();
+                        nf.captured_scope = None;
+                        return Some(CfmlValue::Function(Arc::new(nf)));
+                    }
+                }
+                // Foreign closure (different env, or no current_env yet while
+                // seeding a brand-new map): keep its captured_scope intact.
+                Some(value.clone())
             }
             _ => Some(value.clone()),
         }

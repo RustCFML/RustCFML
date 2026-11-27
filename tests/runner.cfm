@@ -64,6 +64,7 @@ include "harness.cfm";
 <!--- undefined". Surfaced in the Wheels suite (helper at top of run() called --->
 <!--- from nested it()/describe() closures). --->
 <cf_runtest file="core/test_closure_captures_local_function.cfm" />
+<cf_runtest file="core/test_nested_closure_preserves_capture.cfm" />
 <cf_runtest file="core/test_recursive_closure_var.cfm" />
 <cf_runtest file="core/test_caller_local_no_leak.cfm" />
 <cf_runtest file="core/test_scope_member_mutators.cfm" />
