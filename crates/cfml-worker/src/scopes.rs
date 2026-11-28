@@ -2,11 +2,12 @@
 //!
 //! Pulls headers, body, query string, etc. from `worker::Request` and feeds
 //! them into the shared `cfml_vm::web::build_web_scopes` helper. Returns the
-//! globals + http_request_data pair the VM expects.
+//! globals + http_request_data + upload_registry triple the VM expects.
 
 #![cfg(target_arch = "wasm32")]
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
+use cfml_vm::web::UploadRegistry;
 use worker::{Method, Request};
 
 /// Extracts request data and builds the four standard CFML scopes.
@@ -17,7 +18,7 @@ pub async fn build_from_request(
     req: &mut Request,
     script_name: &str,
     path_info: &str,
-) -> worker::Result<(ValueMap, CfmlValue)> {
+) -> worker::Result<(ValueMap, CfmlValue, UploadRegistry)> {
     let method = req.method().to_string().to_uppercase();
     let url = req.url()?;
     let query_string = url.query().unwrap_or("").to_string();

@@ -8,7 +8,15 @@
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::Vfs;
 use cfml_common::vm::{CfmlError, CfmlErrorType};
+use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
+
+/// Per-request registry of uploaded `multipart/form-data` file parts, keyed by
+/// lower-cased field name. Multiple parts under one name are kept in arrival
+/// order (GH #546, #547). `form.<field>` holds only the temp path string(s);
+/// `FileUpload` / `FileUploadAll` / `cffile action="upload|uploadAll"` read the
+/// full metadata from here.
+pub type UploadRegistry = IndexMap<String, Vec<ValueMap>>;
 
 /// Result of resolving a URL path to a file.
 #[derive(Clone, Debug)]
@@ -140,8 +148,12 @@ pub enum RequestBody<'a> {
     /// The whole body is in memory.
     Buffered(&'a [u8]),
     /// A multipart body the host already streamed and parsed; file parts are
-    /// on disk and this is the resulting form scope.
-    StreamedForm(ValueMap),
+    /// on disk. `form` holds temp-path strings; `uploads` holds the full
+    /// metadata `FileUpload` needs (GH #546, #547).
+    StreamedForm {
+        form: ValueMap,
+        uploads: UploadRegistry,
+    },
 }
 
 impl<'a> From<&'a [u8]> for RequestBody<'a> {
@@ -224,9 +236,11 @@ fn server_port_from_host(host_header: &str, is_https: bool, listen_port: u16) ->
 
 /// Build CGI, URL, Form, and Cookie scopes from extracted HTTP request data.
 ///
-/// Returns `(globals, http_request_data)` — globals contains the four scopes
-/// keyed by their lowercase names; `http_request_data` is the struct exposed
-/// to CFML as `getHttpRequestData()`.
+/// Returns `(globals, http_request_data, upload_registry)` — globals contains
+/// the four scopes keyed by their lowercase names; `http_request_data` is the
+/// struct exposed to CFML as `getHttpRequestData()`; `upload_registry` holds
+/// per-field uploaded-file metadata for `FileUpload` / `FileUploadAll`
+/// (GH #546, #547).
 pub fn build_web_scopes(
     method: &str,
     headers: &[(String, String)],
@@ -236,7 +250,7 @@ pub fn build_web_scopes(
     query_string: &str,
     port: u16,
     remote_addr: &str,
-) -> (ValueMap, CfmlValue) {
+) -> (ValueMap, CfmlValue, UploadRegistry) {
     let mut globals = ValueMap::default();
 
     let mut cgi = ValueMap::default();
@@ -336,10 +350,12 @@ pub fn build_web_scopes(
     // NOT simply "the body as a string": see `request_body_content` for the
     // Lucee rules, and note that a host which streamed a multipart body never
     // had the bytes to begin with.
-    let (form_scope, body_content) = match body {
+    let (form_scope, body_content, upload_registry) = match body {
         // The host parsed the multipart body off the wire itself and wrote the
         // file parts to disk, so nothing was ever materialised in memory.
-        RequestBody::StreamedForm(form) => (form, CfmlValue::string(String::new())),
+        RequestBody::StreamedForm { form, uploads } => {
+            (form, CfmlValue::string(String::new()), uploads)
+        }
         RequestBody::Buffered(bytes) => {
             if content_type.starts_with("application/x-www-form-urlencoded") {
                 let raw = String::from_utf8_lossy(bytes).to_string();
@@ -348,18 +364,20 @@ pub fn build_web_scopes(
                 } else {
                     parse_query_string(&raw)
                 };
-                (form, CfmlValue::string(raw))
+                (form, CfmlValue::string(raw), UploadRegistry::new())
             } else if content_type.starts_with("multipart/form-data") {
                 // Buffered multipart: the wasm/worker hosts, which have no
                 // filesystem to stream to. `content` stays empty either way —
                 // Lucee's FormImpl.getInputStream() returns an empty stream for
                 // multipart, so nothing downstream can expect the raw envelope.
-                (
-                    parse_multipart_sync(&content_type, bytes),
-                    CfmlValue::string(String::new()),
-                )
+                let (form, uploads) = parse_multipart_sync(&content_type, bytes);
+                (form, CfmlValue::string(String::new()), uploads)
             } else {
-                (ValueMap::default(), request_body_content(&content_type, bytes))
+                (
+                    ValueMap::default(),
+                    request_body_content(&content_type, bytes),
+                    UploadRegistry::new(),
+                )
             }
         }
     };
@@ -403,7 +421,11 @@ pub fn build_web_scopes(
     http_request_data.insert("method".to_string(), CfmlValue::string(method.to_string()));
     http_request_data.insert("protocol".to_string(), CfmlValue::string("HTTP/1.1".to_string()));
 
-    (globals, CfmlValue::strukt(http_request_data))
+    (
+        globals,
+        CfmlValue::strukt(http_request_data),
+        upload_registry,
+    )
 }
 
 /// Parse a query string like `name=World&id=1` into an ordered map.
@@ -667,10 +689,15 @@ pub fn url_decode(s: &str) -> String {
 ///
 /// File uploads are written to the host's temp directory on native targets so
 /// `cffile action="upload"` can move them later. On `wasm32-unknown-unknown`
-/// there is no temp dir; we still expose the metadata + inline content but
-/// `tempFilePath` is empty.
-pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
+/// there is no temp dir; we still expose the metadata but `tempFilePath` is
+/// empty.
+///
+/// Returns `(form, upload_registry)`. `form.<field>` is the temp path string
+/// (comma-joined when several parts share a name); the registry holds the full
+/// metadata structs `FileUpload` / `FileUploadAll` need (GH #546, #547).
+pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> (ValueMap, UploadRegistry) {
     let mut form = ValueMap::default();
+    let mut uploads = UploadRegistry::new();
 
     let boundary = content_type
         .split(';')
@@ -685,7 +712,7 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
 
     let boundary = match boundary {
         Some(b) => b,
-        None => return form,
+        None => return (form, uploads),
     };
 
     let delimiter = format!("--{}", boundary).into_bytes();
@@ -745,21 +772,24 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
             continue;
         }
 
+        // A file input left empty is no upload: nothing on disk, "" in form.
+        if file_name.as_deref().is_some_and(is_empty_file_input) {
+            insert_query_value(&mut form, field_name.to_lowercase(), String::new());
+            continue;
+        }
+
         if let Some(fname) = file_name {
             let client_file = sanitize_upload_filename(&fname);
             let (server_dir, temp_path, saved) = write_multipart_file(part_body);
-
-            form.insert(
-                field_name.to_lowercase(),
-                CfmlValue::strukt(uploaded_file_info(
-                    &client_file,
-                    part_content_type,
-                    server_dir,
-                    temp_path,
-                    part_body.len() as i64,
-                    saved,
-                )),
+            let info = uploaded_file_info(
+                &client_file,
+                part_content_type,
+                server_dir,
+                temp_path.clone(),
+                part_body.len() as i64,
+                saved,
             );
+            record_uploaded_file(&mut form, &mut uploads, field_name.to_lowercase(), temp_path, info);
         } else {
             insert_query_value(
                 &mut form,
@@ -769,7 +799,35 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
         }
     }
 
-    form
+    (form, uploads)
+}
+
+/// Whether a multipart file part is a file input the user left empty.
+///
+/// A browser still sends such an input, as a part with `filename=""` and no
+/// body. Lucee treats it as no upload at all: nothing is written to disk,
+/// `form.<field>` is an empty string (or, when other parts share the name, just
+/// their paths), `FileUpload` on the field throws and `FileUploadAll` leaves it
+/// out. Code that checks `len( form.field )` or `fileExists( form.field )`
+/// before calling `FileUpload` relies on that — Preside's upload preprocessor
+/// does, and would otherwise save an empty file over a record's existing one.
+/// Callers record such a part with [`insert_query_value`] and an empty value.
+pub fn is_empty_file_input(file_name: &str) -> bool {
+    file_name.trim().is_empty()
+}
+
+/// Record one uploaded file part into both the form scope (temp path string)
+/// and the per-request upload registry (full metadata). Repeated names append
+/// to both: form gets a comma-joined path list, the registry a Vec (GH #547).
+pub fn record_uploaded_file(
+    form: &mut ValueMap,
+    registry: &mut UploadRegistry,
+    field_name: String,
+    temp_path: String,
+    info: ValueMap,
+) {
+    registry.entry(field_name.clone()).or_default().push(info);
+    insert_query_value(form, field_name, temp_path);
 }
 
 /// Find the first index of `needle` within `haystack` (byte-level `.find`).
@@ -856,10 +914,12 @@ pub fn sanitize_upload_filename(raw: &str) -> String {
     base
 }
 
-/// Build the `form.<field>` struct describing one uploaded file.
+/// Build the metadata struct describing one uploaded file.
 ///
-/// Shared by the buffered parser here and the CLI's streaming one so the two
-/// cannot drift in what they expose to CFML.
+/// Stored in the per-request [`UploadRegistry`] (not in `form.<field>` —
+/// that holds the temp path string, matching Lucee/ACF; GH #546). Shared by
+/// the buffered parser here and the CLI's streaming one so the two cannot
+/// drift in what `FileUpload` / `FileUploadAll` see.
 pub fn uploaded_file_info(
     client_file: &str,
     part_content_type: Option<String>,
@@ -1004,8 +1064,9 @@ mod tests {
         }
         body.push_str(&format!("--{boundary}--\r\n"));
 
-        let form = parse_multipart_sync(&ct, body.as_bytes());
+        let (form, uploads) = parse_multipart_sync(&ct, body.as_bytes());
         assert_eq!(form.get("cb").map(|v| v.as_string()), Some("value1,value2".to_string()));
+        assert!(uploads.is_empty(), "plain fields must not enter the upload registry");
     }
 
     #[test]
@@ -1108,18 +1169,18 @@ mod tests {
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
-        let form = parse_multipart_sync(&ct, &body);
-        let file = match form.get("upload") {
-            Some(CfmlValue::Struct(s)) => s,
-            other => panic!("expected file struct, got {:?}", other),
-        };
-        match file.get("fileSize") {
-            Some(CfmlValue::Int(n)) => assert_eq!(n, file_bytes.len() as i64),
-            other => panic!("expected fileSize Int, got {:?}", other),
-        }
-        let temp_path = match file.get("tempFilePath") {
+        let (form, uploads) = parse_multipart_sync(&ct, &body);
+        let temp_path = match form.get("upload") {
             Some(CfmlValue::String(p)) => p.to_string(),
-            other => panic!("expected tempFilePath, got {:?}", other),
+            other => panic!("expected temp path string in form, got {:?}", other),
+        };
+        let file = uploads
+            .get("upload")
+            .and_then(|parts| parts.first())
+            .expect("upload registry must hold the part metadata");
+        match file.get("fileSize") {
+            Some(CfmlValue::Int(n)) => assert_eq!(*n, file_bytes.len() as i64),
+            other => panic!("expected fileSize Int, got {:?}", other),
         };
         let written = std::fs::read(&temp_path).expect("temp file should exist");
         let _ = std::fs::remove_file(&temp_path);
@@ -1144,16 +1205,16 @@ mod tests {
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
-        let form = parse_multipart_sync(&ct, &body);
-        let file = match form.get("f") {
-            Some(CfmlValue::Struct(s)) => s,
-            other => panic!("expected file struct, got {:?}", other),
-        };
-        let temp_path = match file.get("tempFilePath") {
+        let (form, uploads) = parse_multipart_sync(&ct, &body);
+        let temp_path = match form.get("f") {
             Some(CfmlValue::String(p)) => p.to_string(),
-            other => panic!("expected tempFilePath, got {:?}", other),
+            other => panic!("expected temp path string in form, got {:?}", other),
         };
         let _ = std::fs::remove_file(&temp_path);
+        let file = uploads
+            .get("f")
+            .and_then(|parts| parts.first())
+            .expect("upload registry must hold the part metadata");
 
         let temp_dir = std::env::temp_dir();
         let parent = std::path::Path::new(&temp_path)
@@ -1169,9 +1230,9 @@ mod tests {
             "the temp path must carry NOTHING from the client filename: {temp_path}"
         );
 
-        // The original name still reaches CFML as metadata, reduced to a bare
-        // basename so `cffile action="upload"` cannot be walked out of its
-        // destination directory either.
+        // The original name still reaches CFML via the upload registry, reduced
+        // to a bare basename so `cffile action="upload"` cannot be walked out
+        // of its destination directory either.
         match file.get("clientFile") {
             Some(CfmlValue::String(name)) => assert_eq!(&name.to_string(), "evil.txt"),
             other => panic!("expected clientFile, got {:?}", other),
@@ -1191,13 +1252,10 @@ mod tests {
             body.extend_from_slice(b"data");
             body.extend_from_slice(b"\r\n");
             body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-            let form = parse_multipart_sync(&ct, &body);
+            let (form, _uploads) = parse_multipart_sync(&ct, &body);
             match form.get("f") {
-                Some(CfmlValue::Struct(s)) => match s.get("tempFilePath") {
-                    Some(CfmlValue::String(p)) => p.to_string(),
-                    other => panic!("expected tempFilePath, got {:?}", other),
-                },
-                other => panic!("expected file struct, got {:?}", other),
+                Some(CfmlValue::String(p)) => p.to_string(),
+                other => panic!("expected temp path string in form, got {:?}", other),
             }
         };
         let a = one(());
@@ -1230,7 +1288,7 @@ mod tests {
         // POST came back as replacement characters — unrecoverable, and up to
         // 3x the size of the body it corrupted.
         let bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0xFF, 0xC0];
-        let (_globals, data) = build_web_scopes(
+        let (_globals, data, _uploads) = build_web_scopes(
             "POST",
             &h(&[("content-type", "application/octet-stream")]),
             RequestBody::Buffered(bytes),
@@ -1255,7 +1313,7 @@ mod tests {
         // Lucee's rule (ReqRspUtil.getRequestBody): no content type, a text mime
         // type, or form-urlencoded means a string; anything else is binary.
         for ct in ["application/json", "text/plain", "application/soap+xml", ""] {
-            let (_globals, data) = build_web_scopes(
+            let (_globals, data, _uploads) = build_web_scopes(
                 "POST",
                 &h(&[("content-type", ct)]),
                 RequestBody::Buffered(b"{\"a\":1}"),
@@ -1292,7 +1350,7 @@ mod tests {
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
-        let (_globals, data) = build_web_scopes(
+        let (_globals, data, _uploads) = build_web_scopes(
             "POST",
             &h(&[("content-type", &ct)]),
             RequestBody::Buffered(&body),
@@ -1315,10 +1373,13 @@ mod tests {
     fn streamed_form_becomes_the_form_scope_verbatim() {
         let mut form = ValueMap::default();
         form.insert("uuid".to_string(), CfmlValue::string("abc".to_string()));
-        let (globals, _data) = build_web_scopes(
+        let (globals, _data, _uploads) = build_web_scopes(
             "POST",
             &h(&[("content-type", "multipart/form-data; boundary=x")]),
-            RequestBody::StreamedForm(form),
+            RequestBody::StreamedForm {
+                form,
+                uploads: UploadRegistry::new(),
+            },
             "/x.cfm",
             "",
             "",
@@ -1345,11 +1406,101 @@ mod tests {
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
-        let form = parse_multipart_sync(&ct, &body);
+        let (form, uploads) = parse_multipart_sync(&ct, &body);
         match form.get("greeting") {
             Some(CfmlValue::String(s)) => assert_eq!(s.as_str(), "héllo wörld"),
             other => panic!("expected greeting String, got {:?}", other),
         }
+        assert!(uploads.is_empty());
+    }
+
+    #[test]
+    fn multipart_file_field_is_a_temp_path_string_and_registry_keeps_all_parts() {
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body: Vec<u8> = Vec::new();
+        for (name, contents) in [("a.txt", b"aaa" as &[u8]), ("b.txt", b"bbb")] {
+            body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"docs\"; filename=\"{name}\"\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(contents);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let (form, uploads) = parse_multipart_sync(&ct, &body);
+        let paths = match form.get("docs") {
+            Some(CfmlValue::String(s)) => s.to_string(),
+            other => panic!("expected comma-joined temp paths, got {:?}", other),
+        };
+        let path_list: Vec<&str> = paths.split(',').collect();
+        assert_eq!(path_list.len(), 2, "both temp paths must appear in form.docs");
+        let parts = uploads.get("docs").expect("registry must keep both parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].get("clientFile").map(|v| v.as_string()).as_deref(),
+            Some("a.txt")
+        );
+        assert_eq!(
+            parts[1].get("clientFile").map(|v| v.as_string()).as_deref(),
+            Some("b.txt")
+        );
+        for path in &path_list {
+            assert!(std::path::Path::new(path).exists(), "temp file must exist: {path}");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// A file input left empty arrives as `filename=""` with no body. Lucee 7.1
+    /// treats it as no upload: `form.<field>` is "", a same-named real file keeps
+    /// only its own path (no empty list element), and nothing reaches the
+    /// upload registry or the disk.
+    #[test]
+    fn an_empty_file_input_is_an_empty_string_and_not_an_upload() {
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body: Vec<u8> = Vec::new();
+        for (name, filename, contents) in [
+            ("empty", "", b"" as &[u8]),
+            ("docs", "", b""),
+            ("docs", "a.txt", b"aaa"),
+            ("docs", "", b""),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; \
+                     filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(contents);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let (form, uploads) = parse_multipart_sync(&ct, &body);
+        match form.get("empty") {
+            Some(CfmlValue::String(s)) => assert_eq!(s.to_string(), "", "an empty input is \"\""),
+            other => panic!("expected an empty string, got {:?}", other),
+        }
+        assert!(uploads.get("empty").is_none(), "an empty input is not an upload");
+
+        let parts = uploads.get("docs").expect("the real file is registered");
+        assert_eq!(parts.len(), 1, "only the real file is registered");
+        let temp_path = parts[0].get("tempFilePath").map(|v| v.as_string()).unwrap_or_default();
+        match form.get("docs") {
+            Some(CfmlValue::String(s)) => assert_eq!(
+                s.to_string(),
+                temp_path,
+                "form.docs is the real file's path alone"
+            ),
+            other => panic!("expected the temp path, got {:?}", other),
+        }
+        let _ = std::fs::remove_file(&temp_path);
     }
 
     #[test]

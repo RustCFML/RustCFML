@@ -1383,7 +1383,21 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
     }
     let cli_vfs: Arc<dyn vfs::Vfs> =
         Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs()));
-    let result = compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, None);
+    let result = compile_and_run(
+        source,
+        debug,
+        source_file,
+        ValueMap::default(),
+        Some(&server_state),
+        None,
+        cfml_vm::web::UploadRegistry::new(),
+        None,
+        cli_vfs,
+        false,
+        None,
+        false,
+        None,
+    );
     // Buffered `<cflog>` lines must reach disk before we return or `exit(1)`
     // — the error path below never unwinds, so no Drop guard would run.
     logging::flush_all();
@@ -1452,12 +1466,27 @@ fn compile_and_run_with_session(
     extra_globals: ValueMap,
     server_state: Option<&ServerState>,
     http_request_data: Option<CfmlValue>,
+    upload_registry: cfml_vm::web::UploadRegistry,
     session_id: Option<String>,
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
     flush_sink: Option<Box<dyn cfml_vm::flush::FlushSink>>,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true, flush_sink)
+    compile_and_run(
+        source,
+        debug,
+        source_file,
+        extra_globals,
+        server_state,
+        http_request_data,
+        upload_registry,
+        session_id,
+        vfs,
+        sandbox,
+        None,
+        true,
+        flush_sink,
+    )
 }
 
 /// Run the Application.cfc lifecycle for a requested template that does NOT
@@ -1474,11 +1503,26 @@ fn run_missing_template(
     extra_globals: ValueMap,
     server_state: Option<&ServerState>,
     http_request_data: Option<CfmlValue>,
+    upload_registry: cfml_vm::web::UploadRegistry,
     session_id: Option<String>,
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true, None)
+    compile_and_run(
+        "",
+        false,
+        Some(would_be_path),
+        extra_globals,
+        server_state,
+        http_request_data,
+        upload_registry,
+        session_id,
+        vfs,
+        sandbox,
+        Some(target_page),
+        true,
+        None,
+    )
 }
 
 /// The stdlib builtin tables, built on first use and copied into every VM.
@@ -1790,6 +1834,7 @@ fn compile_and_run(
     extra_globals: ValueMap,
     server_state: Option<&ServerState>,
     http_request_data: Option<CfmlValue>,
+    upload_registry: cfml_vm::web::UploadRegistry,
     session_id: Option<String>,
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
@@ -1959,6 +2004,9 @@ fn compile_and_run(
 
     // Wire up HTTP request data if provided
     vm.http_request_data = http_request_data;
+    // Per-request uploaded-file metadata (GH #546 / #547). Empty for CLI /
+    // non-multipart requests.
+    vm.upload_registry = upload_registry;
 
     // Wire up session ID
     vm.session_id = session_id;
@@ -3882,8 +3930,8 @@ async fn stream_multipart_form(
     limit: usize,
     max_parts: u32,
     uploads: &mut cfml_vm::upload_temp::UploadTempFiles,
-) -> Result<cfml_common::dynamic::ValueMap, MultipartRejection> {
-    use cfml_common::dynamic::{CfmlValue, ValueMap};
+) -> Result<(cfml_common::dynamic::ValueMap, cfml_vm::web::UploadRegistry), MultipartRejection> {
+    use cfml_common::dynamic::ValueMap;
     use tokio::io::AsyncWriteExt;
 
     let boundary = multer::parse_boundary(content_type)?;
@@ -3900,6 +3948,7 @@ async fn stream_multipart_form(
         multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
     let mut form = ValueMap::default();
+    let mut registry = cfml_vm::web::UploadRegistry::new();
     let mut parts: u32 = 0;
     while let Some(mut field) = multipart.next_field().await? {
         parts += 1;
@@ -3919,6 +3968,15 @@ async fn stream_multipart_form(
             if len > MAX_UPLOAD_FILENAME_CHARS {
                 return Err(MultipartRejection::FilenameTooLong { len });
             }
+        }
+        // A file input left empty is no upload: no temp file, "" in form.
+        if file_name
+            .as_deref()
+            .is_some_and(cfml_vm::web::is_empty_file_input)
+        {
+            while field.chunk().await?.is_some() {}
+            cfml_vm::web::insert_query_value(&mut form, field_name.to_lowercase(), String::new());
+            continue;
         }
         let part_content_type = field.content_type().map(|m| m.to_string());
 
@@ -3961,16 +4019,22 @@ async fn stream_multipart_form(
                 }
                 drop(file);
 
-                form.insert(
+                let info = cfml_vm::web::uploaded_file_info(
+                    &client_file,
+                    part_content_type,
+                    server_dir,
+                    temp_path.clone(),
+                    written,
+                    saved,
+                );
+                // form.<field> = temp path string(s); registry keeps metadata
+                // and every part under a repeated name (GH #546, #547).
+                cfml_vm::web::record_uploaded_file(
+                    &mut form,
+                    &mut registry,
                     field_name.to_lowercase(),
-                    CfmlValue::strukt(cfml_vm::web::uploaded_file_info(
-                        &client_file,
-                        part_content_type,
-                        server_dir,
-                        temp_path,
-                        written,
-                        saved,
-                    )),
+                    temp_path,
+                    info,
                 );
             }
             None => {
@@ -3985,7 +4049,7 @@ async fn stream_multipart_form(
         }
     }
 
-    Ok(form)
+    Ok((form, registry))
 }
 
 /// Run one request on the current (blocking) thread, then settle the upload
@@ -4234,7 +4298,10 @@ async fn handle_request_inner(
         })
         .map(|ct| ct.to_string());
 
-    let mut streamed_form: Option<cfml_common::dynamic::ValueMap> = None;
+    let mut streamed_form: Option<(
+        cfml_common::dynamic::ValueMap,
+        cfml_vm::web::UploadRegistry,
+    )> = None;
     // The upload temp files this request creates. Dropping the guard deletes
     // them, so every return below — a 404, a blocked path, a static file, a
     // parse error — cleans up; the template-running branches move it onto the
@@ -4274,8 +4341,8 @@ async fn handle_request_inner(
             None => read.await,
         };
         match read {
-            Ok(form) => {
-                streamed_form = Some(form);
+            Ok(parsed) => {
+                streamed_form = Some(parsed);
                 body = axum::body::Body::empty();
             }
             Err(e) => {
@@ -4656,7 +4723,7 @@ async fn handle_request_inner(
             };
 
             // Build web scopes using resolved script_name and path_info
-            let (extra_globals, http_request_data) = build_web_scopes(
+            let (extra_globals, http_request_data, upload_registry) = build_web_scopes(
                 &method, &headers, &mut streamed_form, &body_bytes, &rf.script_name, &rf.path_info, &query_string, state.port, &remote_addr,
             );
 
@@ -4713,6 +4780,7 @@ async fn handle_request_inner(
                         extra_globals,
                         Some(&server_state),
                         Some(http_request_data),
+                        upload_registry,
                         session_id_clone,
                         vfs,
                         sandbox,
@@ -4841,7 +4909,7 @@ async fn handle_request_inner(
                 // target_page is web-root-relative, as ColdFusion passes it.
                 let target_page = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
 
-                let (extra_globals, http_request_data) = build_web_scopes(
+                let (extra_globals, http_request_data, upload_registry) = build_web_scopes(
                     &method, &headers, &mut streamed_form, &body_bytes, &target_page, "", &query_string, state.port, &remote_addr,
                 );
 
@@ -4871,6 +4939,7 @@ async fn handle_request_inner(
                             extra_globals,
                             Some(&server_state),
                             Some(http_request_data),
+                            upload_registry,
                             session_id_clone,
                             vfs,
                             sandbox,
@@ -5185,20 +5254,20 @@ use cfml_vm::web::{ResolvedFile, resolve_file};
 fn build_web_scopes(
     method: &str,
     headers: &[(String, String)],
-    streamed_form: &mut Option<ValueMap>,
+    streamed_form: &mut Option<(ValueMap, cfml_vm::web::UploadRegistry)>,
     body_bytes: &[u8],
     script_name: &str,
     path_info: &str,
     query_string: &str,
     port: u16,
     remote_addr: &str,
-) -> (ValueMap, CfmlValue) {
+) -> (ValueMap, CfmlValue, cfml_vm::web::UploadRegistry) {
     // A streamed multipart upload has no body left to pass — its file parts are
     // already on disk and `streamed_form` is what the parse produced. Taking it
     // here (rather than at the callsites) keeps the two serve-handler branches,
     // only one of which ever runs, from having to move the same value.
     let body = match streamed_form.take() {
-        Some(form) => cfml_vm::web::RequestBody::StreamedForm(form),
+        Some((form, uploads)) => cfml_vm::web::RequestBody::StreamedForm { form, uploads },
         None => cfml_vm::web::RequestBody::Buffered(body_bytes),
     };
     cfml_vm::web::build_web_scopes(
@@ -5314,6 +5383,7 @@ fn render_error_response(
                 extra,
                 Some(&state.server_state),
                 None,
+                cfml_vm::web::UploadRegistry::new(),
                 None,
                 state.vfs.clone(),
                 state.sandbox,
@@ -6401,7 +6471,21 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute
-    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false, None) {
+    match compile_and_run(
+        &source,
+        false,
+        Some(entry_path),
+        extra_globals,
+        None,
+        None,
+        cfml_vm::web::UploadRegistry::new(),
+        None,
+        vfs,
+        sandbox,
+        None,
+        false,
+        None,
+    ) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);

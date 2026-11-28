@@ -48,6 +48,7 @@ pub struct RunContext {
     pub vfs: Arc<dyn Vfs>,
     pub extra_globals: ValueMap,
     pub http_request_data: CfmlValue,
+    pub upload_registry: cfml_vm::web::UploadRegistry,
     pub server_state: ServerState,
     pub session_id: Option<String>,
 }
@@ -82,6 +83,7 @@ pub fn cfml_worker_run_sync() {
         ctx.vfs,
         ctx.extra_globals,
         ctx.http_request_data,
+        ctx.upload_registry,
         &ctx.server_state,
         ctx.session_id,
     );

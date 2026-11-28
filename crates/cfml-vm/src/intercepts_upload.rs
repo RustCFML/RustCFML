@@ -401,22 +401,47 @@ impl CfmlVirtualMachine {
 
         if all {
             let mut results = Vec::new();
-            for (_, val) in form.iter() {
-                if let CfmlValue::Struct(file_info) = val {
-                    let temp_path = file_info
-                        .data_get("tempfilepath")
-                        .map(|v| v.as_string())
-                        .unwrap_or_default();
-                    if temp_path.is_empty() {
-                        continue;
+            // Prefer the per-request upload registry so every part under a
+            // repeated field name is returned (GH #547). Fall back to scanning
+            // form for CFML-constructed structs when the registry is empty.
+            if !self.upload_registry.is_empty() {
+                for parts in self.upload_registry.values() {
+                    for file_info in parts {
+                        let temp_path = file_info
+                            .get("tempFilePath")
+                            .or_else(|| file_info.get("tempfilepath"))
+                            .map(|v| v.as_string())
+                            .unwrap_or_default();
+                        if temp_path.is_empty() {
+                            continue;
+                        }
+                        let saved = Self::save_uploaded_file(
+                            file_info,
+                            &destination,
+                            &name_conflict,
+                            &policy,
+                        )?;
+                        results.push(CfmlValue::strukt(saved));
                     }
-                    let saved = Self::save_uploaded_file(
-                        &file_info.snapshot(),
-                        &destination,
-                        &name_conflict,
-                        &policy,
-                    )?;
-                    results.push(CfmlValue::strukt(saved));
+                }
+            } else {
+                for (_, val) in form.iter() {
+                    if let CfmlValue::Struct(file_info) = val {
+                        let temp_path = file_info
+                            .data_get("tempfilepath")
+                            .map(|v| v.as_string())
+                            .unwrap_or_default();
+                        if temp_path.is_empty() {
+                            continue;
+                        }
+                        let saved = Self::save_uploaded_file(
+                            &file_info.snapshot(),
+                            &destination,
+                            &name_conflict,
+                            &policy,
+                        )?;
+                        results.push(CfmlValue::strukt(saved));
+                    }
                 }
             }
             return Ok(CfmlValue::array(results));
@@ -428,6 +453,30 @@ impl CfmlVirtualMachine {
             .to_lowercase()
             .trim_start_matches("form.")
             .to_string();
+
+        // Registry first: when several parts share the field name, take the
+        // first (Lucee parity; GH #547). form.<field> is only the temp path.
+        if let Some(parts) = self.upload_registry.get(&field_lower) {
+            if let Some(file_info) = parts.first() {
+                let has_temp = file_info
+                    .get("tempFilePath")
+                    .or_else(|| file_info.get("tempfilepath"))
+                    .map(|v| !v.as_string().is_empty())
+                    .unwrap_or(false);
+                if has_temp {
+                    let saved = Self::save_uploaded_file(
+                        file_info,
+                        &destination,
+                        &name_conflict,
+                        &policy,
+                    )?;
+                    return Ok(CfmlValue::strukt(saved));
+                }
+            }
+        }
+
+        // Backward compat: CFML code that manually builds a struct in
+        // form.<field> (see tests/tags/test_cffile_upload_accept.cfm).
         if let Some(CfmlValue::Struct(file_info)) = form.data_get(&field_lower) {
             let has_temp = file_info
                 .data_get("tempfilepath")
