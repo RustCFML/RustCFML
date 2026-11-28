@@ -26,12 +26,13 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use cfml_module_abi as abi;
 use cfml_module_abi::{Ctx, HostVtable, NativeClassVtable, StrRef, ValueHandle};
 
+use cfml_codegen::compiler::BytecodeFunction;
 use cfml_common::dynamic::{CfmlArray, CfmlNative, CfmlQuery, CfmlStruct, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 
-/// The tier this host implements. Values only, for now; tier 2 appends scope
-/// access to the vtable without breaking anything already published.
-pub const HOST_TIER: u32 = abi::tier::EXECUTION;
+/// The tier this host implements. Each tier appends vtable entries and changes
+/// none, so an extension declaring a lower tier loads and runs unchanged.
+pub const HOST_TIER: u32 = abi::tier::EXCEPTIONS;
 
 const CTX_MAGIC: u64 = 0x5243464d_4c435458; // "RCFMLCTX"
 
@@ -47,6 +48,10 @@ struct CallState {
     handles: Vec<ValueHandle>,
     generation: u32,
     error: Option<CfmlError>,
+    /// Errors the module took out of `error` with `error_take` (tier 4): no
+    /// longer pending, kept for the rest of the call so `error_restore` can
+    /// put one back exactly as it was. Dropped, unraised, when the call ends.
+    caught: Vec<CfmlError>,
 }
 
 /// The scopes a module may only WRITE while holding that scope's lock.
@@ -152,6 +157,7 @@ fn acquire() -> CallState {
     state.slab.clear();
     state.handles.clear();
     state.error = None;
+    state.caught.clear();
     // Wrapping is fine: a collision needs 4 billion intervening calls AND a
     // handle held across all of them, which the borrow checker in the wrapper
     // crate already prevents.
@@ -163,6 +169,7 @@ fn release(mut state: CallState) {
     state.slab.clear();
     state.handles.clear();
     state.error = None;
+    state.caught.clear();
     POOL.with(|p| {
         let mut pool = p.borrow_mut();
         if pool.len() < 8 {
@@ -873,6 +880,11 @@ pub static HOST_VTABLE: HostVtable = HostVtable {
     component_metadata: h_component_metadata,
     write_output: h_write_output,
     include_template: h_include_template,
+    // ---- tier 4 ----
+    error_take: h_error_take,
+    error_restore: h_error_restore,
+    call_value_named: h_call_value_named,
+    invoke_method_named: h_invoke_method_named,
 };
 
 // ---------------------------------------------------------------------------
@@ -1994,23 +2006,54 @@ unsafe extern "C" fn h_unlock(raw: *mut Ctx, token: u64) -> u32 {
 /// list. A `CfmlValue` parked here holds its `Arc`, this table is not in the
 /// survivor set, so the value reads as externally owned and is protected. There
 /// is a test for exactly that, because "it should follow" is not evidence.
-static ROOTS: Mutex<Option<(u64, HashMap<u64, CfmlValue>)>> = Mutex::new(None);
+static ROOTS: Mutex<Option<(u64, HashMap<u64, RootEntry>)>> = Mutex::new(None);
+
+/// A rooted value, and the bytecode of every function reachable from it.
+///
+/// A stored function value carries only a `global_id`; its body lives in
+/// whatever holds the `BytecodeFunction` — the template cache, a request's
+/// registry, an application's function table. A closure kept in `application`
+/// is re-homed into that table at request end, so it stays callable after its
+/// defining request has gone and its template has been recompiled or evicted.
+/// A closure kept only here is invisible to that walk, so the root pins the
+/// bytecode itself, captured while the rooting call's VM was in hand, and
+/// registers it into whichever VM later brings the value back. That is the
+/// same reachability walk, rooted at one value, that the socket.io handler
+/// registry uses for the same reason — and what Lucee gets for free, because a
+/// stored UDF holds a reference to its own compiled class.
+struct RootEntry {
+    value: CfmlValue,
+    fns: Arc<[Arc<BytecodeFunction>]>,
+}
 
 unsafe extern "C" fn h_root(raw: *mut Ctx, h: ValueHandle, out: *mut u64) -> u32 {
     let v = out_or!(value_of(raw, h), abi::status::BAD_HANDLE);
+    let fns: Arc<[Arc<BytecodeFunction>]> = match vm_of(raw) {
+        Some(vm) => vm.collect_reachable_fn_arcs(&v).into(),
+        None => Arc::from(Vec::new()),
+    };
     let mut guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
     let table = guard.get_or_insert_with(|| (0, HashMap::new()));
     table.0 += 1;
     let id = table.0;
-    table.1.insert(id, v);
+    table.1.insert(id, RootEntry { value: v, fns });
     *out = id;
     abi::status::OK
 }
 
 unsafe extern "C" fn h_unroot(id: u64) -> u32 {
-    let mut guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
-    match guard.as_mut().and_then(|t| t.1.remove(&id)) {
-        Some(_) => abi::status::OK,
+    let removed = {
+        let mut guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_mut().and_then(|t| t.1.remove(&id))
+    };
+    match removed {
+        // Dropped after the lock is released, deliberately: the last reference
+        // to a native object runs its module's `drop_fn`, which may drop a
+        // `Rooted` of its own and re-enter this lock.
+        Some(entry) => {
+            drop(entry);
+            abi::status::OK
+        }
         None => abi::status::NOT_FOUND,
     }
 }
@@ -2018,10 +2061,20 @@ unsafe extern "C" fn h_unroot(id: u64) -> u32 {
 unsafe extern "C" fn h_root_get(raw: *mut Ctx, id: u64) -> ValueHandle {
     let found = {
         let guard = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().and_then(|t| t.1.get(&id).cloned())
+        guard
+            .as_ref()
+            .and_then(|t| t.1.get(&id))
+            .map(|e| (e.value.clone(), Arc::clone(&e.fns)))
     };
     match found {
-        Some(v) => make(raw, v),
+        Some((v, fns)) => {
+            // Make the pinned bytecode resolvable in THIS request before
+            // anything can call it. A no-op for functions it already has.
+            if let Some(vm) = vm_of(raw) {
+                vm.register_carried_fns(&fns);
+            }
+            make(raw, v)
+        }
         None => ValueHandle::NULL,
     }
 }
@@ -2237,5 +2290,97 @@ unsafe extern "C-unwind" fn h_include_template(raw: *mut Ctx, path: StrRef) -> u
             stage_err(raw, e);
             1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 4 — CFML exceptions as data, named arguments
+// ---------------------------------------------------------------------------
+
+/// The exception as CFML's own `catch ( any e )` would see it.
+///
+/// Built by the same code a catch block uses, so `tagContext`, `stackTrace`,
+/// `rootCause` and anything a `throw()` attached (`detail`, `errorCode`,
+/// `extendedInfo`, a driver's `SQLState`) are exactly what CFML would get.
+/// With no VM (a ctx from `on_load`) there is no template position to report,
+/// so the tag context is empty.
+unsafe fn exception_struct(raw: *mut Ctx, e: &CfmlError) -> CfmlValue {
+    match vm_of(raw) {
+        Some(vm) => vm.resolve_catch_error_val(e),
+        None => crate::CfmlVirtualMachine::build_error_struct(
+            e,
+            CfmlValue::Array(CfmlArray::new(Vec::new())),
+        ),
+    }
+}
+
+unsafe extern "C" fn h_error_take(raw: *mut Ctx, info: *mut ValueHandle, token: *mut u64) -> u32 {
+    let (err, generation, index) = {
+        let Some(state) = state_of(raw) else { return abi::status::BAD_CTX };
+        match state.error.as_ref() {
+            None => return abi::status::NOT_FOUND,
+            // Not an exception: the request is ending. CFML's `catch( any )`
+            // cannot stop it either, and an extension must not be able to
+            // keep a timed-out or aborted request running.
+            Some(e) if crate::CfmlVirtualMachine::is_control_flow_error(e) => {
+                return abi::status::NOT_CATCHABLE
+            }
+            Some(_) => {}
+        }
+        let Some(err) = state.error.take() else { return abi::status::NOT_FOUND };
+        (err, state.generation, state.caught.len())
+    };
+    let described = exception_struct(raw, &err);
+    let Some(state) = state_of(raw) else { return abi::status::BAD_CTX };
+    state.caught.push(err);
+    *token = (u64::from(generation) << 32) | index as u64;
+    *info = make(raw, described);
+    abi::status::OK
+}
+
+unsafe extern "C" fn h_error_restore(raw: *mut Ctx, token: u64) -> u32 {
+    let Some(state) = state_of(raw) else { return abi::status::BAD_CTX };
+    if (token >> 32) as u32 != state.generation {
+        return abi::status::NOT_FOUND;
+    }
+    let Some(err) = state.caught.get((token & 0xffff_ffff) as usize) else {
+        return abi::status::NOT_FOUND;
+    };
+    // First error wins, exactly as for `throw`.
+    if state.error.is_none() {
+        state.error = Some(err.clone());
+    }
+    abi::status::OK
+}
+
+unsafe extern "C-unwind" fn h_call_value_named(
+    raw: *mut Ctx,
+    callee: ValueHandle,
+    args: ValueHandle,
+) -> ValueHandle {
+    let f = out_or!(value_of(raw, callee), ValueHandle::NULL);
+    let named = out_or!(value_of(raw, args), ValueHandle::NULL);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    match vm.call_value_named_public(&f, named, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
+    }
+}
+
+unsafe extern "C-unwind" fn h_invoke_method_named(
+    raw: *mut Ctx,
+    object: ValueHandle,
+    name: StrRef,
+    args: ValueHandle,
+) -> ValueHandle {
+    let obj = out_or!(value_of(raw, object), ValueHandle::NULL);
+    let named = out_or!(value_of(raw, args), ValueHandle::NULL);
+    let method = str_in(name);
+    let locals = locals_of(raw).clone();
+    let Some(vm) = vm_of(raw) else { return ValueHandle::NULL };
+    match vm.invoke_method_named_public(&obj, &method, named, &locals) {
+        Ok(v) => make(raw, v),
+        Err(e) => stage_err(raw, e),
     }
 }

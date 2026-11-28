@@ -350,6 +350,70 @@ Rooted values are visible to the cycle collector, so a cache cannot be collected
 out from under you. The flip side: a `Rooted` you never drop is a leak for the
 life of the process.
 
+`Rooted` is an id, so it is `Send + Sync`: keep it in a class field, a `static`,
+a map, and drop it on any thread — releasing needs no `ctx`. Bringing the value
+back does: `rooted.get( ctx )` hands you a `Value` for the call in progress,
+like any other. (A value that has been released comes back as a null.)
+
+#### Keeping a closure to call later
+
+The value can be a closure, or a component instance — which is how
+`page.on( "console", fn )`, a SQL function backed by CFML, or an agent's tool
+callback is built. A tier-3 extension keeps it in one call and calls it in a
+later one, possibly in a later request:
+
+```rust
+"on" => {                                     // emitter.on( fn )
+    self.handlers.lock().unwrap().push( ctx.root( args[0] )? );
+    Ok( ctx.this() )
+}
+"emit" => {                                   // emitter.emit( payload ), any later call
+    let handlers: Vec<Value> =
+        self.handlers.lock().unwrap().iter().map( |h| h.get( ctx ) ).collect();
+    for h in handlers {                       // the lock is released before CFML runs:
+        h.call_as_fn( &[ args[0] ] )?;        // a handler may call back into this object
+    }
+    Ok( ctx.null() )
+}
+```
+
+What the closure sees when it runs is what the same closure kept in
+`application` scope sees, because it is the same value:
+
+- **Its own captures are live.** A function's `local` variables it closed over,
+  a component's `variables` and `this`: shared with every other holder of the
+  closure, and every call sees the last one's changes. They stay alive until
+  the last `Rooted` (and every other reference) is dropped.
+- **The dynamic scopes are the caller's.** `request`, `session`, `url`, `form`,
+  `cgi` and `cookie` belong to the request whose `ctx` calls the closure, not
+  the one that created it; `application` is the live application. That is what
+  Lucee does when an extension keeps a `UDF` and calls `udf.call( pc, … )` with
+  the current `PageContext`, and the only answer that cannot leak one user's
+  request into another's.
+- **It runs on the calling thread, which is a CFML thread.** A `ctx` exists
+  only inside a call, on the thread running that call, and cannot be sent to
+  another (`Ctx` is neither `Send` nor `Sync`). So there is no way to run CFML
+  from an extension's own threads. Work on another thread — an async runtime, a
+  C library's callback — hands the call back to the CFML thread that is waiting
+  for it, over a channel, and that thread makes the call. A `cfthread` body
+  runs on a CFML thread like any other, with its request's scopes.
+- **Its body survives its request.** A function value carries only an id; its
+  bytecode lives in the template cache, the request, or the application. A
+  root pins the bytecode of every function reachable from the value, so a kept
+  closure still runs after the request that compiled it has gone and its
+  template has been recompiled or evicted — as one kept in `application` does.
+
+Concurrent calls of one kept closure from several requests run concurrently,
+exactly as they would through `application` scope: unsynchronised updates to its
+captured variables race in the same way, and `<cflock>` inside the closure (or
+around the call) is the remedy, as it is in CFML.
+
+One place where RustCFML's closures differ from Lucee's applies here as it does
+in CFML (it is not specific to extensions): a closure defined at **page
+level** loses the page's `variables` when that page's request ends
+([known-issues §122](known-issues.md#122)). Build kept closures in a function —
+as above, or in `onApplicationStart` — rather than at page level.
+
 ### Checking the host is new enough
 
 An extension built against tier 2 and loaded by a tier-1 engine gets a legible
@@ -419,10 +483,112 @@ its output goes to the buffer. Well defined, rather than guessing whose
 
 ### Errors from re-entrant CFML
 
-When CFML you called throws, that error is what your caller sees — the module's
-own `Err` on the way out does not replace it. First error wins, deliberately: a
-precise "no such component" or a lock timeout is worth more than a generic
-"[newComponent] failed" wrapped around it.
+When CFML you called throws, the call returns `Err` and the CFML error is left
+**pending** in your call. A pending error is what your caller sees when your
+call returns — whatever you return, `Err` or `Ok`. First error wins,
+deliberately: a precise "no such component" or a lock timeout is worth more than
+a generic message wrapped around it, so `?` always propagates the CFML error
+exactly as CFML raised it, type, detail and tag context included.
+
+The `Err` itself carries the CFML error's message and type (`custom_type` is
+`my.tool` for a `throw( type = "my.tool" )`) on an engine that provides tier 4;
+an older one says `[function value] failed`.
+Ignoring the `Err` and returning normally does **not** handle the error: it is
+still pending, and still raised. To handle it, catch it (tier 4, below).
+
+The error reaches the CFML `catch` around your call, too: if the page that called
+your function sits inside `try`, the CFML you called back into throws, and you
+propagate, that `catch` runs. (Earlier engines lost the error there when the
+extension function was compile-time bound, which every installed one is: the
+callee consumed the outer `try`'s handler from inside its own frame and
+execution carried on as if nothing had been thrown.)
+
+## Catching CFML errors, named arguments (tier 4)
+
+### Catching an error as data
+
+```rust
+match tool.try_call_as_fn( &[ input ] ) {
+    Ok( v )  => Ok( v ),
+    // The CFML `throw()` becomes data, and the run carries on.
+    Err( e ) => Ok( ctx.string( format!( "Error: {} ({})", e.message, e.error_type ) ) ),
+}
+```
+
+A `try_` call — `ctx.try_call`, `value.try_call_as_fn`, `value.try_invoke` —
+returns a CFML error as a `CfmlException` instead of leaving it pending.
+Holding one means the error is **handled**: it will not be raised when your call
+returns. It carries `error_type`, `message`, `detail`, `extended_info` and
+`error_code`, and `info()` is the full struct a CFML `catch ( any e )` would get —
+`tagContext`, `stackTrace`, `rootCause` and anything a `throw()` attached. That
+is the shape an agent's tool loop needs: a tool that throws becomes a result the
+model reads, not the end of the run.
+
+Three ways out of a caught exception:
+
+```rust
+Err( e ) => Ok( describe( e ) ),                        // handled
+Err( e ) => Err( e.rethrow() ),                         // raised again, unchanged
+Err( e ) => Err( Error::custom( "my.ext", "…" ) ),      // replaced by your own
+```
+
+`rethrow()` — and `?`, which does the same — puts the ORIGINAL error back exactly
+as CFML threw it, so propagating a caught exception loses nothing.
+
+Anything that calls CFML can be caught: `ctx.catching( || … )` runs a closure and
+catches what it raises, for the calls with no `try_` twin (`new_component`,
+`include`, `component_metadata`, a lock timeout, the named calls below):
+
+```rust
+let made = ctx.catching( || ctx.new_component( "services.Mailer", &[] ) );
+```
+
+`ctx.take_error()` is the primitive under both: it takes whatever is pending —
+say after a plain call whose `Err` you have decided to handle — and returns
+`None` when nothing is.
+
+**A request ending is not an exception.** An `abort`, a `cflocation` redirect or
+a request timeout cannot be taken: as `catch( any )` cannot stop one in CFML, an
+extension cannot keep an aborted or timed-out request running. The `try_` call
+still returns `Err` — check `e.ends_request()` — and the request ends when your
+call returns, whatever you return. Return promptly.
+
+**Output capture is put back.** If the CFML you called opened a `savecontent`
+(or `silent`, or a custom tag) and threw inside it, the capture is closed when
+the error reaches you — where Lucee's `finally` blocks would close it — so what
+you or the page write afterwards goes where it should.
+
+**Lucee parity.** A Java extension calling `udf.call( pc, … )` gets a
+`PageException` it can catch, inspect and swallow; this is the same. For CFML
+the only change is the fix above — an error thrown through an extension reaches
+the `catch` around it. An extension that does not catch raises exactly what it
+raised before, and an extension built before tier 4, which cannot catch,
+behaves as it did.
+
+### Named arguments
+
+```rust
+// args: { "city": "Paris", "days": 2 } — from a model, a form, a config file
+tool.call_as_fn_named( args )?;            // function( city, days = 1 )
+service.invoke_named( "forecast", args )?; // a method, the same way
+```
+
+The ABI form of `fn( argumentCollection = args )` and of
+`invoke( object, method, args )`: a struct's keys bind to parameter names
+whatever order they arrive in, an omitted optional takes its default, a key
+that matches no parameter lands in `arguments`, and a positive-integer key is
+positional, as in CFML. An array is positional. Lucee's equivalent is
+`udf.callWithNamedValues`. Named arguments need a user-defined function or
+closure; a built-in is refused with a clear error. Catch a named call's errors
+with `ctx.catching`.
+
+### Declaring tier 4
+
+`module! { …, tier: abi::tier::EXCEPTIONS, … }`. An engine older than that
+refuses the extension at load, naming both tiers. An extension that declares
+tier 3 and uses these calls anyway still runs on an older engine: `take_error()`
+returns `None` and the `try_` calls behave like the plain ones (the error stays
+pending), and a named call returns an error saying which tier it needs.
 
 ---
 
@@ -621,11 +787,11 @@ rustc built the engine. The compatibility token is just
 printed.
 
 The host's service table is **size-versioned and append-only**, and every entry
-point takes a `ctx` from day one. Scope access (tier 2) and CFML execution
-(tier 3) will therefore *append* entries rather than change any signature: an
-extension published today keeps working, and an extension built against a newer
-ABI degrades on an older engine with a legible message instead of jumping
-through uninitialised memory.
+point takes a `ctx` from day one. Scope access (tier 2), CFML execution (tier 3)
+and catchable errors with named arguments (tier 4) therefore *appended* entries
+rather than changing any signature: an extension published earlier keeps
+working, and an extension built against a newer ABI degrades on an older engine
+with a legible message instead of jumping through uninitialised memory.
 
 Measured on an M-series Mac, per call:
 
@@ -658,11 +824,12 @@ answer.
 - **An extension is trusted code**, exactly like a Lucee `.lex`: arbitrary
   native code with full process privilege. The manifest digests protect against
   a corrupted download, not a hostile author. This is not a sandbox.
-- **Tier 3 today** — the full surface. An extension can compute over CFML values,
+- **Tier 4 today** — the full surface. An extension can compute over CFML values,
   hold Rust state, read and write scopes, take the locks CFML takes, keep values
-  alive across requests, and **run CFML**: call functions and closures,
-  instantiate components, invoke methods, inject dependencies, read metadata,
-  write page output and include templates.
+  — closures included — alive across requests, and **run CFML**: call functions
+  and closures (by position or by name), instantiate components, invoke methods,
+  inject dependencies, read metadata, write page output and include templates,
+  and catch, inspect and handle or re-raise the errors that CFML raises.
 - **No signing yet.** Manifest digests catch a corrupted download, not a hostile
   author.
 - **macOS:** downloaded libraries are quarantined by Gatekeeper and would fail

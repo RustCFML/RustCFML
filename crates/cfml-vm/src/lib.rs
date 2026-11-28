@@ -13000,6 +13000,7 @@ impl CfmlVirtualMachine {
                                         &val,
                                         &declared_locals,
                                         &func.params,
+                                        Some(env),
                                     ) {
                                         m.insert(name, cv);
                                     }
@@ -16071,9 +16072,13 @@ impl CfmlVirtualMachine {
                         Some(ref env) => {
                             let mut m = env.write().unwrap();
                             for (k, v) in &locals {
-                                if let Some(cv) =
-                                    Self::closure_env_capture_value(k, v, &declared_locals, &func.params)
-                                {
+                                if let Some(cv) = Self::closure_env_capture_value(
+                                    k,
+                                    v,
+                                    &declared_locals,
+                                    &func.params,
+                                    Some(env),
+                                ) {
                                     m.insert(k.clone(), cv);
                                 }
                             }
@@ -16082,9 +16087,13 @@ impl CfmlVirtualMachine {
                         None => {
                             let mut seed = ValueMap::default();
                             for (k, v) in locals.iter() {
-                                if let Some(cv) =
-                                    Self::closure_env_capture_value(k, v, &declared_locals, &func.params)
-                                {
+                                if let Some(cv) = Self::closure_env_capture_value(
+                                    k,
+                                    v,
+                                    &declared_locals,
+                                    &func.params,
+                                    None,
+                                ) {
                                     seed.insert(k.clone(), cv);
                                 }
                             }
@@ -17628,6 +17637,7 @@ impl CfmlVirtualMachine {
                             &value,
                             &declared_locals,
                             &func.params,
+                            Some(env),
                         ) {
                             let mut m = env.write().unwrap();
                             Self::env_own_write(&mut m, &mut env_reconciled_version, |m| {
@@ -18418,6 +18428,47 @@ impl CfmlVirtualMachine {
         None
     }
 
+    /// Run CFML on behalf of an extension as a call site of its own.
+    ///
+    /// **The calling frame's `try` handlers are set aside**, exactly as the
+    /// `Call` op sets them aside around every CFML call (and
+    /// `include_for_extension` around its template). Without this, CFML an
+    /// extension called that threw while the CFML which called the EXTENSION
+    /// sat inside a `try` found that outer `try`'s handler on the stack, popped
+    /// it, and jumped to its `catch_ip` inside the callee's own bytecode: the
+    /// error vanished, the wrong instructions ran, and the page's `catch` never
+    /// fired. A compile-time-bound extension BIF (`CallBuiltin`) is dispatched
+    /// without the `Call` op's isolation, which is how every installed `.rcx`
+    /// reached this.
+    ///
+    /// **On failure, the output-capture state is put back** to what it was on
+    /// entry — open `savecontent`/`silent` captures, custom-tag and base-tag
+    /// ancestry, query-loop cursors — as a CFML `catch` puts it back. Here
+    /// that happens at the extension boundary, where Lucee's own `finally`
+    /// blocks would have unwound it, rather than at whichever CFML `catch`
+    /// eventually handles the error: since tier 4 the extension may handle the
+    /// error itself, and then there is no CFML `catch` at all.
+    fn for_extension<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, CfmlError>,
+    ) -> Result<T, CfmlError> {
+        let entry = TryHandler {
+            catch_ip: 0,
+            stack_depth: 0,
+            saved_buffers_depth: self.saved_output_buffers.len(),
+            custom_tag_depth: self.custom_tag_stack.len(),
+            base_tag_depth: self.base_tag_stack.len(),
+            for_in_cursor_depth: self.for_in_cursors.len(),
+        };
+        let saved_try_stack = std::mem::take(&mut self.try_stack);
+        let result = f(self);
+        self.try_stack = saved_try_stack;
+        if result.is_err() {
+            self.restore_capture_state(&entry);
+        }
+        result
+    }
+
     /// Call a function value. The extension-facing entry point for tier 3.
     pub(crate) fn call_value_public(
         &mut self,
@@ -18425,7 +18476,7 @@ impl CfmlVirtualMachine {
         args: Vec<CfmlValue>,
         locals: &ValueMap,
     ) -> CfmlResult {
-        self.call_function(callee, args, locals)
+        self.for_extension(|vm| vm.call_function(callee, args, locals))
     }
 
     /// `createObject( "component", path )` with constructor arguments, for a
@@ -18442,7 +18493,7 @@ impl CfmlVirtualMachine {
         // extension gets the same inheritance chain, `implements` resolution,
         // security policy and `init` handling that CFML does.
         let callee = Self::builtin_fn_value("createObject");
-        self.call_function(&callee, call_args, locals)
+        self.for_extension(|vm| vm.call_function(&callee, call_args, locals))
     }
 
     /// Invoke a method on a component or native object, for a tier-3 extension.
@@ -18454,7 +18505,61 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> CfmlResult {
         let mut extra = args;
-        self.call_member_function(object, method, &mut extra, None, locals)
+        self.for_extension(|vm| vm.call_member_function(object, method, &mut extra, None, locals))
+    }
+
+    /// Call a function value with NAMED arguments, for a tier-4 extension — the
+    /// ABI form of `fn( argumentCollection = args )`, and Lucee's
+    /// `UDF.callWithNamedValues`.
+    ///
+    /// `args` is read exactly as `invoke()` reads its argument collection: a
+    /// struct binds by parameter name (a positive-integer key is positional, an
+    /// unmatched key lands in `arguments`), an array is positional. Binding goes
+    /// through the same reorder a CFML named call uses.
+    pub(crate) fn call_value_named_public(
+        &mut self,
+        callee: &CfmlValue,
+        args: CfmlValue,
+        locals: &ValueMap,
+    ) -> CfmlResult {
+        let is_udf = matches!(callee, CfmlValue::Function(f) if cfml_function_gid(f) >= 0);
+        if !is_udf {
+            return Err(CfmlError::runtime(format!(
+                "named arguments need a user-defined function or closure, not a value of type {}; \
+                 call a built-in function by name instead",
+                callee.type_name()
+            )));
+        }
+        let (values, names) = self.invoke_args_to_named(args);
+        let (positional, extras) =
+            Self::reorder_named_args_with_extras(callee, Some(&names), values);
+        // Isolate this call's extras: whatever was pending belongs to someone
+        // else, and anything left unconsumed must not leak into a later call.
+        let outer_extras = self.pending_extra_named_args.take();
+        self.pending_extra_named_args = if extras.is_empty() { None } else { Some(extras) };
+        let result = self.for_extension(|vm| vm.call_function(callee, positional, locals));
+        self.pending_extra_named_args = outer_extras;
+        result
+    }
+
+    /// Invoke a method with NAMED arguments, for a tier-4 extension —
+    /// `invoke( object, method, args )`, dispatched the way the `invoke()` BIF
+    /// dispatches it.
+    pub(crate) fn invoke_method_named_public(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        args: CfmlValue,
+        locals: &ValueMap,
+    ) -> CfmlResult {
+        let (mut values, names) = self.invoke_args_to_named(args);
+        let result = self.for_extension(|vm| {
+            vm.call_member_function(object, method, &mut values, Some(&names), locals)
+        });
+        // As `invoke()` does: there is no calling CFML frame for the method's
+        // `this` write-back to land on.
+        self.method_this_writeback = None;
+        result
     }
 
     /// `getComponentMetadata( path )`, for a tier-3 extension. Annotation-driven
@@ -18466,7 +18571,7 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> CfmlResult {
         let callee = Self::builtin_fn_value("getComponentMetadata");
-        self.call_function(&callee, vec![CfmlValue::string(path)], locals)
+        self.for_extension(|vm| vm.call_function(&callee, vec![CfmlValue::string(path)], locals))
     }
 
     /// Append to page output, honouring whatever capture is in effect
@@ -18484,6 +18589,10 @@ impl CfmlVirtualMachine {
     /// scope and discards what it defined; its output goes to the buffer. Well
     /// defined, rather than guessing whose `variables` scope to touch.
     pub(crate) fn include_for_extension(&mut self, path: &str) -> Result<(), CfmlError> {
+        self.for_extension(|vm| vm.include_template_for_extension(path))
+    }
+
+    fn include_template_for_extension(&mut self, path: &str) -> Result<(), CfmlError> {
         let path = if path.starts_with('/') || path.starts_with('\\') {
             format!("/{}", path.trim_start_matches(['/', '\\']))
         } else {
@@ -35943,21 +36052,25 @@ impl CfmlVirtualMachine {
     /// var-scoped function EXPRESSION like `var fn = function(){…}` — so that a
     /// nested closure can resolve it by bare name (PR #198: Wheels/TestBox
     /// define a helper at the top of `run()` and call it from inside
-    /// `it()`/`describe()` closures). Crucially it is captured with
-    /// `captured_scope` STRIPPED: an env-resident Function whose captured_scope
-    /// is an Arc clone of this same env forms a self-referential cycle (env ->
-    /// Function -> captured_scope -> env) that leaks the env on frame exit (the
-    /// reason Functions were historically excluded wholesale). Stripping the
-    /// scope breaks the cycle; the helper still resolves its enclosing values
-    /// because the calling closure passes its own effective scope (which carries
-    /// the same env data) as the parent. Anonymous / non-`var` sibling closures
-    /// stay out of the env (resolved via user_functions / call-site overlay),
-    /// preserving prior behaviour and the leak guard.
+    /// `it()`/`describe()` closures). When the Function's `captured_scope` is
+    /// THIS same env (`current_env`), it is stored with the scope STRIPPED: an
+    /// env-resident Function whose captured_scope is an Arc clone of this same
+    /// env forms a self-referential cycle (env -> Function -> captured_scope ->
+    /// env) that leaks the env on frame exit. Stripping breaks the cycle; the
+    /// helper still resolves its enclosing values because a stripped lexical
+    /// callee adopts the caller's `CLOSURE_FRAME_ENV` (see `fused_parent_merge`).
+    /// A FOREIGN closure — one returned from another function or passed in as an
+    /// argument, whose captured_scope points at a *different* env — must KEEP
+    /// that scope: stripping it is how `return function(){ return counter(); }`
+    /// lost the counter's own captured `n` (GH #549). Anonymous / non-`var`
+    /// sibling closures stay out of the env (resolved via user_functions /
+    /// call-site overlay), preserving prior behaviour and the leak guard.
     fn closure_env_capture_value(
         name: &str,
         value: &CfmlValue,
         declared_locals: &DeclaredLocals,
         params: &[String],
+        current_env: Option<&Arc<RwLock<ValueMap>>>,
     ) -> Option<CfmlValue> {
         match value {
             CfmlValue::Function(f) => {
@@ -35984,16 +36097,24 @@ impl CfmlVirtualMachine {
                 }
                 // A Function that still owns a captured_scope is a named nested
                 // function / real closure: reachable via user_functions, and
-                // re-capturing it would reintroduce the leak cycle. Capture only
-                // when var-scoped (PR #198), stripping the scope to break it.
+                // re-capturing a SAME-env self-reference would reintroduce the
+                // leak cycle. Capture only when var-scoped / a parameter
+                // (PR #198), and strip ONLY when the scope IS this env.
                 let is_var_scoped = declared_locals.contains(name)
                     || params.iter().any(|p| p.eq_ignore_ascii_case(name));
                 if !is_var_scoped {
                     return None;
                 }
-                let mut nf = (**f).clone();
-                nf.captured_scope = None;
-                Some(CfmlValue::Function(Arc::new(nf)))
+                if let (Some(cur), Some(cap)) = (current_env, f.captured_scope.as_ref()) {
+                    if Arc::ptr_eq(cur, cap) {
+                        let mut nf = (**f).clone();
+                        nf.captured_scope = None;
+                        return Some(CfmlValue::Function(Arc::new(nf)));
+                    }
+                }
+                // Foreign closure (different env, or no current_env yet while
+                // seeding a brand-new map): keep its captured_scope intact.
+                Some(value.clone())
             }
             _ => Some(value.clone()),
         }
@@ -37151,6 +37272,22 @@ impl CfmlVirtualMachine {
             }
         }
         ids.into_iter().filter_map(|gid| self.resolve_fn(gid)).collect()
+    }
+
+    /// Register function `Arc`s carried from another request (a value an
+    /// extension rooted, see `foreign::RootEntry`) into THIS one, so the value
+    /// resolves here exactly as it did where it was created. A function this VM
+    /// already has is skipped before anything is touched, so a value resolved
+    /// on every call costs a registry probe per function, not a trip through
+    /// the shared registry's lock.
+    pub(crate) fn register_carried_fns(&mut self, fns: &[Arc<BytecodeFunction>]) {
+        for f in fns {
+            let id = f.global_id as usize;
+            if self.fn_registry.get(id).is_some_and(|slot| slot.is_some()) {
+                continue;
+            }
+            self.register_fn(f);
+        }
     }
 
     /// Set every savepoint already recorded for this transaction on the

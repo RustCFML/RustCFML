@@ -20,9 +20,10 @@ assertTrue("xmlChildren has elements", arrayLen(children) > 0);
 assert("first child name", children[1].xmlName, "item");
 assert("first child text", children[1].xmlText, "test");
 
-// --- xmlSearch ---
+// --- xmlSearch (basic; full XPath coverage in test_xml_search_xpath.cfm / GH ##548) ---
 results = xmlSearch(doc, "//item");
 assertTrue("xmlSearch finds elements", arrayLen(results) > 0);
+assert("xmlSearch //item count", arrayLen(results), 1);
 
 // --- named child access derefs to the FIRST element (GH #343) ---
 // `node.Child.member` is THE standard CFML XML idiom. A named child is a GROUP

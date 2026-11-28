@@ -19460,68 +19460,7 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_xml_search(args: Vec<CfmlValue>) -> CfmlResult {
     let doc = args.get(0).cloned().unwrap_or(CfmlValue::Null);
     let path_expr = get_str(&args, 1);
-
-    let mut results = Vec::new();
-
-    let search_root = if let CfmlValue::Struct(ref s) = doc {
-        if let Some(root) = s.get("xmlRoot") {
-            root.clone()
-        } else {
-            doc.clone()
-        }
-    } else {
-        doc.clone()
-    };
-
-    if path_expr.starts_with("//") {
-        let tag_name = &path_expr[2..];
-        xml_search_descendants(&search_root, tag_name, &mut results);
-    } else {
-        let parts: Vec<&str> = path_expr.trim_start_matches('/').split('/').collect();
-        xml_search_path(&search_root, &parts, 0, &mut results);
-    }
-
-    Ok(CfmlValue::array(results))
-}
-
-#[cfg(feature = "xml")]
-fn xml_search_descendants(node: &CfmlValue, tag_name: &str, results: &mut Vec<CfmlValue>) {
-    if let CfmlValue::Struct(ref s) = node {
-        if let Some(CfmlValue::String(ref name)) = s.get("xmlName") {
-            if name.as_str() == tag_name || tag_name == "*" {
-                results.push(node.clone());
-            }
-        }
-        if let Some(CfmlValue::Array(ref children)) = s.get("xmlChildren") {
-            for child in children.iter() {
-                xml_search_descendants(&child, tag_name, results);
-            }
-        }
-    }
-}
-
-#[cfg(feature = "xml")]
-fn xml_search_path(node: &CfmlValue, parts: &[&str], depth: usize, results: &mut Vec<CfmlValue>) {
-    if depth >= parts.len() {
-        results.push(node.clone());
-        return;
-    }
-
-    let target = parts[depth];
-
-    if let CfmlValue::Struct(ref s) = node {
-        if let Some(CfmlValue::String(ref name)) = s.get("xmlName") {
-            if name.as_str() == target || target == "*" {
-                if depth == parts.len() - 1 {
-                    results.push(node.clone());
-                } else if let Some(CfmlValue::Array(ref children)) = s.get("xmlChildren") {
-                    for child in children.iter() {
-                        xml_search_path(&child, parts, depth + 1, results);
-                    }
-                }
-            }
-        }
-    }
+    crate::xpath::xml_search(&doc, &path_expr)
 }
 
 #[cfg(feature = "xml")]

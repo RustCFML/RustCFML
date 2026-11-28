@@ -43,6 +43,13 @@ pub mod tier {
     /// Adds CFML execution — calling UDFs and closures, instantiating
     /// components, invoking methods, page output, and `include`.
     pub const EXECUTION: u32 = 3;
+    /// Adds CFML exceptions as data, and named arguments. An error raised by
+    /// CFML the extension called can be taken out of the call — caught,
+    /// inspected, and either handled or raised again — the way a Lucee
+    /// extension catches the `PageException` from `udf.call( pc, … )`. And a
+    /// function or method can be called with named arguments, the ABI form of
+    /// `argumentCollection` (Lucee's `udf.callWithNamedValues`).
+    pub const EXCEPTIONS: u32 = 4;
 }
 
 /// Status returned by fallible vtable entries. Zero is success.
@@ -64,6 +71,11 @@ pub mod status {
     pub const TIMEOUT: u32 = 7;
     /// No scope of that name, or no VM in this context.
     pub const NO_SCOPE: u32 = 8;
+    /// The pending error is not an exception but a request ending — an
+    /// `abort`, a `cflocation` redirect or a request timeout. Like
+    /// `catch( any )` in CFML, an extension cannot take it: it is raised when
+    /// the call returns, whatever the extension does.
+    pub const NOT_CATCHABLE: u32 = 9;
 }
 
 /// Type discriminants reported by [`HostVtable::val_type`].
@@ -621,6 +633,52 @@ pub struct HostVtable {
     pub write_output: unsafe extern "C-unwind" fn(*mut Ctx, text: StrRef) -> u32,
     /// `<cfinclude>` a template.
     pub include_template: unsafe extern "C-unwind" fn(*mut Ctx, path: StrRef) -> u32,
+
+    // ---- tier 4: CFML exceptions as data, named arguments ------------------
+    //
+    // When CFML that a tier-3 entry ran throws, the entry returns NULL (or a
+    // failure status) and the host STAGES the CFML error in this call; it is
+    // raised when the call returns. Until tier 4 nothing could un-stage it, so
+    // an extension that handled the failure still had it raised. `error_take`
+    // is the catch: it removes the staged error and hands it over as data.
+    // An extension that never calls it behaves exactly as before.
+
+    /// Take the error staged by the last failed re-entrant call (`call_fn`,
+    /// `call_value`, `new_component`, `invoke_method`, `component_metadata`,
+    /// `include_template`, `lock`, and the named forms below), so it is NOT
+    /// raised when this call returns.
+    ///
+    /// Writes the exception through `info` as the struct a CFML
+    /// `catch ( any e )` would see — `type`, `message`, `detail`,
+    /// `extendedInfo`, `errorCode`, `tagContext`, `stackTrace` and any custom
+    /// members — and through `token` an id [`HostVtable::error_restore`]
+    /// accepts. [`status::NOT_FOUND`] when nothing is staged;
+    /// [`status::NOT_CATCHABLE`] for an abort, redirect or request timeout,
+    /// which stays staged.
+    pub error_take: unsafe extern "C" fn(*mut Ctx, info: *mut ValueHandle, token: *mut u64) -> u32,
+    /// Stage a taken error again, exactly as it was — type, message, extras
+    /// and stack — so propagating a caught exception loses nothing. First
+    /// error wins, as for `throw`: a no-op if an error is already staged.
+    /// [`status::NOT_FOUND`] for a token from another call.
+    pub error_restore: unsafe extern "C" fn(*mut Ctx, token: u64) -> u32,
+    /// Call a function value with NAMED arguments — the ABI form of
+    /// `fn( argumentCollection = args )`. `args` is a struct whose keys bind to
+    /// parameter names (a positive-integer key is positional, as in CFML; a
+    /// key that matches no parameter lands in `arguments`), or an array of
+    /// positional arguments.
+    pub call_value_named: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        callee: ValueHandle,
+        args: ValueHandle,
+    ) -> ValueHandle,
+    /// Invoke a method with NAMED arguments — `invoke( object, name, args )`,
+    /// with `args` as for [`HostVtable::call_value_named`].
+    pub invoke_method_named: unsafe extern "C-unwind" fn(
+        *mut Ctx,
+        object: ValueHandle,
+        name: StrRef,
+        args: ValueHandle,
+    ) -> ValueHandle,
 }
 
 impl HostVtable {
@@ -657,6 +715,22 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    /// The vtable only ever grows at the end: an extension built against an
+    /// older table must find every entry it knows where it always was.
+    #[test]
+    fn tier_4_entries_were_appended_after_the_tier_3_table() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(
+            offset_of!(HostVtable, error_take),
+            offset_of!(HostVtable, include_template) + size_of::<usize>(),
+            "a tier-4 entry was inserted before the end of the tier-3 table"
+        );
+        assert_eq!(
+            offset_of!(HostVtable, invoke_method_named) + size_of::<usize>(),
+            size_of::<HostVtable>()
+        );
     }
 
     #[test]
