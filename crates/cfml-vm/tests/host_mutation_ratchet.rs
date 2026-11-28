@@ -27,7 +27,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("cfml-vm/src/java_shims.rs", 16),
     ("cfml-vm/src/lib.rs", 2),
     ("cfml-vm/src/upload_temp.rs", 10),
-    ("cfml-vm/src/web.rs", 11), // +1: multipart multi-file registry unit test cleans up its temp paths
+    ("cfml-vm/src/web.rs", 12), // +2: the multi-file registry and empty-file-input unit tests clean up their temp paths
     ("cfml-vm/src/mcp/client.rs", 1),
     ("cfml-stdlib/src/builtins.rs", 34), // +1: cfzip removes a partial file past its cap (cfzip is sandbox-refused)
     ("cfml-stdlib/src/file_handles.rs", 2),

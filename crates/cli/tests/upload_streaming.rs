@@ -382,6 +382,38 @@ fn several_files_under_one_field_name_reach_fileuploadall() {
 }
 
 #[test]
+fn a_file_input_left_empty_is_not_an_upload() {
+    // A browser sends an empty file input as filename="" with no body. Lucee
+    // treats it as no upload: form.docs is "" (or only the real files' paths),
+    // FileUpload throws, FileUploadAll leaves it out. Preside's preprocessor
+    // checks len( form.field ) and would otherwise save an empty file.
+    let server = start_server();
+    let empty = post_named_files(server.port, "/empty_input.cfm", "docs", &[("", b"")]);
+    assert!(empty.contains("200 OK"), "request should succeed; got:\n{empty}");
+    assert_eq!(field(&empty, "formDocs"), "[]");
+    assert_eq!(field(&empty, "uploadThrew"), "true");
+    assert_eq!(field(&empty, "uploadAllCount"), "0");
+    assert_eq!(field(&empty, "savedFiles"), "0");
+
+    let mixed = post_named_files(
+        server.port,
+        "/uploadall.cfm",
+        "docs",
+        &[("", b""), ("a.txt", b"aaa"), ("", b"")],
+    );
+    assert!(mixed.contains("200 OK"), "upload should succeed; got:\n{mixed}");
+    assert_eq!(field(&mixed, "pathCount"), "1");
+    assert_eq!(field(&mixed, "path1Exists"), "true");
+    assert_eq!(field(&mixed, "uploadAllCount"), "1");
+    assert_eq!(field(&mixed, "clientFile1"), "a.txt");
+    let form_docs = field(&mixed, "formDocs");
+    assert!(
+        !form_docs.contains(','),
+        "empty parts must not add list elements: {form_docs}"
+    );
+}
+
+#[test]
 fn concurrent_uploads_of_one_filename_do_not_clobber_each_other() {
     let server = start_server();
     let port = server.port;

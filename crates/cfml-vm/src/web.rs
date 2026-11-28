@@ -772,6 +772,12 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> (ValueMap, Uploa
             continue;
         }
 
+        // A file input left empty is no upload: nothing on disk, "" in form.
+        if file_name.as_deref().is_some_and(is_empty_file_input) {
+            insert_query_value(&mut form, field_name.to_lowercase(), String::new());
+            continue;
+        }
+
         if let Some(fname) = file_name {
             let client_file = sanitize_upload_filename(&fname);
             let (server_dir, temp_path, saved) = write_multipart_file(part_body);
@@ -794,6 +800,20 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> (ValueMap, Uploa
     }
 
     (form, uploads)
+}
+
+/// Whether a multipart file part is a file input the user left empty.
+///
+/// A browser still sends such an input, as a part with `filename=""` and no
+/// body. Lucee treats it as no upload at all: nothing is written to disk,
+/// `form.<field>` is an empty string (or, when other parts share the name, just
+/// their paths), `FileUpload` on the field throws and `FileUploadAll` leaves it
+/// out. Code that checks `len( form.field )` or `fileExists( form.field )`
+/// before calling `FileUpload` relies on that — Preside's upload preprocessor
+/// does, and would otherwise save an empty file over a record's existing one.
+/// Callers record such a part with [`insert_query_value`] and an empty value.
+pub fn is_empty_file_input(file_name: &str) -> bool {
+    file_name.trim().is_empty()
 }
 
 /// Record one uploaded file part into both the form scope (temp path string)
@@ -1433,6 +1453,54 @@ mod tests {
             assert!(std::path::Path::new(path).exists(), "temp file must exist: {path}");
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// A file input left empty arrives as `filename=""` with no body. Lucee 7.1
+    /// treats it as no upload: `form.<field>` is "", a same-named real file keeps
+    /// only its own path (no empty list element), and nothing reaches the
+    /// upload registry or the disk.
+    #[test]
+    fn an_empty_file_input_is_an_empty_string_and_not_an_upload() {
+        let boundary = "----B";
+        let ct = format!("multipart/form-data; boundary={}", boundary);
+        let mut body: Vec<u8> = Vec::new();
+        for (name, filename, contents) in [
+            ("empty", "", b"" as &[u8]),
+            ("docs", "", b""),
+            ("docs", "a.txt", b"aaa"),
+            ("docs", "", b""),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; \
+                     filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(contents);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+        let (form, uploads) = parse_multipart_sync(&ct, &body);
+        match form.get("empty") {
+            Some(CfmlValue::String(s)) => assert_eq!(s.to_string(), "", "an empty input is \"\""),
+            other => panic!("expected an empty string, got {:?}", other),
+        }
+        assert!(uploads.get("empty").is_none(), "an empty input is not an upload");
+
+        let parts = uploads.get("docs").expect("the real file is registered");
+        assert_eq!(parts.len(), 1, "only the real file is registered");
+        let temp_path = parts[0].get("tempFilePath").map(|v| v.as_string()).unwrap_or_default();
+        match form.get("docs") {
+            Some(CfmlValue::String(s)) => assert_eq!(
+                s.to_string(),
+                temp_path,
+                "form.docs is the real file's path alone"
+            ),
+            other => panic!("expected the temp path, got {:?}", other),
+        }
+        let _ = std::fs::remove_file(&temp_path);
     }
 
     #[test]

@@ -3969,6 +3969,15 @@ async fn stream_multipart_form(
                 return Err(MultipartRejection::FilenameTooLong { len });
             }
         }
+        // A file input left empty is no upload: no temp file, "" in form.
+        if file_name
+            .as_deref()
+            .is_some_and(cfml_vm::web::is_empty_file_input)
+        {
+            while field.chunk().await?.is_some() {}
+            cfml_vm::web::insert_query_value(&mut form, field_name.to_lowercase(), String::new());
+            continue;
+        }
         let part_content_type = field.content_type().map(|m| m.to_string());
 
         match file_name {
