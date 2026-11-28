@@ -84,6 +84,8 @@ Compatibility target is **Lucee 7** (BoxLang where Lucee is silent). Anything no
 | [50](#50) | AntiSamy sanitiser — cosmetic divergences from the Java library | 🏗 edges |
 | [51](#51) | Tag-mode parsing — two constructs compile here that Lucee rejects | 🏗 edges |
 | [53](#53) | `private`/`package` methods are gated on CALLS, not on member reads | 🏗 edges |
+| [122](#122) | A page-level closure called on a later request has lost the page's `variables` | 🏗 open |
+| [123](#123) | A closure kept in a function local loses its captures when an inner closure calls it | ✅ resolved (v0.752.1) |
 | [118](#118) | Markdown: safe by default (unlike BoxLang), reference links resolved | 🏗 by design |
 
 **Part E — Environment-specific 🌍**
@@ -1895,6 +1897,56 @@ function and tag shapes from BoxLang's `bx-markdown`, with these deliberate edge
   bold directly inside bold is written as plain bold.
 - `writeDump( doc )` shows a generic native-object box. Use `doc.outline()` or
   `doc.toStruct()` to look inside.
+
+<a id="122"></a>
+
+## 122. A page-level closure called on a later request has lost the page's `variables` 🏗
+
+A closure defined at page level closes over the page's `variables`. Within the
+request that defined it, that works as on Lucee. Once that request ends,
+RustCFML clears the page's closure environment (it breaks an
+env → closure → env reference cycle that otherwise leaked one environment per
+request), so the same closure called on a LATER request — kept in
+`application` scope or by an extension — no longer sees those variables. Lucee keeps the defining page's `variables` scope alive with the
+closure.
+
+```cfml
+// request 1
+pageVar = 0;
+application.bump = function() { pageVar++; return pageVar; };
+application.read = function() { return variables.marker; };
+// request 2
+application.bump();   // Lucee: 2     RustCFML: variable [PAGEVAR] doesn't exist
+application.read();   // Lucee: the defining page's value     RustCFML: an error
+```
+
+Verified against Lucee 7.1.2.191. Writes differ too: on Lucee `variables.x = …`
+inside such a closure writes the DEFINING page's scope, which the calling page
+never sees; on RustCFML the write can land in the calling page. The dynamic scopes — `request`, `session`, `url`,
+`form`, `cgi` — are the CALLING request's on both engines, and a closure built
+inside a function (its captures are that function's locals) or a component
+method (its `variables`/`this`) keeps them on both. Build closures that must
+outlive their request in a function — `onApplicationStart` is the usual place.
+
+<a id="123"></a>
+
+## 123. A closure kept in a function local loses its captures when an inner closure calls it — RESOLVED in v0.752.1 *(GH [#549](https://github.com/RustCFML/RustCFML/issues/549))*
+
+```cfml
+function makeCounter() { var n = 0; return function() { n++; return n; }; }
+function makeShared() {
+    var counter = makeCounter();
+    return function() { return counter(); };
+}
+s = makeShared();
+s();   // 1, then 2, as on Lucee 7.1.2 (v0.752.0: variable [N] doesn't exist)
+```
+
+Calling `counter()` directly or from a closure defined at page level always
+worked; calling it from a closure defined in the same function that holds it
+lost `counter`'s own captured `n` until v0.752.1. The fix keeps a closure's
+captured scope when another closure captures it
+(`tests/core/test_nested_closure_preserves_capture.cfm`).
 
 ---
 

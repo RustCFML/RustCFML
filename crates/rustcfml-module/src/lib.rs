@@ -126,6 +126,9 @@ fn status(code: u32, what: &str) -> Result<()> {
         abi::status::UNLOCKED => "the shared scope is not locked; take ctx.lock() before writing it",
         abi::status::TIMEOUT => "timed out waiting for the lock",
         abi::status::NO_SCOPE => "no such scope, or no VM in this context",
+        abi::status::NOT_CATCHABLE => {
+            "the request is ending (an abort, a redirect or a request timeout), which cannot be caught"
+        }
         _ => "unknown host error",
     };
     Err(Error::expression(format!("{what}: {reason}")))
@@ -1076,6 +1079,13 @@ fn require_tier(entry_offset: usize, what: &str, tier: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether the loaded host provides `tier` and the entry at `entry_offset`,
+/// for paths that degrade rather than fail on an older engine.
+fn host_provides(entry_offset: usize, tier: u32) -> bool {
+    let host = host();
+    host.tier >= tier && host.has(entry_offset)
+}
+
 /// One CFML scope, reached by name.
 ///
 /// Reads take that scope's read lock, so a value can never be read half-written
@@ -1306,6 +1316,12 @@ impl Ctx {
     /// ```ignore
     /// let upper = ctx.call( "ucase", &[ ctx.string( "hi" ) ] )?;
     /// ```
+    ///
+    /// If the CFML throws, this returns `Err` and the CFML error stays
+    /// **pending**: it is raised when your call returns, whatever you return, so
+    /// `?` propagates it exactly as CFML raised it. To handle it instead, use
+    /// [`Ctx::try_call`] (or [`Ctx::take_error`]). The same holds for every
+    /// call into CFML.
     pub fn call<'a>(&'a self, name: &str, args: &[Value<'a>]) -> Result<Value<'a>> {
         require_tier(
             core::mem::offset_of!(HostVtable, call_fn),
@@ -1369,27 +1385,46 @@ impl Ctx {
         )?;
         let code = unsafe { (host().include_template)(self.raw, StrRef::new(path)) };
         if code != abi::status::OK {
-            // The host staged the real CFML error; a second message here would
-            // mask it.
-            return Err(Error::new(format!("include [{}] failed", path)));
+            // The host staged the real CFML error, which is what CFML sees.
+            return Err(self.failure(&format!("include {path}")));
         }
         Ok(())
     }
 
-    /// A NULL return means the host staged a CFML error for us; surfacing our
-    /// own message instead would hide it, so this only fills in when there is
-    /// nothing better.
+    /// A NULL return means the host staged a CFML error for us. That staged
+    /// error is what CFML sees if this call returns `Err` — first error wins —
+    /// so the `Err` here only has to describe it.
     fn checked<'a>(&'a self, h: ValueHandle, what: &str) -> Result<Value<'a>> {
         if h.is_null() {
-            return Err(Error::new(format!("[{}] failed", what)));
+            return Err(self.failure(what));
         }
         Ok(Value { h, ctx: self })
+    }
+
+    /// The `Err` for a failed call into CFML: the CFML error's own type and
+    /// message where the host can tell us them (tier 4), the generic
+    /// `[what] failed` where it cannot.
+    ///
+    /// The staged error is taken only to read it and is put straight back, so
+    /// what CFML eventually sees is exactly what it saw before this existed: an
+    /// extension that returns this `Err` — or ignores it — still has the
+    /// original error raised. Use [`Ctx::take_error`] (or a `try_` call) to
+    /// handle the error instead.
+    fn failure(&self, what: &str) -> Error {
+        match self.take_error() {
+            Some(exception) if !exception.ends_request => exception.rethrow(),
+            Some(exception) => Error::new(format!("[{what}] did not complete: {}", exception.message)),
+            None => Error::new(format!("[{what}] failed")),
+        }
     }
 }
 
 impl<'a> Value<'a> {
     /// Call this value as a function — a UDF or closure handed to you as an
     /// argument. The mechanism behind `thing.onEvent( function(e){ … } )`.
+    ///
+    /// A CFML error stays pending (see [`Ctx::call`]); use
+    /// [`Value::try_call_as_fn`] to handle it.
     pub fn call_as_fn(self, args: &[Value<'a>]) -> Result<Value<'a>> {
         require_tier(
             core::mem::offset_of!(HostVtable, call_value),
@@ -1403,7 +1438,8 @@ impl<'a> Value<'a> {
         self.ctx.checked(h, "function value")
     }
 
-    /// Invoke a method on a component or native object.
+    /// Invoke a method on a component or native object. A CFML error stays
+    /// pending (see [`Ctx::call`]); use [`Value::try_invoke`] to handle it.
     pub fn invoke(self, method: &str, args: &[Value<'a>]) -> Result<Value<'a>> {
         require_tier(
             core::mem::offset_of!(HostVtable, invoke_method),
@@ -1440,6 +1476,281 @@ impl<'a> Value<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 4 — CFML exceptions as data, named arguments
+// ---------------------------------------------------------------------------
+
+/// An exception raised by CFML this extension called, caught as data — what a
+/// Lucee extension gets as a `PageException` from `udf.call( pc, … )`.
+///
+/// Holding one means the error has been **handled**: it will not be raised
+/// when this call returns. Read it, turn it into something else (a tool result
+/// for a model, a status code, a log line), or raise it again unchanged with
+/// [`CfmlException::rethrow`] — or simply with `?`, which does the same.
+///
+/// ```ignore
+/// match tool.try_call_as_fn( &[ input ] ) {
+///     Ok( v )  => Ok( v ),
+///     // The CFML `throw()` becomes data; the run carries on.
+///     Err( e ) if e.error_type != "fatal" => Ok( ctx.string( format!( "Error: {}", e.message ) ) ),
+///     // Anything else is raised exactly as CFML threw it.
+///     Err( e ) => Err( e.rethrow() ),
+/// }
+/// ```
+pub struct CfmlException<'a> {
+    ctx: &'a Ctx,
+    /// The host's id for the original error, so `rethrow` can stage it again
+    /// with nothing lost. `None` when there was no CFML error to take.
+    token: Option<u64>,
+    /// The `catch ( any e )` struct, or NULL.
+    info: ValueHandle,
+    ends_request: bool,
+    /// `e.type` — `"Expression"`, `"Application"`, `"database"`, or whatever
+    /// `throw( type = … )` said.
+    pub error_type: String,
+    /// `e.message`.
+    pub message: String,
+    /// `e.detail`, as CFML reports it.
+    pub detail: String,
+    /// `e.extendedInfo`, as CFML reports it.
+    pub extended_info: String,
+    /// `e.errorCode`, as CFML reports it.
+    pub error_code: String,
+}
+
+impl<'a> CfmlException<'a> {
+    fn from_info(ctx: &'a Ctx, info: ValueHandle, token: Option<u64>) -> CfmlException<'a> {
+        let v = Value { h: info, ctx };
+        let field = |k: &str| {
+            if v.has_key(k) {
+                v.key(k).to_string()
+            } else {
+                String::new()
+            }
+        };
+        CfmlException {
+            ctx,
+            token,
+            info,
+            ends_request: false,
+            error_type: field("type"),
+            message: field("message"),
+            detail: field("detail"),
+            extended_info: field("extendedInfo"),
+            error_code: field("errorCode"),
+        }
+    }
+
+    /// A failure with no CFML error behind it: the extension's own `Err`, or
+    /// a request ending, which cannot be taken.
+    fn from_error(ctx: &'a Ctx, e: Error, ends_request: bool) -> CfmlException<'a> {
+        // The type names the host gives these kinds when it raises them.
+        let error_type = match e.kind {
+            abi::error_type::EXPRESSION => "Expression".to_string(),
+            abi::error_type::DATABASE => "database".to_string(),
+            abi::error_type::SECURITY => "Security".to_string(),
+            abi::error_type::IO => "java.io.IOException".to_string(),
+            abi::error_type::CUSTOM if !e.custom_type.is_empty() => e.custom_type.clone(),
+            _ => "Application".to_string(),
+        };
+        CfmlException {
+            ctx,
+            token: None,
+            info: ValueHandle::NULL,
+            ends_request,
+            error_type,
+            message: e.message,
+            detail: String::new(),
+            extended_info: String::new(),
+            error_code: String::new(),
+        }
+    }
+
+    /// The exception as the struct CFML's `catch ( any e )` gives — with
+    /// `tagContext`, `stackTrace`, `rootCause` and any custom members a
+    /// `throw()` attached. A null value when there was no CFML error.
+    pub fn info(&self) -> Value<'a> {
+        if self.info.is_null() {
+            return self.ctx.null();
+        }
+        Value { h: self.info, ctx: self.ctx }
+    }
+
+    /// True for an `abort`, a `cflocation` redirect or a request timeout.
+    /// These are not exceptions: as with `catch( any )` in CFML they cannot be
+    /// handled, and the request ends when this call returns whatever the
+    /// extension returns. Return promptly.
+    pub fn ends_request(&self) -> bool {
+        self.ends_request
+    }
+
+    /// Raise this exception again, exactly as CFML threw it — type, message,
+    /// detail, custom members and tag context — when this call returns. Return
+    /// the `Error` from the call:
+    ///
+    /// ```ignore
+    /// Err( e ) => return Err( e.rethrow() ),
+    /// ```
+    pub fn rethrow(self) -> Error {
+        if let Some(token) = self.token {
+            // Stage the original again. First error wins, so whatever `Err`
+            // the module then returns, CFML sees this.
+            unsafe { (host().error_restore)(self.ctx.raw, token) };
+        }
+        let kind = if self.error_type.eq_ignore_ascii_case("expression") {
+            abi::error_type::EXPRESSION
+        } else if self.error_type.is_empty() || self.error_type.eq_ignore_ascii_case("application") {
+            abi::error_type::APPLICATION
+        } else {
+            abi::error_type::CUSTOM
+        };
+        let custom_type = if kind == abi::error_type::CUSTOM { self.error_type } else { String::new() };
+        Error { kind, custom_type, message: self.message }
+    }
+}
+
+/// `?` on a caught exception raises it again, unchanged.
+impl From<CfmlException<'_>> for Error {
+    fn from(e: CfmlException<'_>) -> Error {
+        e.rethrow()
+    }
+}
+
+impl core::fmt::Display for CfmlException<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}: {}", self.error_type, self.message)?;
+        if !self.detail.is_empty() {
+            write!(f, " ({})", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for CfmlException<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CfmlException")
+            .field("error_type", &self.error_type)
+            .field("message", &self.message)
+            .field("detail", &self.detail)
+            .field("extended_info", &self.extended_info)
+            .field("error_code", &self.error_code)
+            .field("ends_request", &self.ends_request)
+            .finish()
+    }
+}
+
+impl Ctx {
+    /// Take the CFML error that the last failed call into CFML left pending,
+    /// so it is **not** raised when this call returns — the `catch`.
+    ///
+    /// Every call into CFML (`call`, `call_as_fn`, `invoke`, `new_component`,
+    /// `component_metadata`, `include`, `lock`, the `_named` forms) that fails
+    /// leaves its CFML error pending, and a pending error is raised when the
+    /// extension returns, `Ok` or not. That is what makes `?` propagate the
+    /// precise CFML error, and it is unchanged. Taking the error is how an
+    /// extension says it has handled it.
+    ///
+    /// `None` when nothing is pending, on an engine older than tier 4, and for
+    /// a request ending (`abort`, a redirect, a request timeout), which stays
+    /// pending because it is not an exception.
+    pub fn take_error(&self) -> Option<CfmlException<'_>> {
+        if !host_provides(core::mem::offset_of!(HostVtable, error_take), abi::tier::EXCEPTIONS) {
+            return None;
+        }
+        let mut info = ValueHandle::NULL;
+        let mut token = 0u64;
+        let code = unsafe { (host().error_take)(self.raw, &mut info, &mut token) };
+        match code {
+            abi::status::OK => Some(CfmlException::from_info(self, info, Some(token))),
+            abi::status::NOT_CATCHABLE => Some(CfmlException::from_error(
+                self,
+                Error::new("the request is ending: an abort, a redirect or a request timeout"),
+                true,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Run `f`, catching any CFML error it raises: on failure the error is
+    /// handed back as data and will not be raised when this call returns.
+    ///
+    /// The general form of the `try_` calls, for anything that calls into CFML:
+    ///
+    /// ```ignore
+    /// let outcome = ctx.catching( || tool.call_as_fn_named( args ) );
+    /// ```
+    ///
+    /// An `Err` from `f` with no CFML error behind it (the extension's own, or
+    /// a stale handle) comes back as a `CfmlException` with no `info`.
+    pub fn catching<'a, T>(
+        &'a self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> core::result::Result<T, CfmlException<'a>> {
+        match f() {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.take_error().unwrap_or_else(|| CfmlException::from_error(self, e, false))),
+        }
+    }
+
+    /// [`Ctx::call`], with a CFML error caught as data.
+    pub fn try_call<'a>(
+        &'a self,
+        name: &str,
+        args: &[Value<'a>],
+    ) -> core::result::Result<Value<'a>, CfmlException<'a>> {
+        self.catching(|| self.call(name, args))
+    }
+}
+
+impl<'a> Value<'a> {
+    /// [`Value::call_as_fn`], with a CFML error caught as data.
+    pub fn try_call_as_fn(
+        self,
+        args: &[Value<'a>],
+    ) -> core::result::Result<Value<'a>, CfmlException<'a>> {
+        self.ctx.catching(|| self.call_as_fn(args))
+    }
+
+    /// [`Value::invoke`], with a CFML error caught as data.
+    pub fn try_invoke(
+        self,
+        method: &str,
+        args: &[Value<'a>],
+    ) -> core::result::Result<Value<'a>, CfmlException<'a>> {
+        self.ctx.catching(|| self.invoke(method, args))
+    }
+
+    /// Call this function with NAMED arguments — `fn( argumentCollection = args )`.
+    ///
+    /// `args` is a struct whose keys bind to the function's parameter names,
+    /// whatever order they arrive in; a positive-integer key is positional, and
+    /// a key that matches no parameter lands in `arguments`, as in CFML. An
+    /// array is positional. Lucee's equivalent is `udf.callWithNamedValues`.
+    pub fn call_as_fn_named(self, args: Value<'_>) -> Result<Value<'a>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, call_value_named),
+            "calling a function with named arguments",
+            abi::tier::EXCEPTIONS,
+        )?;
+        let h = unsafe { (host().call_value_named)(self.ctx.raw, self.h, args.h) };
+        self.ctx.checked(h, "function value")
+    }
+
+    /// Invoke a method with NAMED arguments — `invoke( object, method, args )`,
+    /// with `args` as for [`Value::call_as_fn_named`].
+    pub fn invoke_named(self, method: &str, args: Value<'_>) -> Result<Value<'a>> {
+        require_tier(
+            core::mem::offset_of!(HostVtable, invoke_method_named),
+            "invoking a method with named arguments",
+            abi::tier::EXCEPTIONS,
+        )?;
+        let h = unsafe {
+            (host().invoke_method_named)(self.ctx.raw, self.h, StrRef::new(method), args.h)
+        };
+        self.ctx.checked(h, method)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // module!
 // ---------------------------------------------------------------------------
 
@@ -1457,9 +1768,11 @@ impl<'a> Value<'a> {
 ///
 /// `bifs` maps the CFML name to a `fn(&Ctx, &[Value]) -> Result<Value>`;
 /// `classes` lists types implementing [`NativeClass`], whose CFML name comes
-/// from `CLASS_NAME`. `on_load` names an optional
-/// `fn() -> Result<()>` run once per process, after the host vtable is
-/// installed — the place for thread pools and caches, never per-call work.
+/// from `CLASS_NAME`. `tier` is the capability tier the extension needs (see
+/// [`abi::tier`]); an engine providing less refuses to load it, naming both.
+/// `on_load` names an optional `fn() -> Result<()>` run once per process,
+/// after the host vtable is installed — the place for thread pools and caches,
+/// never per-call work.
 #[macro_export]
 macro_rules! module {
     (
