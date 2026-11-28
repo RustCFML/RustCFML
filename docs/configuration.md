@@ -233,7 +233,7 @@ fires opportunistically on the next request for the owning application
 ### `uploads`
 
 Cleanup of uploaded-file temp files (serve mode only). A request's upload temp
-files (`form.<field>.tempFilePath`) are deleted when the request ends. A request
+files (the paths in `form.<field>`) are deleted when the request ends. A request
 that started background work — `cfthread`, `runAsync`, an executor task — may
 still be reading them, so it keeps them, and this reaper removes them once they
 are old enough. It also removes files left by a process that is no longer

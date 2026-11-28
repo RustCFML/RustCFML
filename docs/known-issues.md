@@ -215,7 +215,7 @@ follow-up (mirrors the datasource work).
 | Function | Ignored argument(s) | Reason |
 |---|---|---|
 | `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
-| `fileUpload()` / `fileUploadAll()` | `accept` | **Implemented** — VM-intercepted, it reads the form scope's `tempFilePath`/`clientFile`, creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. `accept` is enforced against the client-declared type and the extension, not the file's bytes (no content sniffing — see the upload note further down). |
+| `fileUpload()` / `fileUploadAll()` | `accept` | **Implemented** — VM-intercepted, it reads the request's uploaded parts (`form.<field>` holds only the temp path, or a list of them for several files under one name, as on Lucee; GH #546, #547): `fileUpload()` takes a field's first part, `fileUploadAll()` every part, and a file input left empty is no upload. It creates the destination directory, honours `nameConflict=makeunique`, and reports the real `serverFile`/`fileWasSaved`. `accept` is enforced against the client-declared type and the extension, not the file's bytes (no content sniffing — see the upload note further down). |
 | `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
 | `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
 | `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
@@ -1963,7 +1963,9 @@ Restrictions that apply only on a particular target (wasm, CLI vs serve).
 A `multipart/form-data` upload is parsed off the wire and each file part is
 written straight to its own temp file. Nothing about the CFML surface changed —
 `form.<field>.tempFilePath` and `cffile action="upload"` work as before — but
-three things behind it did, and all three are worth knowing.
+three things behind it did, and all three are worth knowing. (Since GH #546,
+`form.<field>` is the temp path itself, as on Lucee; see the `fileUpload()` row
+in the function table.)
 
 **The body is no longer buffered.** It used to be read whole by
 `axum::body::to_bytes` before the handler ran, then split, then written to
@@ -2009,7 +2011,7 @@ now remove them (`cfml_vm::upload_temp`):
    `urlForm.release` in its non-`hasFamily` branch), so one thread anywhere in
    a request leaks its uploads permanently. That hole is the conservative answer
    to a real hazard — a thread can outlive its request and may have been handed
-   `tempFilePath` — so a request that started a `cfthread`, `runAsync` or an
+   an upload's temp path — so a request that started a `cfthread`, `runAsync` or an
    executor task still **keeps** its files at request end; they are left to
    layer 2 rather than leaked. Every early return (404, blocked path, a parse
    that failed part-way) deletes too.
